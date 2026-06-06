@@ -221,6 +221,13 @@ fn is_retryable(err: &ProxyError) -> bool {
     }
 }
 
+fn is_chat_format(format: &ProviderFormat) -> bool {
+    matches!(
+        format,
+        ProviderFormat::Anthropic | ProviderFormat::Openai | ProviderFormat::OpenaiResponses
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Core proxy logic (protocol-aware)
 // ---------------------------------------------------------------------------
@@ -278,6 +285,15 @@ async fn handle_proxy(
         }
 
         let provider_format = &route.format;
+        if !is_chat_format(provider_format) {
+            let err = ProxyError::Upstream(format!(
+                "route format {:?} (modality={}) is not yet supported by the chat proxy",
+                provider_format, route.modality
+            ));
+            log::warn!("[Proxy] skipping non-chat route: {}", err);
+            last_error = Some(err);
+            continue;
+        }
 
         let provider = match config.providers.get(&route.provider) {
             Some(p) => p,
@@ -459,6 +475,7 @@ async fn handle_proxy(
         tag: tag.clone(),
         provider: provider.name.clone(),
         target_model: route.model.clone(),
+        modality: route.modality.clone(),
         timestamp: chrono_now(),
     }).await;
 
@@ -755,6 +772,16 @@ async fn handle_count_tokens(
         if attempt > 0 {
             log::warn!("[Proxy] count_tokens {} failover: trying route #{} (provider={}, model={})",
                 tag, attempt + 1, route.provider, route.model);
+        }
+
+        if !is_chat_format(&route.format) {
+            let err = ProxyError::Upstream(format!(
+                "count_tokens is not supported for route format {:?} (modality={})",
+                route.format, route.modality
+            ));
+            log::warn!("[Proxy] count_tokens skipping non-chat route: {}", err);
+            last_error = Some(err);
+            continue;
         }
 
         let provider = match config.providers.get(&route.provider) {
@@ -1110,6 +1137,24 @@ pub async fn test_route(
                 tag, attempt + 1, route.provider, route.model);
         }
 
+        if !is_chat_format(&route.format) {
+            let result = TestResult {
+                success: false,
+                tag: tag.to_string(),
+                provider: String::new(),
+                model: route.model.clone(),
+                format: format!("{:?}", route.format),
+                latency_ms: 0,
+                error: Some(format!(
+                    "route format {:?} (modality={}) is not yet supported by the chat test endpoint",
+                    route.format, route.modality
+                )),
+                response: None,
+            };
+            last_result = Some(result);
+            continue;
+        }
+
     let provider = match config.providers.get(&route.provider) {
         Some(p) => p,
         None => {
@@ -1178,6 +1223,7 @@ pub async fn test_route(
             strip_thinking(&mut b);
             convert::anthropic_to_responses_request(&b, &route.model)
         }
+        _ => unreachable!("non-chat formats are filtered before test request conversion"),
     };
 
     // Build URL
@@ -1291,6 +1337,7 @@ pub async fn test_route(
         ProviderFormat::Anthropic => {
             serde_json::from_str(&resp_text).map_err(|e| { log::warn!("[Test] failed to parse response as JSON: {}", e); Value::Null }).unwrap_or(Value::Null)
         }
+        _ => unreachable!("non-chat formats are filtered before test response conversion"),
     };
 
     log::info!("[Test] ✓ success in {}ms", latency_ms);

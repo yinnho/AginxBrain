@@ -7,13 +7,69 @@ export interface Provider {
   auth_type: 'bearer' | 'x_api_key' | 'x_goog_api_key';
 }
 
+export type RouteFormat =
+  | 'openai'
+  | 'anthropic'
+  | 'openai_responses'
+  | 'openai_images'
+  | 'dashscope_image'
+  | 'dashscope_video'
+  | 'dashscope_tts'
+  | 'kling'
+  | 'minimax_image';
+
+export const SUPPORTED_MODALITIES = [
+  'chat',
+  'vision',
+  'image_generation',
+  'video_generation',
+  'tts',
+  'asr',
+  'embedding',
+] as const;
+
+export const MODALITY_LABELS: Record<string, string> = {
+  chat: 'Chat',
+  vision: 'Vision',
+  image_generation: 'Image',
+  video_generation: 'Video',
+  tts: 'TTS',
+  asr: 'ASR',
+  embedding: 'Embedding',
+};
+
+export const FORMAT_MODALITIES: Record<RouteFormat, string> = {
+  openai: 'chat',
+  anthropic: 'chat',
+  openai_responses: 'chat',
+  openai_images: 'image_generation',
+  dashscope_image: 'image_generation',
+  minimax_image: 'image_generation',
+  dashscope_video: 'video_generation',
+  kling: 'video_generation',
+  dashscope_tts: 'tts',
+};
+
+export const FORMAT_ENDPOINTS: Record<RouteFormat, string> = {
+  openai: '/v1/chat/completions',
+  anthropic: '/v1/messages',
+  openai_responses: '/v1/responses',
+  openai_images: '/v1/images/generations',
+  dashscope_image: '/api/v1/services/aigc/text2image/image-synthesis',
+  dashscope_video: '/api/v1/services/aigc/video-generation/video-synthesis',
+  dashscope_tts: '/api/v1/services/aigc/text-to-speech/stream',
+  kling: '/v1/videos/text2video',
+  minimax_image: '/v1/image_generation',
+};
+
 export interface Route {
   endpoint: string;
   model: string;
   provider: string;
   tags: string[];
-  format: 'openai' | 'anthropic' | 'openai_responses';
+  format: RouteFormat;
   enabled: boolean;
+  modality: string;
 }
 
 export interface Tag {
@@ -24,6 +80,7 @@ export interface Tag {
 
 export interface AppConfig {
   port: number;
+  host: string;
   providers: Record<string, Provider>;
   routes: Route[];
   tags: Tag[];
@@ -62,6 +119,7 @@ export interface RequestLog {
   tag: string;
   provider: string;
   target_model: string;
+  modality: string;
   timestamp: string;
 }
 

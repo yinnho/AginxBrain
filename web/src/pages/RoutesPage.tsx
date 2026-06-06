@@ -1,16 +1,11 @@
 import { useState } from 'react';
-import type { AppConfig, Route, TestResult } from '../lib/api';
+import type { AppConfig, Route, RouteFormat, TestResult } from '../lib/api';
+import { FORMAT_ENDPOINTS, FORMAT_MODALITIES, MODALITY_LABELS, SUPPORTED_MODALITIES } from '../lib/api';
 import * as api from '../lib/api';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
 import { Badge } from '../components/Badge';
 import { Input, Select } from '../components/Input';
-
-const FORMAT_ENDPOINTS: Record<string, string> = {
-  openai: '/v1/chat/completions',
-  anthropic: '/v1/messages',
-  openai_responses: '/v1/responses',
-};
 
 export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onConfigChange: (c: AppConfig) => void }) {
   const [editing, setEditing] = useState<number | null>(null);
@@ -116,7 +111,8 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
                   <div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <span style={{ fontSize: 15, fontWeight: 600 }}>{route.model}</span>
-                      <Badge color={route.format === 'openai' ? '#10a37f' : route.format === 'openai_responses' ? '#6366f1' : '#d97706'}>{route.format || 'openai'}</Badge>
+                      <Badge color={route.format === 'openai' ? '#10a37f' : route.format === 'openai_responses' ? '#6366f1' : route.format.includes('image') ? '#ec4899' : route.format.includes('video') || route.format === 'kling' ? '#8b5cf6' : route.format.includes('tts') ? '#f97316' : '#d97706'}>{route.format || 'openai'}</Badge>
+                      <Badge color={route.modality === 'chat' ? '#3B82F6' : route.modality === 'image_generation' ? '#ec4899' : route.modality === 'video_generation' ? '#8b5cf6' : route.modality === 'tts' ? '#f97316' : '#64748b'}>{MODALITY_LABELS[route.modality || 'chat'] || route.modality || 'chat'}</Badge>
                     </div>
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
                       via <span style={{ color: 'var(--text-secondary)' }}>{route.provider}</span>
@@ -233,15 +229,17 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
   const [model, setModel] = useState(initial?.model || '');
   const [provider, setProvider] = useState(initial?.provider || providers[0] || '');
   const [selectedTags, setSelectedTags] = useState<string[]>(initial?.tags || []);
-  const [format, setFormat] = useState<'openai' | 'anthropic' | 'openai_responses'>(initial?.format || 'openai');
+  const [format, setFormat] = useState<RouteFormat>(initial?.format || 'openai');
+  const [modality, setModality] = useState(initial?.modality || FORMAT_MODALITIES[initial?.format || 'openai'] || 'chat');
 
   const toggleTag = (tag: string) => {
     setSelectedTags(prev => prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag]);
   };
 
-  const handleFormatChange = (newFormat: 'openai' | 'anthropic' | 'openai_responses') => {
+  const handleFormatChange = (newFormat: RouteFormat) => {
     setFormat(newFormat);
     setEndpoint(FORMAT_ENDPOINTS[newFormat] || '/v1/chat/completions');
+    setModality(FORMAT_MODALITIES[newFormat] || 'chat');
   };
 
   const valid = endpoint && model && provider && selectedTags.length > 0;
@@ -254,10 +252,21 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
         <Select label="Provider" value={provider} onChange={e => setProvider(e.target.value)}>
           {providers.map(p => <option key={p} value={p}>{p}</option>)}
         </Select>
-        <Select label="Format" value={format} onChange={e => handleFormatChange(e.target.value as 'openai' | 'anthropic' | 'openai_responses')}>
+        <Select label="Format" value={format} onChange={e => handleFormatChange(e.target.value as RouteFormat)}>
           <option value="openai">OpenAI</option>
           <option value="anthropic">Anthropic</option>
           <option value="openai_responses">OpenAI Responses</option>
+          <option value="openai_images">OpenAI Images</option>
+          <option value="dashscope_image">DashScope Image</option>
+          <option value="dashscope_video">DashScope Video</option>
+          <option value="dashscope_tts">DashScope TTS</option>
+          <option value="kling">Kling</option>
+          <option value="minimax_image">MiniMax Image</option>
+        </Select>
+        <Select label="Modality" value={modality} onChange={e => setModality(e.target.value)}>
+          {SUPPORTED_MODALITIES.map(m => (
+            <option key={m} value={m}>{MODALITY_LABELS[m] || m}</option>
+          ))}
         </Select>
         <div style={{ gridColumn: '1 / -1' }}>
           <label style={{ display: 'block', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6, fontWeight: 500 }}>Tags</label>
@@ -276,7 +285,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
         </div>
       </div>
       <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
-        <Button variant="primary" disabled={!valid} onClick={() => onSave({ endpoint, model, provider, tags: selectedTags, format, enabled: initial?.enabled ?? true })}>Save</Button>
+        <Button variant="primary" disabled={!valid} onClick={() => onSave({ endpoint, model, provider, tags: selectedTags, format, modality, enabled: initial?.enabled ?? true })}>Save</Button>
         <Button variant="ghost" onClick={onCancel}>Cancel</Button>
       </div>
     </Card>

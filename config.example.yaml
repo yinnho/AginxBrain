@@ -1,4 +1,5 @@
 port: 8083
+host: 127.0.0.1
 
 providers:
   deepseek:
@@ -43,36 +44,57 @@ routes:
     provider: deepseek
     tags: [sonnet, auto]
     format: openai
+    modality: chat
 
   - endpoint: /v1/chat/completions
     model: deepseek-v4-flash
     provider: deepseek
     tags: [haiku]
     format: openai
+    modality: chat
 
   - endpoint: /v1/messages
     model: glm-5.1
     provider: zhipu
     tags: [opus]
     format: anthropic
+    modality: chat
 
   - endpoint: /v1/chat/completions
     model: qwen3.7-max
     provider: dashscope
     tags: [sonnet]
     format: openai
+    modality: chat
 
   - endpoint: /v1/messages
     model: K2.6
     provider: kimi
     tags: [sonnet]
     format: anthropic
+    modality: chat
 
-  - endpoint: /v1/messages
-    model: MiniMax-M3
-    provider: minimax
-    tags: [haiku]
-    format: anthropic
+  # Future media routes (configuration-only in this phase; driver support comes later):
+  # - endpoint: /api/v1/services/aigc/text2image/image-synthesis
+  #   model: wanx2.1-t2i-plus
+  #   provider: dashscope
+  #   tags: [image]
+  #   format: dashscope_image
+  #   modality: image_generation
+  #
+  # - endpoint: /v1/videos/text2video
+  #   model: kling-v1-6
+  #   provider: kling
+  #   tags: [video]
+  #   format: kling
+  #   modality: video_generation
+  #
+  # - endpoint: /api/v1/services/aigc/text-to-speech/stream
+  #   model: cosyvoice-v1
+  #   provider: dashscope
+  #   tags: [tts]
+  #   format: dashscope_tts
+  #   modality: tts
 
 tags:
   - name: opus

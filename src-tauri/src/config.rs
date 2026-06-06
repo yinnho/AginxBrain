@@ -12,6 +12,8 @@ pub struct RequestLog {
     pub tag: String,
     pub provider: String,
     pub target_model: String,
+    #[serde(default = "default_modality")]
+    pub modality: String,
     pub timestamp: String,
 }
 
@@ -74,6 +76,17 @@ pub enum ProviderFormat {
     Openai,
     #[serde(rename = "openai_responses")]
     OpenaiResponses,
+    #[serde(rename = "openai_images")]
+    OpenaiImages,
+    #[serde(rename = "dashscope_image")]
+    DashscopeImage,
+    #[serde(rename = "dashscope_video")]
+    DashscopeVideo,
+    #[serde(rename = "dashscope_tts")]
+    DashscopeTts,
+    Kling,
+    #[serde(rename = "minimax_image")]
+    MinimaxImage,
 }
 
 fn default_format() -> ProviderFormat {
@@ -95,6 +108,8 @@ pub struct Route {
     pub format: ProviderFormat,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_modality")]
+    pub modality: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +127,10 @@ fn default_port() -> u16 {
 
 fn default_host() -> String {
     "127.0.0.1".to_string()
+}
+
+fn default_modality() -> String {
+    "chat".to_string()
 }
 
 fn default_tag() -> String {
@@ -141,12 +160,12 @@ fn default_providers() -> HashMap<String, Provider> {
 
 fn default_routes() -> Vec<Route> {
     vec![
-        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { endpoint: "/v1/messages".into(), model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, enabled: true },
-        Route { endpoint: "/v1/chat/completions".into(), model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { endpoint: "/v1/messages".into(), model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true },
-        Route { endpoint: "/v1/messages".into(), model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true },
+        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, enabled: true, modality: default_modality() },
+        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, enabled: true, modality: default_modality() },
+        Route { endpoint: "/v1/messages".into(), model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, enabled: true, modality: default_modality() },
+        Route { endpoint: "/v1/chat/completions".into(), model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true, modality: default_modality() },
+        Route { endpoint: "/v1/messages".into(), model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true, modality: default_modality() },
+        Route { endpoint: "/v1/messages".into(), model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true, modality: default_modality() },
     ]
 }
 
@@ -340,6 +359,22 @@ mod tests {
         let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(fmt, ProviderFormat::OpenaiResponses);
 
+        let yaml = "dashscope_image";
+        let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fmt, ProviderFormat::DashscopeImage);
+
+        let yaml = "dashscope_video";
+        let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fmt, ProviderFormat::DashscopeVideo);
+
+        let yaml = "kling";
+        let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fmt, ProviderFormat::Kling);
+
+        let yaml = "minimax_image";
+        let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fmt, ProviderFormat::MinimaxImage);
+
         let yaml = "anthropic";
         let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(fmt, ProviderFormat::Anthropic);
@@ -361,6 +396,7 @@ mod tests {
                     tag: "auto".into(),
                     provider: "test".into(),
                     target_model: "target".into(),
+                    modality: "chat".into(),
                     timestamp: "now".into(),
                 }).await;
             }
@@ -369,6 +405,27 @@ mod tests {
             assert_eq!(logs[0].request_model, "model-10"); // oldest remaining
             assert_eq!(logs[49].request_model, "model-59"); // newest
         });
+    }
+
+    #[test]
+    fn test_route_default_modality_is_chat() {
+        let yaml = r#"
+endpoint: /v1/chat/completions
+model: test-model
+provider: test-provider
+tags: [sonnet]
+format: openai
+enabled: true
+"#;
+        let route: Route = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(route.modality, "chat");
+    }
+
+    #[test]
+    fn test_default_routes_are_chat_modality() {
+        for route in default_routes() {
+            assert_eq!(route.modality, "chat");
+        }
     }
 
     #[test]

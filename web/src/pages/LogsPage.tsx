@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import type { RequestLog } from '../lib/api';
+import { MODALITY_LABELS } from '../lib/api';
 import * as api from '../lib/api';
 import { Badge } from '../components/Badge';
 
@@ -9,6 +10,19 @@ function tagColor(tag: string): string {
     case 'sonnet': return '#3B82F6';
     case 'opus': return '#A855F7';
     case 'auto': return '#F59E0B';
+    default: return '#555';
+  }
+}
+
+function modalityColor(modality: string): string {
+  switch (modality) {
+    case 'chat': return '#3B82F6';
+    case 'vision': return '#06B6D4';
+    case 'image_generation': return '#EC4899';
+    case 'video_generation': return '#8B5CF6';
+    case 'tts': return '#F97316';
+    case 'asr': return '#14B8A6';
+    case 'embedding': return '#64748B';
     default: return '#555';
   }
 }
@@ -58,6 +72,7 @@ export function LogsPage() {
                 <th>Time</th>
                 <th>Model</th>
                 <th>Tag</th>
+                <th>Modality</th>
                 <th>Provider</th>
                 <th>Target</th>
               </tr>
@@ -73,6 +88,9 @@ export function LogsPage() {
                   </td>
                   <td>
                     <Badge color={tagColor(log.tag)}>{log.tag}</Badge>
+                  </td>
+                  <td>
+                    <Badge color={modalityColor(log.modality || 'chat')}>{MODALITY_LABELS[log.modality || 'chat'] || log.modality || 'chat'}</Badge>
                   </td>
                   <td style={{ color: 'var(--text-secondary)' }}>{log.provider}</td>
                   <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>{log.target_model}</td>
