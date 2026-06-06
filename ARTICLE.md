@@ -108,9 +108,9 @@ auto   → Moonshot Kimi (K2.6)        ← 未识别模型自动走这里
 
 ```toml
 model = "gpt-5.5"
-model_provider = "model-router"
+model_provider = "aginxllm"
 
-[model_providers.model-router]
+[model_providers.aginxllm]
 name = "AginxLLM"
 base_url = "http://127.0.0.1:8082"
 wire_api = "responses"
@@ -206,7 +206,7 @@ Claude Code 用 Anthropic 格式，Codex 用 Responses 格式，国产模型用 
 
 ```bash
 git clone https://github.com/yinnho/model-router
-cd model-router
+cd aginxllm
 npm --prefix web install
 npm --prefix web run tauri dev     # 开发模式
 npm --prefix web run tauri build   # 构建安装包
@@ -214,7 +214,7 @@ npm --prefix web run tauri build   # 构建安装包
 
 ### 配置
 
-安装后编辑 `~/.model-router/config.yaml`，配置你的 provider 和路由规则，然后在管理界面点击 "Takeover"——完成。
+安装后编辑 `~/.aginxllm/config.yaml`，配置你的 provider 和路由规则，然后在管理界面点击 "Takeover"——完成。
 
 ## 写在最后
 

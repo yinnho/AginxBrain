@@ -48,7 +48,7 @@ function App() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'model-router-config.json';
+      a.download = 'aginxllm-config.json';
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);

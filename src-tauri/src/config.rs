@@ -167,10 +167,10 @@ impl Default for AppConfig {
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    // Allow override via MODEL_ROUTER_CONFIG environment variable
-    if let Ok(path) = std::env::var("MODEL_ROUTER_CONFIG") {
+    // Allow override via AGINXLLM_CONFIG environment variable
+    if let Ok(path) = std::env::var("AGINXLLM_CONFIG") {
         if !path.is_empty() {
-            log::info!("[Config] using config path from MODEL_ROUTER_CONFIG: {}", path);
+            log::info!("[Config] using config path from AGINXLLM_CONFIG: {}", path);
             return Ok(PathBuf::from(path));
         }
     }

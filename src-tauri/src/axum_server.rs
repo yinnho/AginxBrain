@@ -103,7 +103,7 @@ pub async fn start(state: AppState) -> u16 {
         }
     };
 
-    log::info!("model-router listening on 127.0.0.1:{}", port);
+    log::info!("aginxllm listening on 127.0.0.1:{}", port);
 
     // Use oneshot channel to signal when the spawned server task has started,
     // preventing the race where the Tauri window connects before the server
