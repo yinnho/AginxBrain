@@ -11,24 +11,25 @@ use tauri::Manager;
 use crate::takeover::{check_codex_takeover_status, check_takeover_status,
     take_over_claude, take_over_codex};
 
-pub fn run() {
+/// Desktop mode: Tauri window + system tray + Axum server in background.
+pub fn run_desktop(port_override: Option<u16>, host_override: Option<String>) {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .setup(|app| {
+        .setup(move |app| {
             // 1. Load config
-            let app_config = load_config().map_err(|e| e.to_string())?;
+            let mut app_config = load_config().map_err(|e| e.to_string())?;
+            if let Some(p) = port_override { app_config.port = p; }
+            if let Some(h) = host_override.clone() { app_config.host = h; }
 
-            // 2. Create shared AppState (frontend is embedded via rust-embed)
+            // 2. Create shared AppState
             let state = config::AppState::new(app_config)
                 .map_err(|e| e.to_string())?;
 
-            // 4. Start axum server in background thread with its own runtime.
-            //    Uses a Notify-based shutdown signal so the thread can be
-            //    gracefully stopped before process exit.
+            // 3. Start axum server in background thread
             let shutdown = config::ServerShutdown::new();
             let shutdown_notify = shutdown.notifier();
             app.manage(shutdown);
@@ -43,32 +44,24 @@ pub fn run() {
                         return;
                     }
                 };
-                let port = rt.block_on(async { axum_server::start(server_state).await });
-                let _ = tx.send(port);
-                // Wait for shutdown signal instead of blocking forever.
-                // The tray "Quit" handler calls notify_one() on this Notify.
+                let (host, port) = rt.block_on(async { axum_server::start(server_state).await });
+                let _ = tx.send((host, port));
                 rt.block_on(shutdown_notify.notified());
                 log::info!("[Tauri] axum server shutting down");
             });
 
-            // 5. Wait for server to be ready
-            let port = rx.recv().map_err(|e| format!("server failed to start: {}", e))?;
-            log::info!("[Tauri] axum server ready on port {}", port);
+            // 4. Wait for server to be ready
+            let (host, port) = rx.recv().map_err(|e| format!("server failed to start: {}", e))?;
+            log::info!("[Tauri] axum server ready on {}:{}", host, port);
 
-            // 5b. Rewrite stale takeover configs if the port changed since last run
-            // This ensures CLI tools (Claude Code, Codex) can reach the proxy even
-            // if the user changed the port in config.yaml.
+            // 5. Rewrite stale takeover configs if the port changed
             refresh_takeover_configs(port);
 
             // 6. Create main window
-            // In dev mode, load from Vite dev server (API calls are proxied by Vite)
-            // In production, load from axum (which serves bundled static files)
             let window_url = if cfg!(debug_assertions) {
-                // cannot fail: well-known URL format
                 "http://localhost:5173".parse().unwrap()
             } else {
-                // cannot fail: well-formed URL from known port
-                format!("http://127.0.0.1:{}", port).parse().unwrap()
+                format!("http://{}:{}", host, port).parse().unwrap()
             };
             log::info!("[Tauri] opening window at {}", window_url);
 
@@ -83,7 +76,7 @@ pub fn run() {
             .center()
             .build()?;
 
-            // 7. Close-to-tray: intercept close request, hide instead
+            // 7. Close-to-tray
             let window_clone = window.clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -92,7 +85,7 @@ pub fn run() {
                 }
             });
 
-            // 8. Set up system tray
+            // 8. System tray
             tray::setup_tray(app)?;
 
             Ok(())
@@ -105,16 +98,45 @@ pub fn run() {
     }
 }
 
+/// Server mode: no Tauri window, just Axum HTTP server in foreground.
+/// Accessible via browser at http://host:port/
+pub fn run_server(port_override: Option<u16>, host_override: Option<String>) {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    rt.block_on(async {
+        let mut app_config = load_config().expect("failed to load config");
+        if let Some(p) = port_override { app_config.port = p; }
+        // Server mode defaults to 0.0.0.0 unless explicitly overridden
+        if host_override.is_some() {
+            app_config.host = host_override.unwrap();
+        } else {
+            app_config.host = "0.0.0.0".to_string();
+        }
+
+        let state = config::AppState::new(app_config).expect("failed to create state");
+        let (host, port) = axum_server::start(state).await;
+
+        println!("========================================");
+        println!("AginxBrain v{}", env!("CARGO_PKG_VERSION"));
+        println!("Listening on {}:{}", host, port);
+        println!("Web UI: http://{}:{}/", host, port);
+        println!("========================================");
+
+        // Block forever (Ctrl+C to stop)
+        tokio::signal::ctrl_c().await.expect("failed to listen for ctrl+c");
+        log::info!("[Server] shutting down");
+    });
+}
+
 /// On startup, rewrite takeover configs if they were active but point to a
-/// different port than the one the server just bound to.  This handles the
-/// common case where the user changes `port` in config.yaml and restarts.
+/// different port than the one the server just bound to.
 fn refresh_takeover_configs(port: u16) {
     // Claude Code takeover
     let claude_status = check_takeover_status(port);
     if claude_status.active {
         log::info!("[Startup] Claude Code takeover active on correct port {}", port);
     } else {
-        // Check if settings.json has a stale model-router base URL
         let claude_settings = match dirs::home_dir() {
             Some(h) => h.join(".claude").join("settings.json"),
             None => return,
@@ -136,7 +158,6 @@ fn refresh_takeover_configs(port: u16) {
     if codex_status.active {
         log::info!("[Startup] Codex takeover active on correct port {}", port);
     } else {
-        // Check if config.toml has a stale model-router provider
         let codex_config_path = match dirs::home_dir() {
             Some(h) => h.join(".codex").join("config.toml"),
             None => return,

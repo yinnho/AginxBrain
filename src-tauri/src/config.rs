@@ -19,6 +19,8 @@ pub struct RequestLog {
 pub struct AppConfig {
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_host")]
+    pub host: String,
     #[serde(default = "default_providers")]
     pub providers: HashMap<String, Provider>,
     #[serde(default = "default_routes")]
@@ -108,6 +110,10 @@ fn default_port() -> u16 {
     8083
 }
 
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+
 fn default_tag() -> String {
     "auto".to_string()
 }
@@ -157,6 +163,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             port: default_port(),
+            host: default_host(),
             providers: default_providers(),
             routes: default_routes(),
             tags: default_tags(),

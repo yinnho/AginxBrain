@@ -15,9 +15,10 @@ use rust_embed::RustEmbed;
 #[folder = "../web/dist/"]
 struct Asset;
 
-/// Start the axum HTTP server. Returns the port once bound.
-pub async fn start(state: AppState) -> u16 {
+/// Start the axum HTTP server. Returns the actual host:port once bound.
+pub async fn start(state: AppState) -> (String, u16) {
     let port = state.config.read().await.port;
+    let host = state.config.read().await.host.clone();
 
     let app = axum::Router::new()
         // Anthropic client paths
@@ -95,15 +96,16 @@ pub async fn start(state: AppState) -> u16 {
         .fallback(fallback_handler)
         .with_state(state);
 
-    let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await {
+    let listen_addr = format!("{}:{}", host, port);
+    let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
         Ok(l) => l,
         Err(e) => {
-            log::error!("[Server] failed to bind port {}: {}", port, e);
-            return port;
+            log::error!("[Server] failed to bind {}: {}", listen_addr, e);
+            return (host, port);
         }
     };
 
-    log::info!("aginxbrain listening on 127.0.0.1:{}", port);
+    log::info!("aginxbrain listening on {}", listen_addr);
 
     // Use oneshot channel to signal when the spawned server task has started,
     // preventing the race where the Tauri window connects before the server
@@ -119,7 +121,7 @@ pub async fn start(state: AppState) -> u16 {
     // ensuring the accept loop is active before the caller proceeds.
     ready_rx.await.ok();
 
-    port
+    (host, port)
 }
 
 /// Middleware that logs every incoming request.
@@ -223,7 +225,35 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
 
     #[cfg(debug_assertions)]
     {
-        log::warn!("[Fallback] GET {} → 404 (dev mode, Vite serves frontend)", uri.path());
+        // Dev mode: serve from disk (web/dist/) so browser access works during development
+        let file_path = uri.path().trim_start_matches('/');
+        let file_path = if file_path.is_empty() { "index.html" } else { file_path };
+
+        let disk_path = std::path::PathBuf::from("../web/dist").join(file_path);
+        if disk_path.exists() && disk_path.is_file() {
+            if let Ok(bytes) = tokio::fs::read(&disk_path).await {
+                let ct = mime_guess::from_path(file_path).first_or_octet_stream().to_string();
+                log::info!("[Fallback] GET {} → 200 (disk, {})", uri.path(), ct);
+                return (StatusCode::OK, [("content-type", ct)], bytes).into_response();
+            }
+        }
+
+        // SPA fallback: for paths without a file extension, serve index.html
+        let has_extension = std::path::Path::new(file_path).extension().is_some();
+        if !has_extension {
+            let html_path = std::path::PathBuf::from("../web/dist/index.html");
+            if let Ok(bytes) = tokio::fs::read(&html_path).await {
+                log::info!("[Fallback] GET {} → 200 (SPA fallback, disk)", uri.path());
+                return (
+                    StatusCode::OK,
+                    [("content-type", "text/html; charset=utf-8")],
+                    bytes,
+                )
+                    .into_response();
+            }
+        }
+
+        log::warn!("[Fallback] GET {} → 404 (dev, not on disk)", uri.path());
         (
             StatusCode::NOT_FOUND,
             [("content-type", "text/plain")],
