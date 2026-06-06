@@ -1,4 +1,4 @@
-use crate::config::{AppState, ProviderFormat, RequestLog, Route};
+use crate::config::{AppState, Provider, ProviderFormat, RequestLog, Route};
 use crate::convert;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use http_body_util::BodyExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Extract tag from Claude model name by keyword matching.
@@ -225,6 +225,15 @@ fn is_chat_format(format: &ProviderFormat) -> bool {
     matches!(
         format,
         ProviderFormat::Anthropic | ProviderFormat::Openai | ProviderFormat::OpenaiResponses
+    )
+}
+
+fn is_image_format(format: &ProviderFormat) -> bool {
+    matches!(
+        format,
+        ProviderFormat::OpenaiImages
+            | ProviderFormat::DashscopeImage
+            | ProviderFormat::MinimaxImage
     )
 }
 
@@ -1089,6 +1098,409 @@ fn strip_thinking(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// Image generation endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GenerateImageRequest {
+    #[serde(default)]
+    pub tag: Option<String>,
+    pub prompt: String,
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default = "default_image_count")]
+    pub n: u32,
+    #[serde(default)]
+    pub extra: std::collections::HashMap<String, Value>,
+}
+
+fn default_image_count() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GeneratedImage {
+    pub url: Option<String>,
+    #[serde(default)]
+    pub base64: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GenerateImageResponse {
+    pub success: bool,
+    pub tag: String,
+    pub provider: String,
+    pub model: String,
+    pub format: String,
+    pub images: Vec<GeneratedImage>,
+    pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub async fn generate_image(state: &AppState, req: GenerateImageRequest) -> GenerateImageResponse {
+    let prompt = req.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return image_error(String::new(), "image prompt cannot be empty".to_string());
+    }
+
+    let (tag, candidates, providers) = {
+        let config = state.config.read().await;
+        let tag = req.tag.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| config.current_tag.clone());
+        let candidates: Vec<Route> = find_candidate_routes(&config.routes, &tag)
+            .into_iter()
+            .filter(|r| r.modality == "image_generation" && is_image_format(&r.format))
+            .cloned()
+            .collect();
+        (tag, candidates, config.providers.clone())
+    };
+
+    if candidates.is_empty() {
+        return image_error(tag.clone(), format!("no enabled image_generation route found for tag '{}'", tag));
+    }
+
+    let mut last_error: Option<String> = None;
+    for (attempt, route) in candidates.iter().enumerate() {
+        if attempt > 0 {
+            log::warn!("[Image] {} failover: trying route #{} (provider={}, model={})", tag, attempt + 1, route.provider, route.model);
+        }
+
+        let provider = match providers.get(&route.provider) {
+            Some(p) => p,
+            None => {
+                last_error = Some(format!("provider '{}' not found", route.provider));
+                continue;
+            }
+        };
+        if provider.api_key.is_empty() || provider.api_key.starts_with("sk-your-") || provider.api_key == "your-key-here" {
+            last_error = Some(format!("provider '{}' has no valid API key configured", route.provider));
+            continue;
+        }
+
+        let url = format!("{}{}", provider.base_url.trim_end_matches('/'), route.endpoint.as_str());
+        let start = std::time::Instant::now();
+        let result = match route.format {
+            ProviderFormat::OpenaiImages => generate_openai_images(state, provider, route, &url, &prompt, &req).await,
+            ProviderFormat::DashscopeImage => generate_dashscope_image(state, provider, route, &url, &prompt, &req).await,
+            ProviderFormat::MinimaxImage => generate_minimax_image(state, provider, route, &url, &prompt, &req).await,
+            _ => Err(ProxyError::Upstream(format!("format {:?} is not an image generation format", route.format))),
+        };
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        match result {
+            Ok(images) if !images.is_empty() => {
+                state.log_request(RequestLog {
+                    request_model: tag.clone(),
+                    tag: tag.clone(),
+                    provider: provider.name.clone(),
+                    target_model: route.model.clone(),
+                    modality: "image_generation".into(),
+                    timestamp: chrono_now(),
+                }).await;
+                return GenerateImageResponse {
+                    success: true,
+                    tag,
+                    provider: provider.name.clone(),
+                    model: route.model.clone(),
+                    format: format_string(&route.format),
+                    images,
+                    latency_ms,
+                    error: None,
+                };
+            }
+            Ok(_) => {
+                last_error = Some("image provider returned no images".to_string());
+                continue;
+            }
+            Err(err) => {
+                let err_text = err.to_string();
+                log::warn!("[Image] route failed: {}", err_text);
+                if is_retryable(&err) {
+                    last_error = Some(err_text);
+                    continue;
+                }
+                return GenerateImageResponse {
+                    success: false,
+                    tag,
+                    provider: provider.name.clone(),
+                    model: route.model.clone(),
+                    format: format_string(&route.format),
+                    images: Vec::new(),
+                    latency_ms,
+                    error: Some(err_text),
+                };
+            }
+        }
+    }
+
+    image_error(tag, last_error.unwrap_or_else(|| "all image generation routes failed".to_string()))
+}
+
+fn image_error(tag: String, error: String) -> GenerateImageResponse {
+    GenerateImageResponse {
+        success: false,
+        tag,
+        provider: String::new(),
+        model: String::new(),
+        format: String::new(),
+        images: Vec::new(),
+        latency_ms: 0,
+        error: Some(error),
+    }
+}
+
+fn format_string(format: &ProviderFormat) -> String {
+    match format {
+        ProviderFormat::Anthropic => "anthropic",
+        ProviderFormat::Openai => "openai",
+        ProviderFormat::OpenaiResponses => "openai_responses",
+        ProviderFormat::OpenaiImages => "openai_images",
+        ProviderFormat::DashscopeImage => "dashscope_image",
+        ProviderFormat::DashscopeVideo => "dashscope_video",
+        ProviderFormat::DashscopeTts => "dashscope_tts",
+        ProviderFormat::Kling => "kling",
+        ProviderFormat::MinimaxImage => "minimax_image",
+    }.to_string()
+}
+
+async fn send_image_post(
+    state: &AppState,
+    provider: &Provider,
+    url: &str,
+    body: &Value,
+    extra_headers: &[(&str, &str)],
+) -> Result<Value, ProxyError> {
+    let mut builder = state.http_client.post(url)
+        .header("content-type", "application/json")
+        .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key));
+    for (k, v) in extra_headers {
+        builder = builder.header(*k, *v);
+    }
+    let resp = builder
+        .json(body)
+        .timeout(std::time::Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+    parse_image_response(resp).await
+}
+
+async fn send_image_get(state: &AppState, provider: &Provider, url: &str) -> Result<Value, ProxyError> {
+    let resp = state.http_client.get(url)
+        .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key))
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+    parse_image_response(resp).await
+}
+
+async fn parse_image_response(resp: reqwest::Response) -> Result<Value, ProxyError> {
+    let status = resp.status();
+    let status_code = status.as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(ProxyError::Upstream(format!("HTTP {}: {}", status_code, &text[..text.len().min(500)])));
+    }
+    serde_json::from_str(&text).map_err(|e| ProxyError::Upstream(format!("failed to parse image response: {}", e)))
+}
+
+fn merge_extra(body: &mut Value, extra: &std::collections::HashMap<String, Value>, protected: &[&str]) {
+    if let Some(obj) = body.as_object_mut() {
+        for (k, v) in extra {
+            if !protected.contains(&k.as_str()) && k != "parameters" && k != "input" {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+async fn generate_openai_images(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    url: &str,
+    prompt: &str,
+    req: &GenerateImageRequest,
+) -> Result<Vec<GeneratedImage>, ProxyError> {
+    let mut body = json!({
+        "model": route.model,
+        "prompt": prompt,
+        "n": req.n.max(1),
+        "response_format": "url",
+    });
+    if let Some(size) = &req.size {
+        body["size"] = Value::String(size.clone());
+    }
+    merge_extra(&mut body, &req.extra, &["model", "prompt"]);
+    let result = send_image_post(state, provider, url, &body, &[]).await?;
+    parse_openai_images(&result).ok_or_else(|| ProxyError::Upstream("No images in OpenAI Images response".to_string()))
+}
+
+async fn generate_dashscope_image(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    url: &str,
+    prompt: &str,
+    req: &GenerateImageRequest,
+) -> Result<Vec<GeneratedImage>, ProxyError> {
+    let size = req.size.clone().unwrap_or_else(|| "1024*1024".to_string()).replace('x', "*");
+    let mut parameters = json!({ "size": size, "n": req.n.max(1), "prompt_extend": true, "watermark": false });
+    if let Some(extra_params) = req.extra.get("parameters").and_then(|v| v.as_object()) {
+        if let Some(obj) = parameters.as_object_mut() {
+            for (k, v) in extra_params {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    for (k, v) in &req.extra {
+        if k != "parameters" && k != "input" {
+            if let Some(obj) = parameters.as_object_mut() {
+                obj.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+
+    let mut input = json!({ "prompt": prompt });
+    if let Some(extra_input) = req.extra.get("input").and_then(|v| v.as_object()) {
+        if let Some(obj) = input.as_object_mut() {
+            for (k, v) in extra_input {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let body = json!({ "model": route.model, "input": input, "parameters": parameters });
+    let result = send_image_post(state, provider, url, &body, &[]).await?;
+    if let Some(images) = parse_dashscope_images(&result) {
+        if !images.is_empty() {
+            return Ok(images);
+        }
+    }
+
+    if let Some(task_id) = result.pointer("/output/task_id").and_then(|v| v.as_str()) {
+        return poll_dashscope_image_task(state, provider, task_id).await;
+    }
+
+    Err(ProxyError::Upstream("No images or task_id in DashScope image response".to_string()))
+}
+
+async fn poll_dashscope_image_task(
+    state: &AppState,
+    provider: &Provider,
+    task_id: &str,
+) -> Result<Vec<GeneratedImage>, ProxyError> {
+    let poll_url = format!("https://dashscope.aliyuncs.com/api/v1/tasks/{}", task_id);
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > std::time::Duration::from_secs(120) {
+            return Err(ProxyError::Upstream("DashScope image task polling timed out".to_string()));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let result = send_image_get(state, provider, &poll_url).await?;
+        let status = result.pointer("/output/task_status").and_then(|v| v.as_str()).unwrap_or("");
+        match status {
+            "SUCCEEDED" | "Success" => {
+                return parse_dashscope_images(&result)
+                    .filter(|images| !images.is_empty())
+                    .ok_or_else(|| ProxyError::Upstream("DashScope image task completed without images".to_string()));
+            }
+            "FAILED" | "Failed" => {
+                let msg = result.pointer("/output/message").and_then(|v| v.as_str()).unwrap_or("Unknown DashScope task error");
+                return Err(ProxyError::Upstream(msg.to_string()));
+            }
+            _ => continue,
+        }
+    }
+}
+
+async fn generate_minimax_image(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    url: &str,
+    prompt: &str,
+    req: &GenerateImageRequest,
+) -> Result<Vec<GeneratedImage>, ProxyError> {
+    let mut body = json!({ "model": route.model, "prompt": prompt, "n": req.n.max(1), "response_format": "url" });
+    merge_extra(&mut body, &req.extra, &["model", "prompt"]);
+    let result = send_image_post(state, provider, url, &body, &[]).await?;
+    parse_minimax_images(&result).ok_or_else(|| ProxyError::Upstream("No images in MiniMax response".to_string()))
+}
+
+fn parse_openai_images(result: &Value) -> Option<Vec<GeneratedImage>> {
+    let mut images = Vec::new();
+    for item in result.get("data")?.as_array()? {
+        let url = item.get("url").and_then(|v| v.as_str()).map(String::from);
+        let base64 = item.get("b64_json").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if url.is_some() || !base64.is_empty() {
+            images.push(GeneratedImage { url, base64 });
+        }
+    }
+    Some(images)
+}
+
+fn parse_dashscope_images(result: &Value) -> Option<Vec<GeneratedImage>> {
+    let mut images = Vec::new();
+    if let Some(choices) = result.pointer("/output/choices").and_then(|v| v.as_array()) {
+        for choice in choices {
+            if let Some(content) = choice.pointer("/message/content").and_then(|v| v.as_array()) {
+                for block in content {
+                    if let Some(url) = block.get("image").and_then(|v| v.as_str()) {
+                        images.push(GeneratedImage { url: Some(url.to_string()), base64: String::new() });
+                    }
+                }
+            }
+        }
+    }
+    if let Some(results) = result.pointer("/output/results").and_then(|v| v.as_array()) {
+        for item in results {
+            let url = item.get("url").and_then(|v| v.as_str()).map(String::from);
+            let base64 = item.get("b64_image").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if url.is_some() || !base64.is_empty() {
+                images.push(GeneratedImage { url, base64 });
+            }
+        }
+    }
+    if let Some(data) = result.pointer("/output/data").and_then(|v| v.as_array()) {
+        for item in data {
+            let url = item.get("url").and_then(|v| v.as_str()).map(String::from);
+            let base64 = item.get("b64_json").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if url.is_some() || !base64.is_empty() {
+                images.push(GeneratedImage { url, base64 });
+            }
+        }
+    }
+    Some(images)
+}
+
+fn parse_minimax_images(result: &Value) -> Option<Vec<GeneratedImage>> {
+    let mut images = Vec::new();
+    if let Some(data) = result.get("data") {
+        if let Some(urls) = data.get("image_urls").and_then(|v| v.as_array()) {
+            for url_val in urls {
+                if let Some(url) = url_val.as_str() {
+                    images.push(GeneratedImage { url: Some(url.to_string()), base64: String::new() });
+                }
+            }
+        }
+        if let Some(b64s) = data.get("image_base64").and_then(|v| v.as_array()) {
+            for b64_val in b64s {
+                if let Some(base64) = b64_val.as_str() {
+                    images.push(GeneratedImage { url: None, base64: base64.to_string() });
+                }
+            }
+        }
+    }
+    if images.is_empty() {
+        if let Some(openai_style) = parse_openai_images(result) {
+            images.extend(openai_style);
+        }
+    }
+    Some(images)
 }
 
 // ---------------------------------------------------------------------------

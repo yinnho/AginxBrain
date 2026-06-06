@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { AppConfig, Route, RouteFormat, TestResult } from '../lib/api';
+import type { AppConfig, GenerateImageResponse, Route, RouteFormat, TestResult } from '../lib/api';
 import { FORMAT_ENDPOINTS, FORMAT_MODALITIES, MODALITY_LABELS, SUPPORTED_MODALITIES } from '../lib/api';
 import * as api from '../lib/api';
 import { Button } from '../components/Button';
@@ -12,6 +12,12 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
   const [adding, setAdding] = useState(false);
   const [testResults, setTestResults] = useState<Record<number, TestResult>>({});
   const [testing, setTesting] = useState<number | null>(null);
+  const [imageTag, setImageTag] = useState(config.current_tag || config.tags[0]?.name || 'image');
+  const [imagePrompt, setImagePrompt] = useState('');
+  const [imageSize, setImageSize] = useState('1024x1024');
+  const [imageCount, setImageCount] = useState(1);
+  const [imageLoading, setImageLoading] = useState(false);
+  const [imageResult, setImageResult] = useState<GenerateImageResponse | null>(null);
 
   const handleDelete = async (index: number) => {
     const newRoutes = config.routes.filter((_, i) => i !== index);
@@ -48,6 +54,32 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
     const newConfig = { ...config, routes: newRoutes };
     await api.updateConfig(newConfig);
     onConfigChange(newConfig);
+  };
+
+  const handleGenerateImage = async () => {
+    setImageLoading(true);
+    setImageResult(null);
+    try {
+      const result = await api.generateImage({
+        tag: imageTag,
+        prompt: imagePrompt,
+        size: imageSize,
+        n: imageCount,
+      });
+      setImageResult(result);
+    } catch (e: any) {
+      setImageResult({
+        success: false,
+        tag: imageTag,
+        provider: '',
+        model: '',
+        format: '',
+        images: [],
+        latency_ms: 0,
+        error: e.message || 'Image generation failed',
+      });
+    }
+    setImageLoading(false);
   };
 
   return (
@@ -198,6 +230,51 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
           </div>
         )}
       </div>
+
+      <Card style={{ marginTop: 20, background: 'rgba(236,72,153,0.06)', border: '1px solid rgba(236,72,153,0.18)' }}>
+        <h3 style={{ margin: '0 0 12px 0', fontSize: 12, color: 'var(--text-muted)', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Generate Image</h3>
+        <div style={{ display: 'grid', gridTemplateColumns: '160px 1fr 140px 90px', gap: 10, alignItems: 'end' }}>
+          <Select label="Tag" value={imageTag} onChange={e => setImageTag(e.target.value)}>
+            {config.tags.map(t => <option key={t.name} value={t.name}>{t.name}</option>)}
+          </Select>
+          <Input label="Prompt" value={imagePrompt} onChange={e => setImagePrompt(e.target.value)} placeholder="A cyberpunk cat at night" />
+          <Input label="Size" value={imageSize} onChange={e => setImageSize(e.target.value)} placeholder="1024x1024" />
+          <Input label="N" type="number" min="1" max="10" value={imageCount} onChange={e => setImageCount(Math.max(1, Number(e.target.value) || 1))} />
+        </div>
+        <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
+          <Button variant="primary" disabled={imageLoading || !imagePrompt.trim()} onClick={handleGenerateImage}>
+            {imageLoading ? '⏳ Generating...' : '🎨 Generate'}
+          </Button>
+          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            Uses routes with modality=image_generation and image formats.
+          </span>
+        </div>
+        {imageResult && (
+          <div style={{ marginTop: 12, padding: 10, borderRadius: 'var(--radius-sm)', fontSize: 12, background: imageResult.success ? 'var(--success-dim)' : 'var(--danger-dim)' }}>
+            {imageResult.success ? (
+              <div>
+                <div>
+                  <span style={{ color: 'var(--success)', fontWeight: 600 }}>✓ Generated</span>
+                  <span style={{ color: 'var(--text-muted)', marginLeft: 8 }}>{imageResult.provider} / {imageResult.model}</span>
+                  <span style={{ color: 'var(--text-muted)', marginLeft: 8 }}>{imageResult.latency_ms}ms</span>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 10, marginTop: 10 }}>
+                  {imageResult.images.map((img, i) => {
+                    const src = img.url || (img.base64 ? `data:image/png;base64,${img.base64}` : '');
+                    return src ? (
+                      <a key={i} href={src} target="_blank" rel="noreferrer" style={{ display: 'block' }}>
+                        <img src={src} style={{ width: '100%', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)' }} />
+                      </a>
+                    ) : null;
+                  })}
+                </div>
+              </div>
+            ) : (
+              <div style={{ color: 'var(--danger)' }}>✗ {imageResult.error}</div>
+            )}
+          </div>
+        )}
+      </Card>
 
       <Card style={{ marginTop: 20, background: 'rgba(0,0,0,0.2)' }}>
         <h3 style={{ margin: '0 0 8px 0', fontSize: 12, color: 'var(--text-muted)', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.5px' }}>curl test commands</h3>

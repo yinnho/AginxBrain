@@ -231,3 +231,36 @@ export async function testRoute(tag: string, prompt?: string): Promise<TestResul
   });
   return res.json();
 }
+
+export interface GenerateImageRequest {
+  tag?: string;
+  prompt: string;
+  size?: string;
+  n?: number;
+  extra?: Record<string, unknown>;
+}
+
+export interface GeneratedImage {
+  url: string | null;
+  base64: string;
+}
+
+export interface GenerateImageResponse {
+  success: boolean;
+  tag: string;
+  provider: string;
+  model: string;
+  format: string;
+  images: GeneratedImage[];
+  latency_ms: number;
+  error?: string;
+}
+
+export async function generateImage(req: GenerateImageRequest): Promise<GenerateImageResponse> {
+  const res = await fetch(`${API_BASE}/brain/generate/image`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(req),
+  });
+  return res.json();
+}

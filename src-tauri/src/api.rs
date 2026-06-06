@@ -176,6 +176,14 @@ pub async fn test_route_handler(
     Json(result)
 }
 
+// POST /api/brain/generate/image
+pub async fn generate_image_handler(
+    State(state): State<AppState>,
+    Json(req): Json<proxy::GenerateImageRequest>,
+) -> Json<proxy::GenerateImageResponse> {
+    Json(proxy::generate_image(&state, req).await)
+}
+
 // GET /v1/models — OpenAI-compatible model discovery for Codex
 // Returns tag-based virtual model names (opus, sonnet, haiku, auto) PLUS
 // Codex catalog model names (gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5.2)
