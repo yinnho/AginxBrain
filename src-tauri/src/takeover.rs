@@ -15,10 +15,10 @@ fn claude_settings_backup_path() -> Result<PathBuf> {
         Some(h) => h,
         None => return Err(anyhow::anyhow!("no home directory")),
     };
-    Ok(home.join(".claude").join("settings.json.aginxllm-backup"))
+    Ok(home.join(".claude").join("settings.json.aginxbrain-backup"))
 }
 
-/// Environment variable keys that would override aginxllm's routing.
+/// Environment variable keys that would override aginxbrain's routing.
 const ROUTER_OVERRIDE_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
@@ -67,7 +67,7 @@ pub fn take_over_claude(port: u16) -> Result<String> {
                 env.remove(*key);
             }
 
-            // Set new env vars for aginxllm
+            // Set new env vars for aginxbrain
             env.insert(
                 "ANTHROPIC_BASE_URL".to_string(),
                 Value::String(proxy_url.clone()),
@@ -93,7 +93,7 @@ pub fn take_over_claude(port: u16) -> Result<String> {
             // Actual requests will use provider keys from proxy config
             env.insert(
                 "ANTHROPIC_API_KEY".to_string(),
-                Value::String("sk-ant-placeholder-aginxllm".to_string()),
+                Value::String("sk-ant-placeholder-aginxbrain".to_string()),
             );
         }
     }
@@ -200,7 +200,7 @@ fn codex_config_path() -> Result<PathBuf> {
 }
 
 fn codex_config_backup_path() -> Result<PathBuf> {
-    Ok(codex_dir()?.join("config.toml.aginxllm-backup"))
+    Ok(codex_dir()?.join("config.toml.aginxbrain-backup"))
 }
 
 fn codex_auth_path() -> Result<PathBuf> {
@@ -208,7 +208,7 @@ fn codex_auth_path() -> Result<PathBuf> {
 }
 
 fn codex_auth_backup_path() -> Result<PathBuf> {
-    Ok(codex_dir()?.join("auth.json.aginxllm-backup"))
+    Ok(codex_dir()?.join("auth.json.aginxbrain-backup"))
 }
 
 pub fn take_over_codex(port: u16, default_model: &str) -> Result<String> {
@@ -246,12 +246,12 @@ pub fn take_over_codex(port: u16, default_model: &str) -> Result<String> {
     // every request; the proxy ignores auth and routes by tag regardless.
     let config_toml = format!(
         r#"model = "{model}"
-model_provider = "aginxllm"
+model_provider = "aginxbrain"
 preferred_auth_method = "apikey"
 disable_response_storage = true
 
-[model_providers.aginxllm]
-name = "AginxLLM"
+[model_providers.aginxbrain]
+name = "AginxBrain"
 base_url = "{url}"
 wire_api = "responses"
 requires_openai_auth = true

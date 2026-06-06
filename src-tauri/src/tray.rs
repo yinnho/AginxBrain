@@ -5,7 +5,7 @@ use tauri::{
 };
 
 pub fn setup_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
-    let show_item = MenuItemBuilder::with_id("show", "Show AginxLLM").build(app)?;
+    let show_item = MenuItemBuilder::with_id("show", "Show AginxBrain").build(app)?;
     let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
     let menu = MenuBuilder::new(app)
@@ -13,7 +13,7 @@ pub fn setup_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let mut tray_builder = TrayIconBuilder::with_id("main-tray")
-        .tooltip("AginxLLM")
+        .tooltip("AginxBrain")
         .menu(&menu);
 
     if let Some(icon) = app.default_window_icon() {

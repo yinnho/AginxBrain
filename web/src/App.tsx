@@ -48,7 +48,7 @@ function App() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'aginxllm-config.json';
+      a.download = 'aginxbrain-config.json';
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -163,7 +163,7 @@ function App() {
             fontSize: 16, fontWeight: 700, color: '#fff',
           }}>M</div>
           <div>
-            <h1 style={{ margin: 0, fontSize: 18, fontWeight: 700, letterSpacing: '-0.3px' }}>AginxLLM</h1>
+            <h1 style={{ margin: 0, fontSize: 18, fontWeight: 700, letterSpacing: '-0.3px' }}>AginxBrain</h1>
             <div style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace' }}>127.0.0.1:{config.port}</div>
           </div>
         </div>

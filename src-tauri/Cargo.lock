@@ -2172,7 +2172,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "aginxllm"
+name = "aginxbrain"
 version = "0.2.5"
 dependencies = [
  "anyhow",

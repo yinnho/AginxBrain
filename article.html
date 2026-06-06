@@ -160,7 +160,7 @@
 
 <h1>用国产模型跑 Claude Code，每年省下几千块</h1>
 
-<p style="text-align:center;color:#64748b;font-size:14px;margin-top:4px;">AginxLLM v0.2.0 · 开源免费 · 支持 Claude Code & Codex CLI</p>
+<p style="text-align:center;color:#64748b;font-size:14px;margin-top:4px;">AginxBrain v0.2.0 · 开源免费 · 支持 Claude Code & Codex CLI</p>
 
 <div class="section-divider">· · ·</div>
 
@@ -188,9 +188,9 @@
 
 <div class="section-divider">· · ·</div>
 
-<h2>AginxLLM：模型路由器</h2>
+<h2>AginxBrain：模型路由器</h2>
 
-<p><strong>AginxLLM</strong> 是一个开源桌面应用（Tauri v2 + Rust），位于 Claude Code 和模型提供商之间，做两件事：</p>
+<p><strong>AginxBrain</strong> 是一个开源桌面应用（Tauri v2 + Rust），位于 Claude Code 和模型提供商之间，做两件事：</p>
 
 <div class="callout">
 <p><strong>1. 按标签路由</strong> — opus → 智谱 GLM，sonnet → DeepSeek Pro，haiku → DeepSeek Flash</p>
@@ -201,9 +201,9 @@
 
 <h3>它不是简单的代理</h3>
 
-<p>普通代理只能原样转发，要求两边用同一个协议。AginxLLM 是<strong>协议感知的智能路由</strong>：</p>
+<p>普通代理只能原样转发，要求两边用同一个协议。AginxBrain 是<strong>协议感知的智能路由</strong>：</p>
 
-<pre><code>Claude Code 发出：                   AginxLLM 转发到：
+<pre><code>Claude Code 发出：                   AginxBrain 转发到：
 POST /v1/messages                   POST /v1/chat/completions
 {                                   {
   "model": "opus",        →           "model": "glm-5.1",
@@ -219,7 +219,7 @@ POST /v1/messages                   POST /v1/chat/completions
 
 <h3>一、标签路由——把 Claude Code 的调度能力用到国产模型上</h3>
 
-<p>Claude Code 内部会根据任务难度，在 opus/sonnet/haiku 之间自动切换。AginxLLM 利用这个机制，把每个档位路由到不同的国产模型：</p>
+<p>Claude Code 内部会根据任务难度，在 opus/sonnet/haiku 之间自动切换。AginxBrain 利用这个机制，把每个档位路由到不同的国产模型：</p>
 
 <pre><code>opus   → 智谱 GLM (glm-5.1)        ← 强推理，价格是 Opus 的 1/10
 sonnet → DeepSeek (deepseek-v4-pro)  ← 编码出色，价格是 Sonnet 的 1/5
@@ -230,7 +230,7 @@ auto   → Moonshot Kimi (K2.6)        ← 未识别模型自动走这里</code>
 
 <h3>二、协议转换——三种主流格式任意互转</h3>
 
-<p>不同提供商用不同的 API 格式，AginxLLM 支持三向互转：</p>
+<p>不同提供商用不同的 API 格式，AginxBrain 支持三向互转：</p>
 
 <table>
 <tr><th>客户端格式</th><th>Provider 格式</th><th>典型场景</th></tr>
@@ -266,10 +266,10 @@ auto   → Moonshot Kimi (K2.6)        ← 未识别模型自动走这里</code>
 </div>
 
 <pre><code>model = "gpt-5.5"
-model_provider = "aginxllm"
+model_provider = "aginxbrain"
 
-[model_providers.aginxllm]
-name = "AginxLLM"
+[model_providers.aginxbrain]
+name = "AginxBrain"
 base_url = "http://127.0.0.1:8082"
 wire_api = "responses"</code></pre>
 
@@ -279,13 +279,13 @@ wire_api = "responses"</code></pre>
 
 <h2>Codex CLI 支持</h2>
 
-<p>v0.2.0 新增了对 OpenAI Codex CLI 的支持。Codex 使用 <strong>OpenAI Responses API</strong> 协议（和 Claude Code 的 Anthropic Messages 完全不同），AginxLLM 现在可以：</p>
+<p>v0.2.0 新增了对 OpenAI Codex CLI 的支持。Codex 使用 <strong>OpenAI Responses API</strong> 协议（和 Claude Code 的 Anthropic Messages 完全不同），AginxBrain 现在可以：</p>
 
 <p>✅ 把 Codex 的 Responses API 请求转换为 OpenAI Chat 或 Anthropic Messages 格式<br>
 ✅ 流式 SSE 双向转换<br>
 ✅ 一键写入 Codex 配置文件</p>
 
-<p><span class="highlight">同一个 AginxLLM 实例，同时服务 Claude Code 和 Codex CLI，共用同一套路由规则。</span></p>
+<p><span class="highlight">同一个 AginxBrain 实例，同时服务 Claude Code 和 Codex CLI，共用同一套路由规则。</span></p>
 
 <div class="section-divider">· · ·</div>
 
@@ -293,17 +293,17 @@ wire_api = "responses"</code></pre>
 
 <div class="callout-orange callout">
 <p><strong>坑一：Thinking Blocks 协议变更</strong></p>
-<p>Claude Code 2.1.x 引入 Opus 4.8 后大量使用 thinking blocks，国产 provider 不一定支持。AginxLLM 自动处理透传和转换，再也不会出现 "Content block not found" 之类的 API 错误。</p>
+<p>Claude Code 2.1.x 引入 Opus 4.8 后大量使用 thinking blocks，国产 provider 不一定支持。AginxBrain 自动处理透传和转换，再也不会出现 "Content block not found" 之类的 API 错误。</p>
 </div>
 
 <div class="callout-orange callout">
 <p><strong>坑二：模型名反馈循环</strong></p>
-<p>Claude Code 会"记住" provider 返回的模型名，导致下次请求绕过路由。AginxLLM 在返回响应前，将 provider 的模型名替换为原始别名——反馈循环被彻底切断。</p>
+<p>Claude Code 会"记住" provider 返回的模型名，导致下次请求绕过路由。AginxBrain 在返回响应前，将 provider 的模型名替换为原始别名——反馈循环被彻底切断。</p>
 </div>
 
 <div class="callout-orange callout">
 <p><strong>坑三：协议格式不兼容</strong></p>
-<p>三种协议互不兼容，AginxLLM 的三向转换引擎一站式解决。</p>
+<p>三种协议互不兼容，AginxBrain 的三向转换引擎一站式解决。</p>
 </div>
 
 <div class="section-divider">· · ·</div>
@@ -315,7 +315,7 @@ wire_api = "responses"</code></pre>
 <tr><td>手动配环境变量</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td></tr>
 <tr><td>普通 HTTP 代理</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td></tr>
 <tr><td>降级旧版本</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td></tr>
-<tr><td><strong>AginxLLM</strong></td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
+<tr><td><strong>AginxBrain</strong></td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
 </table>
 
 <div class="section-divider">· · ·</div>
@@ -331,13 +331,13 @@ wire_api = "responses"</code></pre>
 <tr><td>Linux</td><td><code>.AppImage</code></td><td><code>chmod +x</code> 运行</td></tr>
 </table>
 
-<p>安装后编辑 <code>~/.aginxllm/config.yaml</code>，配置你的 provider 和路由规则，然后在管理界面点击 "Takeover"——完成。</p>
+<p>安装后编辑 <code>~/.aginxbrain/config.yaml</code>，配置你的 provider 和路由规则，然后在管理界面点击 "Takeover"——完成。</p>
 
 <div class="section-divider">· · ·</div>
 
 <h2>写在最后</h2>
 
-<p>AginxLLM 的核心理念很简单：<span class="highlight">Claude Code 的智能调度很好，但不一定要用 Anthropic 的模型来执行</span>。把 opus/sonnet/haiku 的调度能力，和国产模型的性价比结合起来——这就是 AginxLLM 做的事。</p>
+<p>AginxBrain 的核心理念很简单：<span class="highlight">Claude Code 的智能调度很好，但不一定要用 Anthropic 的模型来执行</span>。把 opus/sonnet/haiku 的调度能力，和国产模型的性价比结合起来——这就是 AginxBrain 做的事。</p>
 
 <p>不需要降级。不需要折腾环境变量。不需要担心协议不兼容。</p>
 

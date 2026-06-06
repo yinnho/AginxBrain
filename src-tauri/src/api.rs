@@ -212,7 +212,7 @@ pub async fn get_models(State(state): State<AppState>) -> Json<serde_json::Value
             "id": tag,
             "object": "model",
             "created": 0,
-            "owned_by": "aginxllm"
+            "owned_by": "aginxbrain"
         })
     }).collect();
     // Sort for consistent ordering

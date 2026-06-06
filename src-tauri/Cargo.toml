@@ -1,10 +1,10 @@
 [package]
-name = "aginxllm"
+name = "aginxbrain"
 version = "0.2.5"
 edition = "2021"
 
 [lib]
-name = "aginxllm_lib"
+name = "aginxbrain_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]

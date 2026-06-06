@@ -113,7 +113,7 @@ fn default_tag() -> String {
 }
 
 fn default_management_key() -> String {
-    "aginxllm-local".to_string()
+    "aginxbrain-local".to_string()
 }
 
 fn default_auth_type() -> AuthType {
@@ -167,15 +167,15 @@ impl Default for AppConfig {
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    // Allow override via AGINXLLM_CONFIG environment variable
-    if let Ok(path) = std::env::var("AGINXLLM_CONFIG") {
+    // Allow override via AGINXBRAIN_CONFIG environment variable
+    if let Ok(path) = std::env::var("AGINXBRAIN_CONFIG") {
         if !path.is_empty() {
-            log::info!("[Config] using config path from AGINXLLM_CONFIG: {}", path);
+            log::info!("[Config] using config path from AGINXBRAIN_CONFIG: {}", path);
             return Ok(PathBuf::from(path));
         }
     }
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-    Ok(home.join(".aginxllm").join("config.yaml"))
+    Ok(home.join(".aginxbrain").join("config.yaml"))
 }
 
 pub fn load_config() -> Result<AppConfig> {
@@ -302,7 +302,7 @@ mod tests {
         let cfg = AppConfig::default();
         assert_eq!(cfg.port, 8083);
         assert_eq!(cfg.current_tag, "auto");
-        assert_eq!(cfg.management_key, "aginxllm-local");
+        assert_eq!(cfg.management_key, "aginxbrain-local");
         assert!(!cfg.providers.is_empty());
         assert!(!cfg.routes.is_empty());
         assert!(!cfg.tags.is_empty());
@@ -366,6 +366,6 @@ mod tests {
 
     #[test]
     fn test_management_key_default() {
-        assert_eq!(default_management_key(), "aginxllm-local");
+        assert_eq!(default_management_key(), "aginxbrain-local");
     }
 }

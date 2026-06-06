@@ -77,7 +77,7 @@ pub fn run() {
                 "main",
                 tauri::WebviewUrl::External(window_url),
             )
-            .title("AginxLLM")
+            .title("AginxBrain")
             .inner_size(960.0, 700.0)
             .min_inner_size(600.0, 400.0)
             .center()
