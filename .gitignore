@@ -1,0 +1,23 @@
+# Config with real API keys
+config.yaml
+
+# Rust build output
+src-tauri/target/
+
+# Node
+web/node_modules/
+web/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+.claude/worktrees/

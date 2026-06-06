@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>用国产模型跑 Claude Code，每年省下几千块</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.8;
+    color: #333;
+    max-width: 680px;
+    margin: 0 auto;
+    padding: 20px;
+    background: #fff;
+  }
+  h1 {
+    font-size: 24px;
+    font-weight: 700;
+    text-align: center;
+    margin: 30px 0 10px;
+    color: #1a1a1a;
+  }
+  h2 {
+    font-size: 20px;
+    font-weight: 700;
+    margin: 40px 0 16px;
+    padding-left: 12px;
+    border-left: 4px solid #3B82F6;
+    color: #1a1a1a;
+  }
+  h3 {
+    font-size: 17px;
+    font-weight: 600;
+    margin: 28px 0 12px;
+    color: #1a1a1a;
+  }
+  p {
+    font-size: 15px;
+    margin: 12px 0;
+    color: #333;
+  }
+  strong {
+    color: #1a1a1a;
+  }
+  .highlight {
+    background: linear-gradient(to top, #bfdbfe 40%, transparent 40%);
+    font-weight: 600;
+  }
+  .cost-box {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 20px;
+    margin: 20px 0;
+  }
+  .cost-box p {
+    margin: 6px 0;
+    font-size: 14px;
+  }
+  .big-number {
+    font-size: 28px;
+    font-weight: 700;
+    color: #3B82F6;
+  }
+  .callout {
+    background: #eff6ff;
+    border-left: 4px solid #3B82F6;
+    padding: 16px 20px;
+    margin: 20px 0;
+    border-radius: 0 8px 8px 0;
+  }
+  .callout p {
+    margin: 6px 0;
+    font-size: 15px;
+  }
+  .callout-green {
+    background: #f0fdf4;
+    border-left-color: #22C55E;
+  }
+  .callout-orange {
+    background: #fffbeb;
+    border-left-color: #F59E0B;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  th {
+    background: #f1f5f9;
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 600;
+    border: 1px solid #e2e8f0;
+  }
+  td {
+    padding: 10px 12px;
+    border: 1px solid #e2e8f0;
+  }
+  pre {
+    background: #1e293b;
+    color: #e2e8f0;
+    padding: 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.6;
+    margin: 16px 0;
+  }
+  code {
+    font-family: "SF Mono", "Fira Code", Menlo, Consolas, monospace;
+    font-size: 13px;
+    background: #f1f5f9;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+  }
+  .tag {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #fff;
+    margin-right: 4px;
+  }
+  .tag-opus { background: #A855F7; }
+  .tag-sonnet { background: #3B82F6; }
+  .tag-haiku { background: #22C55E; }
+  .tag-auto { background: #F59E0B; }
+  .compare-table td:first-child {
+    font-weight: 600;
+  }
+  .compare-table tr td:last-child {
+    text-align: center;
+  }
+  .footer {
+    margin-top: 40px;
+    padding-top: 20px;
+    border-top: 1px solid #e2e8f0;
+    text-align: center;
+    font-size: 14px;
+    color: #64748b;
+  }
+  .section-divider {
+    text-align: center;
+    margin: 32px 0;
+    color: #cbd5e1;
+    font-size: 20px;
+    letter-spacing: 8px;
+  }
+</style>
+</head>
+<body>
+
+<h1>用国产模型跑 Claude Code，每年省下几千块</h1>
+
+<p style="text-align:center;color:#64748b;font-size:14px;margin-top:4px;">AginxLLM v0.2.0 · 开源免费 · 支持 Claude Code & Codex CLI</p>
+
+<div class="section-divider">· · ·</div>
+
+<h2>先算一笔账</h2>
+
+<p>Claude Code 的工作方式是：<strong>根据任务复杂度，自动切换模型</strong>。</p>
+
+<p>简单问题切 haiku，日常编码用 sonnet，复杂推理上 opus。这个设计很聪明——但问题是，<span class="highlight">Anthropic 的 opus 很贵，sonnet 也不便宜</span>。</p>
+
+<p>以一个典型工作日为例，Claude Code 大约发出 200-400 次请求：</p>
+
+<div class="cost-box">
+<table>
+<tr><th>模型</th><th>占比</th><th>单次 token 成本</th><th>日成本（估算）</th></tr>
+<tr><td><span class="tag tag-opus">opus</span></td><td>~20%</td><td>$0.015/1K</td><td>$3-5</td></tr>
+<tr><td><span class="tag tag-sonnet">sonnet</span></td><td>~60%</td><td>$0.003/1K</td><td>$2-4</td></tr>
+<tr><td><span class="tag tag-haiku">haiku</span></td><td>~20%</td><td>$0.0003/1K</td><td>$0.1</td></tr>
+</table>
+<p style="text-align:center;margin-top:16px;">一天 <span class="big-number">$5-10</span>，一个月 <span class="big-number">$150-300</span>，一年 <span class="big-number">$2000-4000</span></p>
+</div>
+
+<p>如果 opus 走智谱 GLM（价格约为 Anthropic 的 1/10），sonnet 走 DeepSeek Pro，haiku 走 DeepSeek Flash——<span class="highlight">同样的工作流，成本可以降到原来的 1/5 甚至更低</span>。</p>
+
+<p>但问题来了：<strong>怎么让 Claude Code 的 opus/sonnet/haiku 请求，分别走到不同的国产模型上？</strong></p>
+
+<div class="section-divider">· · ·</div>
+
+<h2>AginxLLM：模型路由器</h2>
+
+<p><strong>AginxLLM</strong> 是一个开源桌面应用（Tauri v2 + Rust），位于 Claude Code 和模型提供商之间，做两件事：</p>
+
+<div class="callout">
+<p><strong>1. 按标签路由</strong> — opus → 智谱 GLM，sonnet → DeepSeek Pro，haiku → DeepSeek Flash</p>
+<p><strong>2. 协议转换</strong> — Claude Code 用 Anthropic Messages 协议，DeepSeek 只认 OpenAI Chat 协议——自动转换</p>
+</div>
+
+<p class="callout-green callout"><strong>Claude Code 的智能调度能力不变，但推理成本大幅降低。</strong></p>
+
+<h3>它不是简单的代理</h3>
+
+<p>普通代理只能原样转发，要求两边用同一个协议。AginxLLM 是<strong>协议感知的智能路由</strong>：</p>
+
+<pre><code>Claude Code 发出：                   AginxLLM 转发到：
+POST /v1/messages                   POST /v1/chat/completions
+{                                   {
+  "model": "opus",        →           "model": "glm-5.1",
+  "messages": [...],                  "messages": [...],
+  "max_tokens": 4096                  "max_tokens": 4096
+}                                   }</code></pre>
+
+<p>请求格式、响应格式、流式 SSE，全部自动转换。对 Claude Code 来说，它以为自己在跟 Anthropic API 通信；对 provider 来说，它以为自己在服务一个 OpenAI 格式的客户端。</p>
+
+<div class="section-divider">· · ·</div>
+
+<h2>三大核心功能</h2>
+
+<h3>一、标签路由——把 Claude Code 的调度能力用到国产模型上</h3>
+
+<p>Claude Code 内部会根据任务难度，在 opus/sonnet/haiku 之间自动切换。AginxLLM 利用这个机制，把每个档位路由到不同的国产模型：</p>
+
+<pre><code>opus   → 智谱 GLM (glm-5.1)        ← 强推理，价格是 Opus 的 1/10
+sonnet → DeepSeek (deepseek-v4-pro)  ← 编码出色，价格是 Sonnet 的 1/5
+haiku  → DeepSeek (deepseek-v4-flash) ← 极速响应，几乎不花钱
+auto   → Moonshot Kimi (K2.6)        ← 未识别模型自动走这里</code></pre>
+
+<p><strong>你不需要改变 Claude Code 的任何使用习惯。</strong>该用 opus 还是用 opus，只是背后实际跑的是智谱 GLM。</p>
+
+<h3>二、协议转换——三种主流格式任意互转</h3>
+
+<p>不同提供商用不同的 API 格式，AginxLLM 支持三向互转：</p>
+
+<table>
+<tr><th>客户端格式</th><th>Provider 格式</th><th>典型场景</th></tr>
+<tr><td>Anthropic Messages</td><td>OpenAI Chat</td><td>DeepSeek、Moonshot</td></tr>
+<tr><td>Anthropic Messages</td><td>OpenAI Responses</td><td>通义千问 DashScope</td></tr>
+<tr><td>Anthropic Messages</td><td>Anthropic（透传）</td><td>百度文心、智谱 GLM</td></tr>
+<tr><td>OpenAI Responses</td><td>OpenAI Chat</td><td>Codex CLI → DeepSeek</td></tr>
+<tr><td>OpenAI Responses</td><td>Anthropic Messages</td><td>Codex CLI → 智谱 GLM</td></tr>
+</table>
+
+<p>流式 SSE 转换同样完整支持，thinking 块、text 块、tool_use 块全部正确处理。</p>
+
+<h3>三、一键接管——零配置，开关即用</h3>
+
+<p>不需要手动改环境变量。管理界面点击 "Takeover"：</p>
+
+<div class="callout">
+<p><strong>Claude Code 接管</strong>：自动写入 <code>~/.claude/settings.json</code></p>
+</div>
+
+<pre><code>{
+  "env": {
+    "ANTHROPIC_MODEL": "auto",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8082/anthropic",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "opus",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku"
+  }
+}</code></pre>
+
+<div class="callout">
+<p><strong>Codex CLI 接管</strong>：自动写入 <code>~/.codex/config.toml</code></p>
+</div>
+
+<pre><code>model = "gpt-5.5"
+model_provider = "model-router"
+
+[model_providers.model-router]
+name = "AginxLLM"
+base_url = "http://127.0.0.1:8082"
+wire_api = "responses"</code></pre>
+
+<p>点击 "Restore" 一键恢复原始配置，零风险。</p>
+
+<div class="section-divider">· · ·</div>
+
+<h2>Codex CLI 支持</h2>
+
+<p>v0.2.0 新增了对 OpenAI Codex CLI 的支持。Codex 使用 <strong>OpenAI Responses API</strong> 协议（和 Claude Code 的 Anthropic Messages 完全不同），AginxLLM 现在可以：</p>
+
+<p>✅ 把 Codex 的 Responses API 请求转换为 OpenAI Chat 或 Anthropic Messages 格式<br>
+✅ 流式 SSE 双向转换<br>
+✅ 一键写入 Codex 配置文件</p>
+
+<p><span class="highlight">同一个 AginxLLM 实例，同时服务 Claude Code 和 Codex CLI，共用同一套路由规则。</span></p>
+
+<div class="section-divider">· · ·</div>
+
+<h2>还解决了三个"坑"</h2>
+
+<div class="callout-orange callout">
+<p><strong>坑一：Thinking Blocks 协议变更</strong></p>
+<p>Claude Code 2.1.x 引入 Opus 4.8 后大量使用 thinking blocks，国产 provider 不一定支持。AginxLLM 自动处理透传和转换，再也不会出现 "Content block not found" 之类的 API 错误。</p>
+</div>
+
+<div class="callout-orange callout">
+<p><strong>坑二：模型名反馈循环</strong></p>
+<p>Claude Code 会"记住" provider 返回的模型名，导致下次请求绕过路由。AginxLLM 在返回响应前，将 provider 的模型名替换为原始别名——反馈循环被彻底切断。</p>
+</div>
+
+<div class="callout-orange callout">
+<p><strong>坑三：协议格式不兼容</strong></p>
+<p>三种协议互不兼容，AginxLLM 的三向转换引擎一站式解决。</p>
+</div>
+
+<div class="section-divider">· · ·</div>
+
+<h2>和其他方案对比</h2>
+
+<table class="compare-table">
+<tr><th>方案</th><th>协议转换</th><th>标签路由</th><th>模型反馈</th><th>Codex</th></tr>
+<tr><td>手动配环境变量</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td></tr>
+<tr><td>普通 HTTP 代理</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td></tr>
+<tr><td>降级旧版本</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td></tr>
+<tr><td><strong>AginxLLM</strong></td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
+</table>
+
+<div class="section-divider">· · ·</div>
+
+<h2>快速上手</h2>
+
+<p>从 <strong>GitHub Releases</strong> 下载对应平台的安装包，双击安装即用：</p>
+
+<table>
+<tr><th>平台</th><th>安装包</th><th>说明</th></tr>
+<tr><td>macOS</td><td><code>.dmg</code></td><td>Apple Silicon，拖到 Applications</td></tr>
+<tr><td>Windows</td><td><code>.exe</code></td><td>双击安装</td></tr>
+<tr><td>Linux</td><td><code>.AppImage</code></td><td><code>chmod +x</code> 运行</td></tr>
+</table>
+
+<p>安装后编辑 <code>~/.model-router/config.yaml</code>，配置你的 provider 和路由规则，然后在管理界面点击 "Takeover"——完成。</p>
+
+<div class="section-divider">· · ·</div>
+
+<h2>写在最后</h2>
+
+<p>AginxLLM 的核心理念很简单：<span class="highlight">Claude Code 的智能调度很好，但不一定要用 Anthropic 的模型来执行</span>。把 opus/sonnet/haiku 的调度能力，和国产模型的性价比结合起来——这就是 AginxLLM 做的事。</p>
+
+<p>不需要降级。不需要折腾环境变量。不需要担心协议不兼容。</p>
+
+<div class="footer">
+<p>项目地址：<strong>github.com/yinnho/model-router</strong></p>
+<p>开源免费 · MIT License · 欢迎 Star 🌟</p>
+</div>
+
+</body>
+</html>

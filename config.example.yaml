@@ -1,0 +1,92 @@
+port: 8083
+
+providers:
+  deepseek:
+    name: DeepSeek
+    base_url: https://api.deepseek.com
+    api_key: your-deepseek-key
+    auth_type: bearer
+  deepseek_anthropic:
+    name: DeepSeek (Anthropic)
+    base_url: https://api.deepseek.com/anthropic
+    api_key: your-deepseek-key
+    auth_type: bearer
+  zhipu:
+    name: Zhipu GLM
+    base_url: https://open.bigmodel.cn/api/anthropic
+    api_key: your-zhipu-key
+    auth_type: bearer
+  baidu:
+    name: Baidu ERNIE
+    base_url: https://qianfan.baidubce.com/anthropic/coding
+    api_key: your-baidu-key
+    auth_type: bearer
+  kimi:
+    name: Kimi
+    base_url: https://api.kimi.com/coding
+    api_key: your-kimi-key
+    auth_type: bearer
+  dashscope:
+    name: Qwen (DashScope)
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key: your-dashscope-key
+    auth_type: bearer
+  minimax:
+    name: MiniMax
+    base_url: https://api.minimaxi.com/anthropic
+    api_key: your-minimax-key
+    auth_type: bearer
+
+routes:
+  - endpoint: /v1/chat/completions
+    model: deepseek-v4-pro
+    provider: deepseek
+    tags: [sonnet, auto]
+    format: openai
+
+  - endpoint: /v1/chat/completions
+    model: deepseek-v4-flash
+    provider: deepseek
+    tags: [haiku]
+    format: openai
+
+  - endpoint: /v1/messages
+    model: glm-5.1
+    provider: zhipu
+    tags: [opus]
+    format: anthropic
+
+  - endpoint: /v1/chat/completions
+    model: qwen3.7-max
+    provider: dashscope
+    tags: [sonnet]
+    format: openai
+
+  - endpoint: /v1/messages
+    model: K2.6
+    provider: kimi
+    tags: [sonnet]
+    format: anthropic
+
+  - endpoint: /v1/messages
+    model: MiniMax-M3
+    provider: minimax
+    tags: [haiku]
+    format: anthropic
+
+tags:
+  - name: opus
+    color: "#A855F7"
+
+  - name: sonnet
+    color: "#3B82F6"
+
+  - name: haiku
+    color: "#22C55E"
+
+  - name: auto
+    color: "#F59E0B"
+    is_auto: true
+
+current_tag: auto
+management_key: model-router-local
