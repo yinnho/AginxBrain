@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import * as api from '../lib/api';
+import { UsageGuide } from '../components/UsageGuide';
 
 export function ApiKeysPage() {
   const [keys, setKeys] = useState<api.CallerKey[]>([]);
@@ -109,14 +110,17 @@ export function ApiKeysPage() {
       {newToken && (
         <div style={{
           background: 'rgba(34, 197, 94, 0.08)', border: '1px solid rgba(34, 197, 94, 0.3)',
-          borderRadius: 8, padding: 12, marginBottom: 16, fontSize: 13,
+          borderRadius: 8, padding: 16, marginBottom: 16, fontSize: 13,
         }}>
-          <div style={{ marginBottom: 6, fontWeight: 600 }}>New API key created — copy it now, it will not be shown again:</div>
+          <div style={{ marginBottom: 6, fontWeight: 600 }}>✓ API key 已创建 — 请立即复制，之后不再显示</div>
           <div style={{
             fontFamily: 'monospace', background: 'var(--bg-primary)', padding: 8,
-            borderRadius: 6, wordBreak: 'break-all', userSelect: 'all',
+            borderRadius: 6, wordBreak: 'break-all', userSelect: 'all', marginBottom: 14,
           }}>
             {newToken}
+          </div>
+          <div style={{ borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+            <UsageGuide token={newToken} />
           </div>
           <button
             onClick={() => setNewToken(null)}
@@ -124,7 +128,7 @@ export function ApiKeysPage() {
               marginTop: 8, background: 'transparent', border: '1px solid var(--border)',
               borderRadius: 6, padding: '4px 10px', fontSize: 12, cursor: 'pointer',
             }}
-          >Dismiss</button>
+          >知道了</button>
         </div>
       )}
 
@@ -181,6 +185,22 @@ export function ApiKeysPage() {
             )}
           </tbody>
         </table>
+      )}
+
+      {!newToken && (
+        <div style={{
+          marginTop: 32, padding: 16,
+          background: 'var(--bg-card)', border: '1px solid var(--border)',
+          borderRadius: 'var(--radius-md)',
+        }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
+            使用方法
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>
+            用任意 key 替换下面的占位符。Base URL 是当前站点地址。
+          </div>
+          <UsageGuide token="<your-api-key>" />
+        </div>
       )}
     </div>
   );

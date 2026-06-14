@@ -161,13 +161,15 @@ pub async fn start(state: AppState) -> (String, u16) {
     (host, port)
 }
 
-/// Middleware that validates `Authorization: Bearer <caller-token>` for proxy routes.
+/// Middleware that validates the caller API key on proxy routes.
+/// Accepts either `Authorization: Bearer <token>` (OpenAI / Responses clients)
+/// or `x-api-key: <token>` (Anthropic clients — Claude Code, Anthropic SDK).
 async fn require_caller_key(
     State(state): State<AppState>,
     mut req: Request,
     next: axum::middleware::Next,
 ) -> Result<Response, StatusCode> {
-    let token = extract_bearer_token(req.headers());
+    let token = extract_caller_token(req.headers());
     let Some(token) = token else {
         return Err(StatusCode::UNAUTHORIZED);
     };
@@ -184,10 +186,20 @@ async fn require_caller_key(
     Ok(next.run(req).await)
 }
 
-fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
-    let auth = headers.get("authorization")?.to_str().ok()?;
-    auth.strip_prefix("Bearer ")
-        .or_else(|| auth.strip_prefix("bearer "))
+fn extract_caller_token(headers: &HeaderMap) -> Option<String> {
+    // Prefer Authorization: Bearer (OpenAI / Responses / Codex), then fall back
+    // to x-api-key (Anthropic clients).
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        if let Some(tok) = auth
+            .strip_prefix("Bearer ")
+            .or_else(|| auth.strip_prefix("bearer "))
+        {
+            return Some(tok.trim().to_string());
+        }
+    }
+    headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
 }
 
