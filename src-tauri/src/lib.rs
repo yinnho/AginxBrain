@@ -6,14 +6,19 @@ mod db;
 mod models;
 mod proxy;
 mod takeover;
+
+#[cfg(feature = "desktop")]
 mod tray;
 
 use config::load_config;
-use tauri::Manager;
 use crate::takeover::{check_codex_takeover_status, check_takeover_status,
     take_over_claude, take_over_codex};
 
+#[cfg(feature = "desktop")]
+use tauri::Manager;
+
 /// Desktop mode: Tauri window + system tray + Axum server in background.
+#[cfg(feature = "desktop")]
 pub fn run_desktop(port_override: Option<u16>, host_override: Option<String>) {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 

@@ -464,9 +464,30 @@ async fn handle_proxy(
             last_error = Some(err);
             continue;
         }
-        // 4xx client errors → non-retryable, return immediately
+        // 4xx client errors → non-retryable, return immediately. Still log usage
+        // so the dashboard surfaces auth failures, rate limits, and bad requests.
         let axum_status =
             StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+        let _ = crate::db::insert_usage_log(
+            &state.db,
+            crate::db::UsageInsert {
+                caller_key_id,
+                tag: tag.clone(),
+                provider: provider.name.clone(),
+                model: route.model.clone(),
+                modality: route.modality.clone(),
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: start.elapsed().as_millis() as i64,
+                status: "error".to_string(),
+                error_message: Some(format!(
+                    "HTTP {}: {}",
+                    status_code,
+                    &err_body[..err_body.len().min(200)]
+                )),
+            },
+        )
+        .await;
         return Ok((
             axum_status,
             [("content-type", "application/json")],

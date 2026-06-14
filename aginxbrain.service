@@ -1,0 +1,16 @@
+[Unit]
+Description=AginxBrain AI Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/aginxbrain
+Environment="RUST_LOG=info"
+Environment="AGINXBRAIN_CONFIG=/home/ubuntu/aginxbrain/config.yaml"
+ExecStart=/home/ubuntu/aginxbrain/src-tauri/target/release/aginxbrain --server --host 127.0.0.1 --port 8083
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

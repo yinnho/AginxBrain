@@ -25,6 +25,12 @@ fn main() {
     if args.server {
         aginxbrain_lib::run_server(args.port, args.host);
     } else {
+        #[cfg(feature = "desktop")]
         aginxbrain_lib::run_desktop(args.port, args.host);
+        #[cfg(not(feature = "desktop"))]
+        {
+            eprintln!("This binary was built without desktop support. Use --server mode.");
+            std::process::exit(1);
+        }
     }
 }

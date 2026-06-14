@@ -83,23 +83,27 @@ pub async fn start(state: AppState) -> (String, u16) {
             require_caller_key,
         ));
 
-    let admin_api_routes = axum::Router::new()
+    // Public admin auth endpoints — NOT behind the session layer, since you
+    // can't be authenticated to authenticate. Setup only succeeds when no admin exists.
+    let public_auth_routes = axum::Router::new()
         .route("/admin/setup", axum::routing::post(crate::api::admin_setup))
-        // The setup endpoint must be public (only works when no admin exists).
-        .route("/admin/login", axum::routing::post(crate::api::admin_login))
+        .route("/admin/login", axum::routing::post(crate::api::admin_login));
+
+    let admin_api_routes = axum::Router::new()
         .route("/admin/logout", axum::routing::post(crate::api::admin_logout))
         .route("/admin/me", axum::routing::get(crate::api::admin_me))
         .route("/keys", axum::routing::get(crate::api::list_keys))
         .route("/keys", axum::routing::post(crate::api::create_key))
-        .route("/keys/:id", axum::routing::put(crate::api::update_key))
-        .route("/keys/:id", axum::routing::delete(crate::api::delete_key))
+        .route("/keys/{id}", axum::routing::put(crate::api::update_key))
+        .route("/keys/{id}", axum::routing::delete(crate::api::delete_key))
         .route("/cost-rates", axum::routing::get(crate::api::list_cost_rates))
         .route("/cost-rates", axum::routing::post(crate::api::set_cost_rate))
-        .route("/cost-rates/:id", axum::routing::delete(crate::api::delete_cost_rate))
+        .route("/cost-rates/{id}", axum::routing::delete(crate::api::delete_cost_rate))
         .route("/usage/daily", axum::routing::get(crate::api::daily_usage))
         .route("/usage/monthly", axum::routing::get(crate::api::monthly_usage))
         .route("/usage/summary", axum::routing::get(crate::api::usage_summary))
-        .route("/config", axum::routing::put(crate::api::update_config))
+        .route("/config", axum::routing::get(crate::api::get_config).put(crate::api::update_config))
+        .route("/logs", axum::routing::get(crate::api::get_logs))
         .route("/current-tag", axum::routing::put(crate::api::set_current_tag))
         .route("/takeover/claude", axum::routing::post(crate::api::takeover_claude_handler))
         .route("/takeover/claude", axum::routing::delete(crate::api::restore_claude_handler))
@@ -111,15 +115,20 @@ pub async fn start(state: AppState) -> (String, u16) {
         .route("/config/import", axum::routing::post(crate::api::import_config))
         .route_layer(axum::middleware::from_fn(crate::api::require_admin_session));
 
+    // Public read APIs: only /status (login page needs setup_required before auth).
+    // /config and /logs are admin-only — they live in admin_api_routes above.
     let read_api_routes = axum::Router::new()
-        .route("/config", axum::routing::get(crate::api::get_config))
-        .route("/status", axum::routing::get(crate::api::get_status))
-        .route("/logs", axum::routing::get(crate::api::get_logs));
+        .route("/status", axum::routing::get(crate::api::get_status));
+
+    // Admin and read APIs are nested under /api so they match the frontend's
+    // API_BASE = '/api'. Proxy routes stay at root (e.g. /v1/chat/completions).
+    let api_routes = public_auth_routes
+        .merge(admin_api_routes)
+        .merge(read_api_routes);
 
     let app = axum::Router::new()
         .merge(proxy_routes)
-        .merge(admin_api_routes)
-        .merge(read_api_routes)
+        .nest("/api", api_routes)
         .layer(axum::middleware::from_fn(request_log_middleware))
         .layer(session_layer)
         // Codex conversations can be very large (system prompt + tool results).
