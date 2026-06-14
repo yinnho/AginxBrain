@@ -9,7 +9,7 @@ export function LoginPage({ onLogin, setupRequired }: LoginPageProps) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
-  const [isSetup, setIsSetup] = useState(setupRequired);
+  const isSetup = setupRequired;
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -109,19 +109,6 @@ export function LoginPage({ onLogin, setupRequired }: LoginPageProps) {
             {isSetup ? 'Create account' : 'Sign in'}
           </button>
         </form>
-
-        {!setupRequired && (
-          <button
-            onClick={() => setIsSetup(!isSetup)}
-            style={{
-              marginTop: 16, background: 'transparent', border: 'none',
-              color: 'var(--text-muted, #64748b)', fontSize: 12, cursor: 'pointer',
-              width: '100%',
-            }}
-          >
-            {isSetup ? 'Already have an account? Sign in' : 'Need to create admin? Setup'}
-          </button>
-        )}
       </div>
     </div>
   );

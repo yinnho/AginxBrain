@@ -57,6 +57,10 @@ function App() {
   }, [refresh]);
 
   useEffect(() => {
+    // /api/status is public and tells us whether first-boot setup is needed.
+    // Fetch it on mount regardless of auth, so the landing/login page shows the
+    // correct CTA ("登录控制台" vs "初始化控制台") instead of defaulting to setup.
+    api.getStatus().then(setStatus).catch(() => {});
     checkAuth();
     checkForUpdate().then(info => {
       if (info) setUpdateInfo(info);
@@ -140,7 +144,7 @@ function App() {
     setCheckingUpdate(false);
   }, [showError]);
 
-  if (admin === undefined || (admin && (!config || !status))) {
+  if (admin === undefined || !status || (admin && !config)) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', color: 'var(--text-muted)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
