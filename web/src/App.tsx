@@ -61,12 +61,16 @@ function App() {
     });
   }, [checkAuth]);
 
-  const handleLogin = async (username: string, password: string) => {
+  const handleLogin = async (username: string, password: string, isSetup: boolean) => {
     try {
-      await api.adminLogin(username, password);
+      if (isSetup) {
+        await api.adminSetup(username, password);
+      } else {
+        await api.adminLogin(username, password);
+      }
       await checkAuth();
     } catch (e) {
-      showError(e instanceof Error ? e.message : 'Login failed');
+      showError(e instanceof Error ? e.message : (isSetup ? 'Setup failed' : 'Login failed'));
     }
   };
 

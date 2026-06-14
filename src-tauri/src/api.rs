@@ -42,6 +42,7 @@ pub async fn require_admin_session(
 // POST /api/admin/setup
 pub async fn admin_setup(
     State(state): State<AppState>,
+    session: Session,
     Json(req): Json<AdminSetupRequest>,
 ) -> Result<StatusCode, ApiError> {
     let count = db::admin_count(&state.db).await.map_err(ApiError::from)?;
@@ -55,9 +56,15 @@ pub async fn admin_setup(
         ));
     }
     let hash = hash_password(&req.password).map_err(|e| ApiError::Internal(e.to_string()))?;
-    db::create_admin(&state.db, trimmed, &hash)
+    let id = db::create_admin(&state.db, trimmed, &hash)
         .await
         .map_err(ApiError::from)?;
+    // Log the new admin in immediately — setup establishes the session so the
+    // UI lands in the dashboard without a separate login step.
+    session
+        .insert(ADMIN_SESSION_KEY, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(StatusCode::OK)
 }
 

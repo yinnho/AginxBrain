@@ -61,8 +61,8 @@ pub async fn admin_count(pool: &SqlitePool) -> Result<i64> {
     Ok(count)
 }
 
-pub async fn create_admin(pool: &SqlitePool, username: &str, password_hash: &str) -> Result<()> {
-    sqlx::query(
+pub async fn create_admin(pool: &SqlitePool, username: &str, password_hash: &str) -> Result<i64> {
+    let result = sqlx::query(
         "INSERT INTO admins (username, password_hash) VALUES (?1, ?2)",
     )
     .bind(username)
@@ -70,7 +70,7 @@ pub async fn create_admin(pool: &SqlitePool, username: &str, password_hash: &str
     .execute(pool)
     .await
     .context("creating admin")?;
-    Ok(())
+    Ok(result.last_insert_rowid())
 }
 
 pub async fn find_admin_by_username(

@@ -174,6 +174,7 @@ export async function adminSetup(username: string, password: string): Promise<vo
     method: 'POST',
     headers: jsonHeaders(),
     body: JSON.stringify({ username, password }),
+    credentials: 'include',
   });
   await checkOk(res);
 }

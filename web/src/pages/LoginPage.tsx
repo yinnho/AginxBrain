@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from 'react';
 
 interface LoginPageProps {
-  onLogin: (username: string, password: string) => void;
+  onLogin: (username: string, password: string, isSetup: boolean) => void;
   setupRequired: boolean;
 }
 
@@ -17,7 +17,7 @@ export function LoginPage({ onLogin, setupRequired }: LoginPageProps) {
       alert('Passwords do not match');
       return;
     }
-    onLogin(username, password);
+    onLogin(username, password, isSetup);
   };
 
   return (
