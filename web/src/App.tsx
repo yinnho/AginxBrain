@@ -4,6 +4,7 @@ import * as api from './lib/api';
 import { checkForUpdate, installUpdate } from './lib/updater';
 import type { UpdateInfo } from './lib/updater';
 import { LoginPage } from './pages/LoginPage';
+import { LandingPage } from './pages/LandingPage';
 import { ProvidersPage } from './pages/ProvidersPage';
 import { RoutesPage } from './pages/RoutesPage';
 import { TagsPage } from './pages/TagsPage';
@@ -32,6 +33,7 @@ function App() {
   const [updating, setUpdating] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [admin, setAdmin] = useState<string | null | undefined>(undefined);
+  const [showLogin, setShowLogin] = useState(false);
 
   const showError = useCallback((msg: string) => {
     setError(msg);
@@ -79,6 +81,7 @@ function App() {
     setAdmin(null);
     setConfig(null);
     setStatus(null);
+    setShowLogin(false);
   };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -150,6 +153,9 @@ function App() {
   }
 
   if (!admin) {
+    if (!showLogin) {
+      return <LandingPage onEnter={() => setShowLogin(true)} setupRequired={status?.setup_required ?? true} />;
+    }
     return <LoginPage onLogin={handleLogin} setupRequired={status?.setup_required ?? true} />;
   }
 
