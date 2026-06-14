@@ -166,6 +166,8 @@ fn default_routes() -> Vec<Route> {
         Route { endpoint: "/v1/chat/completions".into(), model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true, modality: default_modality() },
         Route { endpoint: "/v1/messages".into(), model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true, modality: default_modality() },
         Route { endpoint: "/v1/messages".into(), model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true, modality: default_modality() },
+        // Example: route popular Codex model names directly. Add more tags (gpt-5.4, etc.) as needed.
+        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["gpt-5.5".into(), "codex".into()], format: ProviderFormat::Openai, enabled: true, modality: default_modality() },
     ]
 }
 
@@ -175,6 +177,11 @@ fn default_tags() -> Vec<Tag> {
         Tag { name: "sonnet".into(), color: "#3B82F6".into(), is_auto: false },
         Tag { name: "haiku".into(), color: "#22C55E".into(), is_auto: false },
         Tag { name: "auto".into(), color: "#F59E0B".into(), is_auto: true },
+        // Popular client model names can be added as tags without code changes.
+        // When a request arrives with model="gpt-5.5", it resolves directly to
+        // the "gpt-5.5" tag, and the route below routes it to DeepSeek.
+        Tag { name: "gpt-5.5".into(), color: "#10B981".into(), is_auto: false },
+        Tag { name: "codex".into(), color: "#6366F1".into(), is_auto: false },
     ]
 }
 
@@ -332,7 +339,7 @@ mod tests {
         assert!(!cfg.providers.is_empty());
         assert!(!cfg.routes.is_empty());
         assert!(!cfg.tags.is_empty());
-        assert_eq!(cfg.tags.len(), 4); // opus, sonnet, haiku, auto
+        assert_eq!(cfg.tags.len(), 6); // opus, sonnet, haiku, auto, gpt-5.5, codex
     }
 
     #[test]

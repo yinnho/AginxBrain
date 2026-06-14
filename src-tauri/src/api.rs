@@ -184,15 +184,19 @@ pub async fn generate_image_handler(
     Json(proxy::generate_image(&state, req).await)
 }
 
-// GET /v1/models — OpenAI-compatible model discovery for Codex
-// Returns tag-based virtual model names (opus, sonnet, haiku, auto) PLUS
-// Codex catalog model names (gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5.2)
-// so Codex can find its configured model in the list and use full model metadata.
+// GET /v1/models — OpenAI-compatible model discovery for Codex and other clients.
+// Returns all configured tags as valid model IDs. Since tags are now purely
+// user-defined, administrators can add a new tag (e.g. "gpt-5.5" or "codex")
+// at runtime without code changes, and clients using that model name will
+// immediately be routed through the matching tag.
 pub async fn get_models(State(state): State<AppState>) -> Json<serde_json::Value> {
     let config = state.config.read().await;
 
-    // Collect unique tag names from all routes
+    // Collect unique tag names from all routes plus configured tags
     let mut tag_set = std::collections::HashSet::new();
+    for tag in &config.tags {
+        tag_set.insert(tag.name.clone());
+    }
     for route in &config.routes {
         for tag in &route.tags {
             tag_set.insert(tag.clone());
@@ -200,20 +204,6 @@ pub async fn get_models(State(state): State<AppState>) -> Json<serde_json::Value
     }
     // Always include "auto" as it's the default fallback
     tag_set.insert("auto".to_string());
-
-    // Codex bundled catalog model names — these must appear in the list so Codex
-    // recognizes its configured model and uses full metadata (tool parallelization,
-    // reasoning summaries, proper truncation, etc.) instead of degraded fallback.
-    const CODEX_MODELS: &[&str] = &[
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.3-codex",
-        "gpt-5.2",
-    ];
-    for &m in CODEX_MODELS {
-        tag_set.insert(m.to_string());
-    }
 
     let mut models: Vec<serde_json::Value> = tag_set.into_iter().map(|tag| {
         serde_json::json!({

@@ -74,6 +74,17 @@ routes:
     format: anthropic
     modality: chat
 
+  # Popular client model names can be added as tags without code changes.
+  # When a request arrives with model="gpt-5.5", it resolves directly to the
+  # "gpt-5.5" tag below. If a future model name is not covered, simply add a
+  # new tag and attach it to a route — no restart or redeploy required.
+  - endpoint: /v1/chat/completions
+    model: deepseek-v4-pro
+    provider: deepseek
+    tags: [gpt-5.5, codex]
+    format: openai
+    modality: chat
+
   # Future media routes (configuration-only in this phase; driver support comes later):
   # - endpoint: /api/v1/services/aigc/text2image/image-synthesis
   #   model: wanx2.1-t2i-plus
@@ -109,6 +120,13 @@ tags:
   - name: auto
     color: "#F59E0B"
     is_auto: true
+
+  # Add any client model name as a tag and bind it to a route. No code changes needed.
+  - name: gpt-5.5
+    color: "#10B981"
+
+  - name: codex
+    color: "#6366F1"
 
 current_tag: auto
 management_key: aginxbrain-local

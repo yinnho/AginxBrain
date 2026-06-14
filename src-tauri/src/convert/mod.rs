@@ -181,6 +181,43 @@ mod tests {
         assert_eq!(result["stream"], true);
     }
 
+    #[test]
+    fn test_anthropic_to_openai_injects_reasoning_content_for_tool_calls() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "thinking": {"type": "adaptive"},
+            "messages": [
+                {"role": "user", "content": "List files"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {"cmd": "ls"}}
+                ]}
+            ]
+        });
+        let result = anthropic_to_openai_request(&body, "glm-5.1");
+
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["reasoning_content"], " ");
+        assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "bash");
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_no_reasoning_when_thinking_disabled() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "user", "content": "List files"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {"cmd": "ls"}}
+                ]}
+            ]
+        });
+        let result = anthropic_to_openai_request(&body, "glm-5.1");
+
+        let messages = result["messages"].as_array().unwrap();
+        assert!(messages[1].get("reasoning_content").is_none());
+    }
+
     // =======================================================================
     // OpenAI Responses conversion tests
     // =======================================================================

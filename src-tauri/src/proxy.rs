@@ -50,61 +50,36 @@ fn forward_client_headers(
     builder
 }
 
-fn resolve_tag_from_model(model: &str) -> Option<String> {
-    let lower = model.to_lowercase();
-    // Split by common separators for component-level matching,
-    // avoiding false positives like "octopus" matching "opus".
-    let parts: Vec<&str> = lower.split(&['-', '_', '.', ' ', '/'][..]).collect();
+/// Resolve a tag purely from user-defined tag names.
+///
+/// The model name is split into components; if a configured tag's components
+/// appear as a contiguous subsequence inside the model name, that tag wins.
+/// Longer tags are preferred over shorter ones so a tag like "gpt-5.5" beats
+/// a generic "gpt" tag. This keeps AginxBrain model-agnostic: new provider
+/// model names (gpt-6, claude-xyz, etc.) require no code changes — just add
+/// a tag and attach it to a route.
+fn resolve_tag_from_model(model: &str, tags: &[crate::config::Tag]) -> Option<String> {
+    let model_lower = model.to_lowercase();
+    let model_parts: Vec<&str> = model_lower.split(&['-', '_', '.', ' ', '/'][..]).collect();
 
-    // Direct tag matches (opus, sonnet, haiku)
-    if parts.contains(&"opus") {
-        return Some("opus".to_string());
-    }
-    if parts.contains(&"sonnet") {
-        return Some("sonnet".to_string());
-    }
-    if parts.contains(&"haiku") {
-        return Some("haiku".to_string());
-    }
+    // Prefer longer tag names first to avoid partial matches shadowing specific ones
+    // (e.g. a tag "gpt-5.5" should win over a tag "gpt" if both exist).
+    let mut sorted_tags: Vec<&crate::config::Tag> = tags.iter().collect();
+    sorted_tags.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
 
-    // Codex model name → tag mapping.
-    // Codex CLI uses OpenAI Responses API with bundled model names (gpt-5.5,
-    // gpt-5.4, etc.) for proper metadata (tool parallelization, reasoning
-    // summaries, truncation).  We map these to opus/sonnet/haiku tiers so
-    // both Claude Code and Codex share the same tag-based routing rules.
-    //
-    // gpt-5.5  — Codex's flagship model, strongest reasoning  → opus
-    // gpt-5.4  — balanced performance                          → sonnet
-    // gpt-5.3-codex — older but capable coding model           → sonnet
-    // gpt-5.4-mini — lightweight, fast, cheap                  → haiku
-    // gpt-5.2  — oldest, most economical                       → haiku
-    if parts.contains(&"gpt") {
-        // Count occurrences of "5" to distinguish gpt-5.5 from gpt-5.4 etc.
-        if parts.iter().filter(|p| **p == "5").count() >= 2 {
-            return Some("opus".to_string());   // gpt-5.5
+    for tag in sorted_tags {
+        let tag_lower = tag.name.to_lowercase();
+        let tag_parts: Vec<&str> = tag_lower.split(&['-', '_', '.', ' ', '/'][..]).collect();
+        if tag_parts.is_empty() {
+            continue;
         }
-        if parts.contains(&"mini") {
-            return Some("haiku".to_string());  // gpt-5.4-mini
-        }
-        if parts.contains(&"2") {
-            return Some("haiku".to_string());  // gpt-5.2
-        }
-        // gpt-5.4, gpt-5.3-codex, gpt-5.3 → sonnet
-        return Some("sonnet".to_string());
-    }
 
-    // Provider-specific heuristics — only applied when no explicit tag.
-    // These are opinionated quality-to-tag mappings and can be overridden
-    // by setting ANTHROPIC_DEFAULT_*_MODEL to an explicit tag name.
-    if parts.contains(&"glm") {
-        Some("sonnet".to_string())
-    } else if parts.contains(&"deepseek") {
-        Some("haiku".to_string())
-    } else if parts.iter().any(|p| *p == "k2" || p.starts_with("kimi")) {
-        Some("sonnet".to_string())
-    } else {
-        None
+        // Look for the tag's parts as a contiguous subsequence in the model parts.
+        if model_parts.windows(tag_parts.len()).any(|w| w == tag_parts.as_slice()) {
+            return Some(tag.name.clone());
+        }
     }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -273,10 +248,8 @@ async fn handle_proxy(
 
     let config = state.config.read().await;
 
-    // 1. Resolve tag from model
-    // Only opus/sonnet/haiku/auto are recognized tags
-    // Any other model name (e.g. "glm-5.1" from upstream feedback) falls back to auto
-    let tag = resolve_tag_from_model(&request_model)
+    // 1. Resolve tag from model, purely from configured tag names
+    let tag = resolve_tag_from_model(&request_model, &config.tags)
         .unwrap_or_else(|| config.current_tag.clone());
 
     // 2. Find candidate routes for failover (array order = priority)
@@ -340,6 +313,7 @@ async fn handle_proxy(
             let mut b = body.clone();
             b["model"] = Value::String(route.model.clone());
             normalize_roles(&mut b);
+            inject_reasoning_content(&mut b);
             b
         }
         ("anthropic", ProviderFormat::Openai) => {
@@ -767,7 +741,7 @@ async fn handle_count_tokens(
 
     let config = state.config.read().await;
 
-    let tag = resolve_tag_from_model(&request_model)
+    let tag = resolve_tag_from_model(&request_model, &config.tags)
         .unwrap_or_else(|| config.current_tag.clone());
 
     let candidates = find_candidate_routes(&config.routes, &tag);
@@ -1069,6 +1043,67 @@ fn normalize_roles(value: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// Inject placeholder `thinking` blocks into assistant messages when thinking is enabled.
+/// KIMI's API requires every assistant message to have a thinking block in the content array
+/// when thinking is enabled — even tool-call-only messages that came from earlier turns.
+fn inject_reasoning_content(value: &mut Value) {
+    // Claude Code sends thinking.type as "enabled" or "adaptive"
+    // Both require thinking blocks in all assistant messages for KIMI/文心
+    let thinking_type = value
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let thinking_active = thinking_type == "enabled" || thinking_type == "adaptive";
+
+    if !thinking_active {
+        return;
+    }
+
+    if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages.iter_mut() {
+            if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                continue;
+            }
+
+            // Ensure content is an array — convert string/null to array first
+            let content_is_array = msg.get("content").map(|c| c.is_array()).unwrap_or(false);
+            if !content_is_array {
+                // Convert content to array: string → [{"type":"text","text":"..."}], null/missing → []
+                let text_content = msg
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                msg["content"] = if text_content.is_empty() {
+                    json!([])
+                } else {
+                    json!([{"type": "text", "text": text_content}])
+                };
+            }
+
+            // Check if content already has a thinking block
+            let has_thinking = msg
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| arr.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking")))
+                .unwrap_or(false);
+
+            if has_thinking {
+                continue;
+            }
+
+            // Inject a placeholder thinking block at the start of the content array
+            if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                content.insert(0, json!({
+                    "type": "thinking",
+                    "thinking": " "
+                }));
+            }
+        }
     }
 }
 
@@ -1902,36 +1937,103 @@ mod tests {
         assert_eq!(body["messages"][0]["content"], "plain text response");
     }
 
-    #[test]
-    fn test_resolve_tag_codex_models() {
-        // Codex model name → tag mapping
-        assert_eq!(resolve_tag_from_model("gpt-5.5"), Some("opus".to_string()));
-        assert_eq!(resolve_tag_from_model("gpt-5.4"), Some("sonnet".to_string()));
-        assert_eq!(resolve_tag_from_model("gpt-5.3-codex"), Some("sonnet".to_string()));
-        assert_eq!(resolve_tag_from_model("gpt-5.4-mini"), Some("haiku".to_string()));
-        assert_eq!(resolve_tag_from_model("gpt-5.2"), Some("haiku".to_string()));
+    fn test_tags() -> Vec<crate::config::Tag> {
+        vec![
+            crate::config::Tag { name: "opus".into(), color: "#A855F7".into(), is_auto: false },
+            crate::config::Tag { name: "sonnet".into(), color: "#3B82F6".into(), is_auto: false },
+            crate::config::Tag { name: "haiku".into(), color: "#22C55E".into(), is_auto: false },
+            crate::config::Tag { name: "auto".into(), color: "#F59E0B".into(), is_auto: true },
+        ]
     }
 
     #[test]
     fn test_resolve_tag_direct_matches() {
-        // Direct tag name matches
-        assert_eq!(resolve_tag_from_model("opus"), Some("opus".to_string()));
-        assert_eq!(resolve_tag_from_model("sonnet"), Some("sonnet".to_string()));
-        assert_eq!(resolve_tag_from_model("haiku"), Some("haiku".to_string()));
-        assert_eq!(resolve_tag_from_model("auto"), None);
+        let tags = test_tags();
+        assert_eq!(resolve_tag_from_model("opus", &tags), Some("opus".to_string()));
+        assert_eq!(resolve_tag_from_model("sonnet", &tags), Some("sonnet".to_string()));
+        assert_eq!(resolve_tag_from_model("haiku", &tags), Some("haiku".to_string()));
+        // "auto" is a configured tag, so a model literally named "auto" resolves to it.
+        assert_eq!(resolve_tag_from_model("auto", &tags), Some("auto".to_string()));
     }
 
     #[test]
-    fn test_resolve_tag_provider_heuristics() {
-        assert_eq!(resolve_tag_from_model("glm-5.1"), Some("sonnet".to_string()));
-        assert_eq!(resolve_tag_from_model("deepseek-v4-pro"), Some("haiku".to_string()));
-        assert_eq!(resolve_tag_from_model("k2.6"), Some("sonnet".to_string()));
+    fn test_resolve_tag_from_model_name_components() {
+        let tags = test_tags();
+        assert_eq!(resolve_tag_from_model("claude-opus-4-8", &tags), Some("opus".to_string()));
+        assert_eq!(resolve_tag_from_model("claude-sonnet-4-6", &tags), Some("sonnet".to_string()));
+        assert_eq!(resolve_tag_from_model("claude-haiku-4-5", &tags), Some("haiku".to_string()));
     }
 
     #[test]
     fn test_resolve_tag_unknown() {
+        let tags = test_tags();
         // Unknown model names should return None (falls back to current_tag)
-        assert_eq!(resolve_tag_from_model("some-random-model"), None);
-        assert_eq!(resolve_tag_from_model(""), None);
+        assert_eq!(resolve_tag_from_model("some-random-model", &tags), None);
+        assert_eq!(resolve_tag_from_model("", &tags), None);
+    }
+
+    #[test]
+    fn test_resolve_tag_prefers_longer_match() {
+        let tags = vec![
+            crate::config::Tag { name: "gpt".into(), color: "#000".into(), is_auto: false },
+            crate::config::Tag { name: "gpt-5.5".into(), color: "#fff".into(), is_auto: false },
+        ];
+        assert_eq!(resolve_tag_from_model("gpt-5.5", &tags), Some("gpt-5.5".to_string()));
+        assert_eq!(resolve_tag_from_model("gpt-4o", &tags), Some("gpt".to_string()));
+    }
+
+    #[test]
+    fn test_inject_reasoning_content_inserts_thinking_block() {
+        let mut body = json!({
+            "thinking": {"type": "adaptive"},
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]}
+            ]
+        });
+        inject_reasoning_content(&mut body);
+
+        let messages = body["messages"].as_array().unwrap();
+        // User message unchanged
+        assert_eq!(messages[0]["content"], "Hello");
+        // String content becomes array with injected thinking
+        let content1 = messages[1]["content"].as_array().unwrap();
+        assert_eq!(content1[0]["type"], "thinking");
+        assert_eq!(content1[0]["thinking"], " ");
+        assert_eq!(content1[1]["type"], "text");
+        assert_eq!(content1[1]["text"], "Hi");
+        // Existing array content gets injected thinking at front
+        let content2 = messages[2]["content"].as_array().unwrap();
+        assert_eq!(content2[0]["type"], "thinking");
+        assert_eq!(content2[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn test_inject_reasoning_content_noop_when_thinking_disabled() {
+        let mut body = json!({
+            "messages": [
+                {"role": "assistant", "content": "Hi"}
+            ]
+        });
+        inject_reasoning_content(&mut body);
+        assert_eq!(body["messages"][0]["content"], "Hi");
+    }
+
+    #[test]
+    fn test_inject_reasoning_content_preserves_existing_thinking() {
+        let mut body = json!({
+            "thinking": {"type": "enabled"},
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "real reasoning"},
+                    {"type": "text", "text": "Hi"}
+                ]}
+            ]
+        });
+        inject_reasoning_content(&mut body);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["thinking"], "real reasoning");
     }
 }
