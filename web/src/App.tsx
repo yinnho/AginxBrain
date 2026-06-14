@@ -3,16 +3,21 @@ import type { AppConfig, Status } from './lib/api';
 import * as api from './lib/api';
 import { checkForUpdate, installUpdate } from './lib/updater';
 import type { UpdateInfo } from './lib/updater';
+import { LoginPage } from './pages/LoginPage';
 import { ProvidersPage } from './pages/ProvidersPage';
 import { RoutesPage } from './pages/RoutesPage';
 import { TagsPage } from './pages/TagsPage';
 import { LogsPage } from './pages/LogsPage';
+import { ApiKeysPage } from './pages/ApiKeysPage';
+import { UsagePage } from './pages/UsagePage';
 import { StatusDot } from './components/StatusDot';
 
-type Tab = 'logs' | 'providers' | 'routes' | 'tags';
+type Tab = 'logs' | 'providers' | 'routes' | 'tags' | 'keys' | 'usage';
 
 const tabs: { key: Tab; label: string; icon: string }[] = [
   { key: 'logs', label: 'Logs', icon: '📋' },
+  { key: 'usage', label: 'Usage', icon: '📊' },
+  { key: 'keys', label: 'API Keys', icon: '🔑' },
   { key: 'routes', label: 'Routes', icon: '🔀' },
   { key: 'providers', label: 'Providers', icon: '🔌' },
   { key: 'tags', label: 'Tags', icon: '🏷️' },
@@ -26,6 +31,7 @@ function App() {
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updating, setUpdating] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [admin, setAdmin] = useState<string | null | undefined>(undefined);
 
   const showError = useCallback((msg: string) => {
     setError(msg);
@@ -37,6 +43,39 @@ function App() {
     setConfig(c);
     setStatus(s);
   }, []);
+
+  const checkAuth = useCallback(async () => {
+    try {
+      const me = await api.getMe();
+      setAdmin(me.username);
+      await refresh();
+    } catch {
+      setAdmin(null);
+    }
+  }, [refresh]);
+
+  useEffect(() => {
+    checkAuth();
+    checkForUpdate().then(info => {
+      if (info) setUpdateInfo(info);
+    });
+  }, [checkAuth]);
+
+  const handleLogin = async (username: string, password: string) => {
+    try {
+      await api.adminLogin(username, password);
+      await checkAuth();
+    } catch (e) {
+      showError(e instanceof Error ? e.message : 'Login failed');
+    }
+  };
+
+  const handleLogout = async () => {
+    await api.adminLogout();
+    setAdmin(null);
+    setConfig(null);
+    setStatus(null);
+  };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -94,14 +133,7 @@ function App() {
     setCheckingUpdate(false);
   }, [showError]);
 
-  useEffect(() => {
-    refresh();
-    checkForUpdate().then(info => {
-      if (info) setUpdateInfo(info);
-    });
-  }, [refresh]);
-
-  if (!config || !status) {
+  if (admin === undefined || (admin && (!config || !status))) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', color: 'var(--text-muted)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -113,13 +145,17 @@ function App() {
     );
   }
 
+  if (!admin) {
+    return <LoginPage onLogin={handleLogin} setupRequired={status?.setup_required ?? true} />;
+  }
+
   const handleConfigChange = (newConfig: AppConfig) => {
     setConfig(newConfig);
   };
 
   const handleTakeoverToggle = async () => {
     try {
-      if (status.takeover.active) {
+      if (status!.takeover.active) {
         await api.restoreClaude();
       } else {
         await api.takeoverClaude();
@@ -132,7 +168,7 @@ function App() {
 
   const handleCodexTakeoverToggle = async () => {
     try {
-      if (status.codex_takeover.active) {
+      if (status!.codex_takeover.active) {
         await api.restoreCodex();
       } else {
         await api.takeoverCodex();
@@ -144,7 +180,7 @@ function App() {
   };
 
   return (
-    <div style={{ maxWidth: 960, margin: '0 auto', padding: '20px 24px', minHeight: '100vh' }}>
+    <div style={{ maxWidth: 1100, margin: '0 auto', padding: '20px 24px', minHeight: '100vh' }}>
       {/* Hidden file input for import */}
       <input
         ref={fileInputRef}
@@ -164,10 +200,16 @@ function App() {
           }}>M</div>
           <div>
             <h1 style={{ margin: 0, fontSize: 18, fontWeight: 700, letterSpacing: '-0.3px' }}>AginxBrain</h1>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace' }}>127.0.0.1:{config.port}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace' }}>{config!.host}:{config!.port}</div>
           </div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{admin}</span>
+          <button onClick={handleLogout} style={{
+            background: 'transparent', color: 'var(--text-secondary)',
+            border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+            padding: '4px 10px', fontSize: 12, cursor: 'pointer', fontWeight: 500,
+          }}>Logout</button>
           <button
             onClick={handleCheckUpdate}
             disabled={checkingUpdate}
@@ -197,172 +239,95 @@ function App() {
             >Export</button>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-            <StatusDot active={status.takeover.active} />
-            <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace' }}>Claude</span>
+            <StatusDot active={status!.takeover.active} />
+            <button
+              onClick={handleTakeoverToggle}
+              style={{
+                background: status!.takeover.active ? 'var(--accent)' : 'transparent',
+                color: status!.takeover.active ? '#fff' : 'var(--text-secondary)',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                padding: '4px 10px', fontSize: 12, cursor: 'pointer', fontWeight: 500,
+              }}
+            >Claude Code</button>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-            <StatusDot active={status.codex_takeover.active} />
-            <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace' }}>Codex</span>
+            <StatusDot active={status!.codex_takeover.active} />
+            <button
+              onClick={handleCodexTakeoverToggle}
+              style={{
+                background: status!.codex_takeover.active ? 'var(--accent)' : 'transparent',
+                color: status!.codex_takeover.active ? '#fff' : 'var(--text-secondary)',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                padding: '4px 10px', fontSize: 12, cursor: 'pointer', fontWeight: 500,
+              }}
+            >Codex</button>
           </div>
         </div>
       </div>
 
-      {/* Update notification */}
-      {updateInfo && !updating && (
+      {/* Error banner */}
+      {error && (
         <div style={{
-          padding: '8px 14px', marginBottom: 12, borderRadius: 'var(--radius-md)',
-          background: 'rgba(34,197,94,0.1)', border: '1px solid rgba(34,197,94,0.2)',
-          fontSize: 13, display: 'flex', alignItems: 'center', gap: 12,
+          background: 'rgba(239, 68, 68, 0.1)', color: '#EF4444', border: '1px solid rgba(239, 68, 68, 0.2)',
+          borderRadius: 'var(--radius-sm)', padding: '10px 14px', marginBottom: 16, fontSize: 13,
         }}>
-          <span style={{ fontSize: 14, flexShrink: 0 }}>↑</span>
-          <span style={{ flex: 1 }}>
-            New version <strong>v{updateInfo.version}</strong> available
-          </span>
+          {error}
+        </div>
+      )}
+
+      {/* Update banner */}
+      {updateInfo && (
+        <div style={{
+          background: 'rgba(34, 197, 94, 0.1)', color: '#22C55E', border: '1px solid rgba(34, 197, 94, 0.2)',
+          borderRadius: 'var(--radius-sm)', padding: '10px 14px', marginBottom: 16, fontSize: 13,
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        }}>
+          <span>New version available: {updateInfo.version}</span>
           <button
             onClick={async () => {
               setUpdating(true);
               try {
                 await installUpdate(updateInfo);
               } catch (e) {
-                setUpdating(false);
-                setUpdateInfo(null);
                 showError(e instanceof Error ? e.message : 'Update failed');
               }
+              setUpdating(false);
             }}
+            disabled={updating}
             style={{
-              background: 'var(--success)', color: '#fff', border: 'none',
-              borderRadius: 'var(--radius-sm)', padding: '4px 14px',
-              fontSize: 12, cursor: 'pointer', fontWeight: 600,
+              background: '#22C55E', color: '#fff', border: 'none', borderRadius: 'var(--radius-sm)',
+              padding: '4px 10px', fontSize: 12, cursor: updating ? 'default' : 'pointer', fontWeight: 500,
             }}
-          >Update</button>
-          <span
-            onClick={() => setUpdateInfo(null)}
-            style={{ cursor: 'pointer', opacity: 0.5, fontSize: 14, flexShrink: 0 }}
-          >x</span>
+          >{updating ? 'Installing...' : 'Install'}</button>
         </div>
       )}
-
-      {updating && (
-        <div style={{
-          padding: '8px 14px', marginBottom: 12, borderRadius: 'var(--radius-md)',
-          background: 'rgba(59,130,246,0.1)', border: '1px solid rgba(59,130,246,0.2)',
-          color: 'var(--accent)', fontSize: 13, display: 'flex', alignItems: 'center', gap: 8,
-        }}>
-          <span style={{ width: 14, height: 14, border: '2px solid var(--accent)', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 0.8s linear infinite', display: 'inline-block' }} />
-          Downloading update...
-        </div>
-      )}
-
-      {/* Error display */}
-      {error && (
-        <div style={{
-          padding: '8px 14px', marginBottom: 12, borderRadius: 'var(--radius-md)',
-          background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)',
-          color: '#ef4444', fontSize: 13, display: 'flex', alignItems: 'center', gap: 8,
-        }}>
-          <span style={{ fontSize: 14, flexShrink: 0 }}>!</span>
-          <span style={{ flex: 1 }}>{error}</span>
-          <span
-            onClick={() => setError(null)}
-            style={{ cursor: 'pointer', opacity: 0.6, fontSize: 14, flexShrink: 0 }}
-          >x</span>
-        </div>
-      )}
-
-      {/* Takeover bar — both switches side by side */}
-      <div style={{
-        display: 'flex', gap: 12, marginBottom: 20,
-      }}>
-        {/* Claude Code Takeover */}
-        <div style={{
-          flex: 1, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-          padding: '10px 16px',
-          background: status.takeover.active ? 'var(--success-dim)' : 'var(--bg-card)',
-          border: `1px solid ${status.takeover.active ? 'rgba(34,197,94,0.2)' : 'var(--border)'}`,
-          borderRadius: 'var(--radius-md)',
-        }}>
-          <span style={{ fontSize: 13, color: status.takeover.active ? 'var(--success)' : 'var(--text-secondary)' }}>
-            Claude Code
-          </span>
-          <div
-            onClick={handleTakeoverToggle}
-            style={{
-              width: 40, height: 22, borderRadius: 11, cursor: 'pointer',
-              background: status.takeover.active ? 'var(--success)' : '#333',
-              position: 'relative', transition: 'background var(--transition)',
-            }}
-          >
-            <div style={{
-              width: 18, height: 18, borderRadius: 9,
-              background: '#fff', position: 'absolute', top: 2,
-              left: status.takeover.active ? 20 : 2,
-              transition: 'left var(--transition)',
-              boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
-            }} />
-          </div>
-        </div>
-
-        {/* Codex Takeover */}
-        <div style={{
-          flex: 1, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-          padding: '10px 16px',
-          background: status.codex_takeover.active ? 'rgba(59,130,246,0.1)' : 'var(--bg-card)',
-          border: `1px solid ${status.codex_takeover.active ? 'rgba(59,130,246,0.2)' : 'var(--border)'}`,
-          borderRadius: 'var(--radius-md)',
-        }}>
-          <span style={{ fontSize: 13, color: status.codex_takeover.active ? 'var(--accent)' : 'var(--text-secondary)' }}>
-            Codex
-          </span>
-          <div
-            onClick={handleCodexTakeoverToggle}
-            style={{
-              width: 40, height: 22, borderRadius: 11, cursor: 'pointer',
-              background: status.codex_takeover.active ? 'var(--accent)' : '#333',
-              position: 'relative', transition: 'background var(--transition)',
-            }}
-          >
-            <div style={{
-              width: 18, height: 18, borderRadius: 9,
-              background: '#fff', position: 'absolute', top: 2,
-              left: status.codex_takeover.active ? 20 : 2,
-              transition: 'left var(--transition)',
-              boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
-            }} />
-          </div>
-        </div>
-      </div>
 
       {/* Tabs */}
-      <div style={{
-        display: 'flex', gap: 0, marginBottom: 20,
-        borderBottom: '1px solid var(--border)',
-      }}>
+      <div style={{ display: 'flex', gap: 8, borderBottom: '1px solid var(--border)', marginBottom: 20 }}>
         {tabs.map(t => (
           <button
             key={t.key}
             onClick={() => setTab(t.key)}
             style={{
-              padding: '10px 20px', fontSize: 13, cursor: 'pointer',
-              background: 'transparent', border: 'none',
-              color: tab === t.key ? 'var(--text-primary)' : 'var(--text-muted)',
-              borderBottom: tab === t.key ? '2px solid var(--accent)' : '2px solid transparent',
-              fontWeight: tab === t.key ? 600 : 400,
+              background: 'transparent', border: 'none', borderBottom: tab === t.key ? '2px solid var(--accent)' : '2px solid transparent',
+              color: tab === t.key ? 'var(--text-primary)' : 'var(--text-secondary)',
+              padding: '10px 14px', fontSize: 13, cursor: 'pointer', fontWeight: 500,
               display: 'flex', alignItems: 'center', gap: 6,
             }}
           >
-            <span style={{ fontSize: 14 }}>{t.icon}</span>
+            <span>{t.icon}</span>
             {t.label}
           </button>
         ))}
       </div>
 
-      {/* Content */}
-      <div>
-        {tab === 'logs' && <LogsPage />}
-        {tab === 'providers' && <ProvidersPage config={config} onConfigChange={handleConfigChange} />}
-        {tab === 'routes' && <RoutesPage config={config} onConfigChange={handleConfigChange} />}
-        {tab === 'tags' && <TagsPage config={config} onConfigChange={handleConfigChange} />}
-      </div>
+      {/* Tab content */}
+      {tab === 'logs' && <LogsPage />}
+      {tab === 'usage' && <UsagePage />}
+      {tab === 'keys' && <ApiKeysPage />}
+      {tab === 'providers' && <ProvidersPage config={config!} onConfigChange={handleConfigChange} />}
+      {tab === 'routes' && <RoutesPage config={config!} onConfigChange={handleConfigChange} />}
+      {tab === 'tags' && <TagsPage config={config!} onConfigChange={handleConfigChange} />}
     </div>
   );
 }

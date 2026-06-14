@@ -2,6 +2,8 @@ mod api;
 mod axum_server;
 mod config;
 mod convert;
+mod db;
+mod models;
 mod proxy;
 mod takeover;
 mod tray;
@@ -26,8 +28,13 @@ pub fn run_desktop(port_override: Option<u16>, host_override: Option<String>) {
             if let Some(h) = host_override.clone() { app_config.host = h; }
 
             // 2. Create shared AppState
-            let state = config::AppState::new(app_config)
-                .map_err(|e| e.to_string())?;
+            let state = std::thread::scope(|s| {
+                s.spawn(|| {
+                    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+                    rt.block_on(config::AppState::new(app_config)).map_err(|e| e.to_string())
+                }).join()
+            }).map_err(|e| format!("failed to create state: {:?}", e))?;
+            let state = state?;
 
             // 3. Start axum server in background thread
             let shutdown = config::ServerShutdown::new();
@@ -114,7 +121,7 @@ pub fn run_server(port_override: Option<u16>, host_override: Option<String>) {
             app_config.host = "0.0.0.0".to_string();
         }
 
-        let state = config::AppState::new(app_config).expect("failed to create state");
+        let state = config::AppState::new(app_config).await.expect("failed to create state");
         let (host, port) = axum_server::start(state).await;
 
         println!("========================================");

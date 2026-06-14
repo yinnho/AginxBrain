@@ -92,8 +92,9 @@ pub async fn handle_anthropic_messages(
 ) -> Result<Response, ProxyError> {
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
+    let caller_key_id = parts.extensions.get::<i64>().copied();
     let body = parse_body(body).await?;
-    handle_proxy("anthropic", state, headers, axum::Json(body)).await
+    handle_proxy("anthropic", state, headers, caller_key_id, axum::Json(body)).await
 }
 
 pub async fn handle_anthropic_count_tokens(
@@ -102,8 +103,9 @@ pub async fn handle_anthropic_count_tokens(
 ) -> Result<Response, ProxyError> {
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
+    let caller_key_id = parts.extensions.get::<i64>().copied();
     let body = parse_body(body).await?;
-    handle_count_tokens("anthropic", state, headers, axum::Json(body)).await
+    handle_count_tokens("anthropic", state, headers, caller_key_id, axum::Json(body)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -116,8 +118,9 @@ pub async fn handle_openai_chat(
 ) -> Result<Response, ProxyError> {
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
+    let caller_key_id = parts.extensions.get::<i64>().copied();
     let body = parse_body(body).await?;
-    handle_proxy("openai", state, headers, axum::Json(body)).await
+    handle_proxy("openai", state, headers, caller_key_id, axum::Json(body)).await
 }
 
 pub async fn handle_openai_responses(
@@ -126,8 +129,9 @@ pub async fn handle_openai_responses(
 ) -> Result<Response, ProxyError> {
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
+    let caller_key_id = parts.extensions.get::<i64>().copied();
     let body = parse_body(body).await?;
-    handle_proxy("openai_responses", state, headers, axum::Json(body)).await
+    handle_proxy("openai_responses", state, headers, caller_key_id, axum::Json(body)).await
 }
 
 /// Parse request body as JSON, accepting any content-type.
@@ -220,8 +224,10 @@ async fn handle_proxy(
     client_protocol: &str,
     State(state): State<AppState>,
     headers: HeaderMap,
+    caller_key_id: Option<i64>,
     body: axum::Json<Value>,
 ) -> Result<Response, ProxyError> {
+
     let body = body.0;
     let request_model = body
         .get("model")
@@ -246,6 +252,7 @@ async fn handle_proxy(
         is_streaming
     );
 
+    let start = std::time::Instant::now();
     let config = state.config.read().await;
 
     // 1. Resolve tag from model, purely from configured tag names
@@ -255,6 +262,22 @@ async fn handle_proxy(
     // 2. Find candidate routes for failover (array order = priority)
     let candidates = find_candidate_routes(&config.routes, &tag);
     if candidates.is_empty() {
+        let _ = crate::db::insert_usage_log(
+            &state.db,
+            crate::db::UsageInsert {
+                caller_key_id,
+                tag: tag.clone(),
+                provider: "".into(),
+                model: "".into(),
+                modality: "chat".into(),
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: start.elapsed().as_millis() as i64,
+                status: "error".into(),
+                error_message: Some("no route".into()),
+            },
+        )
+        .await;
         return Err(ProxyError::NoRoute(tag.clone()));
     }
 
@@ -452,15 +475,24 @@ async fn handle_proxy(
             .into_response());
     }
 
-    // Record successful request log
-    state.log_request(RequestLog {
-        request_model: request_model.clone(),
-        tag: tag.clone(),
-        provider: provider.name.clone(),
-        target_model: route.model.clone(),
-        modality: route.modality.clone(),
-        timestamp: chrono_now(),
-    }).await;
+    // Record successful request log (placeholder; tokens updated for non-streaming)
+    let usage_log_id = crate::db::insert_usage_log(
+        &state.db,
+        crate::db::UsageInsert {
+            caller_key_id,
+            tag: tag.clone(),
+            provider: provider.name.clone(),
+            model: route.model.clone(),
+            modality: route.modality.clone(),
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: start.elapsed().as_millis() as i64,
+            status: "success".to_string(),
+            error_message: None,
+        },
+    )
+    .await
+    .ok();
 
     // 8. Convert response if needed
     if is_streaming {
@@ -621,6 +653,22 @@ async fn handle_proxy(
             }
         };
 
+        // Try to extract usage tokens from upstream response and update the log.
+        if let Some(log_id) = usage_log_id {
+            if let Ok(value) = serde_json::from_slice::<Value>(&resp_body) {
+                let (input, output) = extract_usage_tokens(&value, provider_format);
+                if input.is_some() || output.is_some() {
+                    let _ = crate::db::update_usage_tokens(
+                        &state.db,
+                        log_id,
+                        input.unwrap_or(0),
+                        output.unwrap_or(0),
+                    )
+                    .await;
+                }
+            }
+        }
+
         match (client_protocol, provider_format) {
             ("anthropic", ProviderFormat::Openai) => {
                 // Convert OpenAI Chat response → Anthropic response
@@ -718,6 +766,25 @@ async fn handle_proxy(
     }
     } // end of for loop over candidates
 
+    // All candidates failed — log the error before returning.
+    let error_message = last_error.as_ref().map(|e| e.to_string());
+    let _ = crate::db::insert_usage_log(
+        &state.db,
+        crate::db::UsageInsert {
+            caller_key_id,
+            tag: tag.clone(),
+            provider: "".into(),
+            model: "".into(),
+            modality: "chat".into(),
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: start.elapsed().as_millis() as i64,
+            status: "error".into(),
+            error_message,
+        },
+    )
+    .await;
+
     Err(last_error.unwrap_or_else(|| ProxyError::NoRoute(tag.clone())))
 }
 
@@ -729,6 +796,7 @@ async fn handle_count_tokens(
     client_protocol: &str,
     State(state): State<AppState>,
     headers: HeaderMap,
+    caller_key_id: Option<i64>,
     body: axum::Json<Value>,
 ) -> Result<Response, ProxyError> {
     let body = body.0;
@@ -746,6 +814,22 @@ async fn handle_count_tokens(
 
     let candidates = find_candidate_routes(&config.routes, &tag);
     if candidates.is_empty() {
+        let _ = crate::db::insert_usage_log(
+            &state.db,
+            crate::db::UsageInsert {
+                caller_key_id,
+                tag: tag.clone(),
+                provider: "".into(),
+                model: "".into(),
+                modality: "chat".into(),
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: 0,
+                status: "error".into(),
+                error_message: Some("no route".into()),
+            },
+        )
+        .await;
         return Err(ProxyError::NoRoute(tag.clone()));
     }
 
@@ -898,6 +982,40 @@ use futures::stream::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Extract input/output tokens from an upstream response body.
+fn extract_usage_tokens(value: &Value, format: &ProviderFormat) -> (Option<i64>, Option<i64>) {
+    match format {
+        ProviderFormat::Anthropic => {
+            let input = value
+                .pointer("/usage/input_tokens")
+                .and_then(|v| v.as_i64());
+            let output = value
+                .pointer("/usage/output_tokens")
+                .and_then(|v| v.as_i64());
+            (input, output)
+        }
+        ProviderFormat::Openai | ProviderFormat::OpenaiImages => {
+            let input = value
+                .pointer("/usage/prompt_tokens")
+                .and_then(|v| v.as_i64());
+            let output = value
+                .pointer("/usage/completion_tokens")
+                .and_then(|v| v.as_i64());
+            (input, output)
+        }
+        ProviderFormat::OpenaiResponses => {
+            let input = value
+                .pointer("/usage/input_tokens")
+                .and_then(|v| v.as_i64());
+            let output = value
+                .pointer("/usage/output_tokens")
+                .and_then(|v| v.as_i64());
+            (input, output)
+        }
+        _ => (None, None),
+    }
+}
 
 /// Stream converter that replaces the model field in SSE message_start events.
 /// This prevents the client from updating its model to the provider's model name.
@@ -1227,14 +1345,21 @@ pub async fn generate_image(state: &AppState, req: GenerateImageRequest) -> Gene
 
         match result {
             Ok(images) if !images.is_empty() => {
-                state.log_request(RequestLog {
-                    request_model: tag.clone(),
-                    tag: tag.clone(),
-                    provider: provider.name.clone(),
-                    target_model: route.model.clone(),
-                    modality: "image_generation".into(),
-                    timestamp: chrono_now(),
-                }).await;
+                let _ = crate::db::insert_usage_log(
+                    &state.db,
+                    crate::db::UsageInsert {
+                        caller_key_id: None, // image generation does not yet authenticate caller keys
+                        tag: tag.clone(),
+                        provider: provider.name.clone(),
+                        model: route.model.clone(),
+                        modality: "image_generation".into(),
+                        input_tokens: None,
+                        output_tokens: None,
+                        latency_ms: latency_ms as i64,
+                        status: "success".into(),
+                        error_message: None,
+                    },
+                ).await;
                 return GenerateImageResponse {
                     success: true,
                     tag,

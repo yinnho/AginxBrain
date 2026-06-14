@@ -282,27 +282,21 @@ const MAX_LOG_ENTRIES: usize = 50;
 pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub http_client: reqwest::Client,
-    pub request_log: Arc<RwLock<Vec<RequestLog>>>,
+    pub db: sqlx::SqlitePool,
 }
 
 impl AppState {
-    pub fn new(config: AppConfig) -> Result<Self> {
+    pub async fn new(config: AppConfig) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3600))
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create HTTP client: {}", e))?;
+        let db = crate::db::init_db().await?;
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
             http_client,
-            request_log: Arc::new(RwLock::new(Vec::new())),
+            db,
         })
-    }
-    pub async fn log_request(&self, entry: RequestLog) {
-        let mut log = self.request_log.write().await;
-        log.push(entry);
-        if log.len() > MAX_LOG_ENTRIES {
-            log.remove(0);
-        }
     }
 }
 /// Holds a shutdown signal for the background axum server thread.
@@ -390,28 +384,6 @@ mod tests {
     #[test]
     fn test_default_format_is_openai() {
         assert_eq!(default_format(), ProviderFormat::Openai);
-    }
-
-    #[test]
-    fn test_request_log_ring_buffer() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let state = AppState::new(AppConfig::default()).unwrap();
-            for i in 0..60 {
-                state.log_request(RequestLog {
-                    request_model: format!("model-{}", i),
-                    tag: "auto".into(),
-                    provider: "test".into(),
-                    target_model: "target".into(),
-                    modality: "chat".into(),
-                    timestamp: "now".into(),
-                }).await;
-            }
-            let logs = state.request_log.read().await;
-            assert_eq!(logs.len(), 50); // MAX_LOG_ENTRIES
-            assert_eq!(logs[0].request_model, "model-10"); // oldest remaining
-            assert_eq!(logs[49].request_model, "model-59"); // newest
-        });
     }
 
     #[test]

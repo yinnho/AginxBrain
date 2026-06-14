@@ -1,46 +1,276 @@
 use crate::config::{save_config, AppConfig, AppState, RequestLog};
+use crate::db;
+use crate::models::{
+    AdminLoginRequest, AdminMeResponse, AdminSetupRequest, CallerKey, CostRate,
+    CreateCallerKeyRequest, CreateCallerKeyResponse, DailyUsage, MonthlyUsage,
+    SetCostRateRequest, UpdateCallerKeyRequest, UsageSummary,
+};
 use crate::proxy::{self, TestResult};
 use crate::takeover::{
     check_codex_takeover_status, check_takeover_status, restore_claude, restore_codex,
     take_over_claude, take_over_codex,
 };
-use axum::extract::State;
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::{Deserialize, Serialize};
+use tower_sessions::Session;
 
+pub const ADMIN_SESSION_KEY: &str = "admin_id";
 
 // ─── Management API authentication middleware ───────────────────────────
 
-/// Extract and validate the X-Management-Key header for write operations.
-/// Returns Ok(()) if the key matches the configured management_key,
-/// or an ApiError::Unauthorized response.
-pub async fn require_management_key(
-    State(state): State<AppState>,
+/// Ensure the request has a valid admin session. All management endpoints use this.
+pub async fn require_admin_session(
+    session: Session,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, ApiError> {
-    let config = state.config.read().await;
-    let expected = config.management_key.clone();
-    drop(config);
-
-    if let Some(key) = request.headers().get("x-management-key") {
-        if let Ok(key_str) = key.to_str() {
-            if key_str == expected {
-                return Ok(next.run(request).await);
-            }
-        }
+    match session.get::<i64>(ADMIN_SESSION_KEY).await {
+        Ok(Some(_)) => Ok(next.run(request).await),
+        _ => Err(ApiError::Unauthorized),
     }
-    Err(ApiError::Unauthorized)
 }
 
-use axum::Json;
-use serde::{Deserialize, Serialize};
+// ─── Admin auth endpoints ───────────────────────────────────────────────
+
+// POST /api/admin/setup
+pub async fn admin_setup(
+    State(state): State<AppState>,
+    Json(req): Json<AdminSetupRequest>,
+) -> Result<StatusCode, ApiError> {
+    let count = db::admin_count(&state.db).await.map_err(ApiError::from)?;
+    if count > 0 {
+        return Err(ApiError::Validation("admin already exists".to_string()));
+    }
+    let trimmed = req.username.trim();
+    if trimmed.is_empty() || req.password.len() < 6 {
+        return Err(ApiError::Validation(
+            "username required and password must be at least 6 characters".to_string(),
+        ));
+    }
+    let hash = hash_password(&req.password).map_err(|e| ApiError::Internal(e.to_string()))?;
+    db::create_admin(&state.db, trimmed, &hash)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::OK)
+}
+
+// POST /api/admin/login
+pub async fn admin_login(
+    State(state): State<AppState>,
+    session: Session,
+    Json(req): Json<AdminLoginRequest>,
+) -> Result<StatusCode, ApiError> {
+    let row = db::find_admin_by_username(&state.db, req.username.trim())
+        .await
+        .map_err(ApiError::from)?;
+    let Some((id, password_hash)) = row else {
+        return Err(ApiError::Unauthorized);
+    };
+    if !verify_password(&req.password, &password_hash).map_err(|e| ApiError::Internal(e.to_string()))? {
+        return Err(ApiError::Unauthorized);
+    }
+    session
+        .insert(ADMIN_SESSION_KEY, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
+// POST /api/admin/logout
+pub async fn admin_logout(session: Session) -> Result<StatusCode, ApiError> {
+    let _ = session.remove::<i64>(ADMIN_SESSION_KEY).await;
+    Ok(StatusCode::OK)
+}
+
+// GET /api/admin/me
+pub async fn admin_me(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<Json<AdminMeResponse>, ApiError> {
+    let admin_id = session
+        .get::<i64>(ADMIN_SESSION_KEY)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or(ApiError::Unauthorized)?;
+    // Find admin username by id. Reuse find_admin_by_username is not possible, so query directly.
+    let username: String = sqlx::query_scalar("SELECT username FROM admins WHERE id = ?1")
+        .bind(admin_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(AdminMeResponse { username }))
+}
+
+fn hash_password(password: &str) -> anyhow::Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    let hash = argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("failed to hash password: {}", e))?;
+    Ok(hash.to_string())
+}
+
+fn verify_password(password: &str, hash: &str) -> anyhow::Result<bool> {
+    let parsed = PasswordHash::new(hash).map_err(|e| anyhow::anyhow!("invalid hash: {}", e))?;
+    let argon2 = Argon2::default();
+    Ok(argon2
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
+}
+
+// ─── Caller key management ──────────────────────────────────────────────
+
+// GET /api/keys
+pub async fn list_keys(State(state): State<AppState>) -> Result<Json<Vec<CallerKey>>, ApiError> {
+    let keys = db::list_caller_keys(&state.db).await.map_err(ApiError::from)?;
+    Ok(Json(keys))
+}
+
+// POST /api/keys
+pub async fn create_key(
+    State(state): State<AppState>,
+    Json(req): Json<CreateCallerKeyRequest>,
+) -> Result<Json<CreateCallerKeyResponse>, ApiError> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::Validation("name cannot be empty".to_string()));
+    }
+    let resp = db::create_caller_key(&state.db, name, req.note.trim())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(resp))
+}
+
+// PUT /api/keys/:id
+pub async fn update_key(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateCallerKeyRequest>,
+) -> Result<StatusCode, ApiError> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::Validation("name cannot be empty".to_string()));
+    }
+    let ok = db::update_caller_key(&state.db, id, name, req.note.trim(), req.enabled)
+        .await
+        .map_err(ApiError::from)?;
+    if !ok {
+        return Err(ApiError::Validation("key not found".to_string()));
+    }
+    Ok(StatusCode::OK)
+}
+
+// DELETE /api/keys/:id
+pub async fn delete_key(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let ok = db::delete_caller_key(&state.db, id).await.map_err(ApiError::from)?;
+    if !ok {
+        return Err(ApiError::Validation("key not found".to_string()));
+    }
+    Ok(StatusCode::OK)
+}
+
+// ─── Cost rates ─────────────────────────────────────────────────────────
+
+// GET /api/cost-rates
+pub async fn list_cost_rates(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<CostRate>>, ApiError> {
+    let rates = db::list_cost_rates(&state.db).await.map_err(ApiError::from)?;
+    Ok(Json(rates))
+}
+
+// POST /api/cost-rates
+pub async fn set_cost_rate(
+    State(state): State<AppState>,
+    Json(req): Json<SetCostRateRequest>,
+) -> Result<Json<CostRate>, ApiError> {
+    let provider = req.provider.trim();
+    let model = req.model.trim();
+    if provider.is_empty() || model.is_empty() {
+        return Err(ApiError::Validation("provider and model required".to_string()));
+    }
+    let rate = db::set_cost_rate(&state.db, provider, model, req.input_price_per_1k, req.output_price_per_1k)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(rate))
+}
+
+// DELETE /api/cost-rates/:id
+pub async fn delete_cost_rate(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let ok = db::delete_cost_rate(&state.db, id).await.map_err(ApiError::from)?;
+    if !ok {
+        return Err(ApiError::Validation("rate not found".to_string()));
+    }
+    Ok(StatusCode::OK)
+}
+
+// ─── Usage ──────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct DailyUsageQuery {
+    pub key_id: Option<i64>,
+    pub from: String,
+    pub to: String,
+}
+
+// GET /api/usage/daily
+pub async fn daily_usage(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<DailyUsageQuery>,
+) -> Result<Json<Vec<DailyUsage>>, ApiError> {
+    let rows = db::daily_usage(&state.db, q.key_id, &q.from, &q.to)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+pub struct MonthlyUsageQuery {
+    pub key_id: Option<i64>,
+    pub year: i32,
+    pub month: i32,
+}
+
+// GET /api/usage/monthly
+pub async fn monthly_usage(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<MonthlyUsageQuery>,
+) -> Result<Json<Vec<MonthlyUsage>>, ApiError> {
+    let rows = db::monthly_usage(&state.db, q.key_id, q.year, q.month)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(rows))
+}
+
+// GET /api/usage/summary
+pub async fn usage_summary(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<UsageSummary>>, ApiError> {
+    let rows = db::usage_summary(&state.db).await.map_err(ApiError::from)?;
+    Ok(Json(rows))
+}
+
+// ─── Config/status/logs ─────────────────────────────────────────────────
 
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub current_tag: String,
     pub takeover: TakeoverInfo,
     pub codex_takeover: TakeoverInfo,
+    pub setup_required: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -132,12 +362,13 @@ pub async fn restore_claude_handler() -> Result<StatusCode, ApiError> {
 }
 
 // GET /api/status
-pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
+pub async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse>, ApiError> {
     let config = state.config.read().await;
     let port = config.port;
     let claude_status = check_takeover_status(port);
     let codex_status = check_codex_takeover_status(port);
-    Json(StatusResponse {
+    let setup_required = db::admin_count(&state.db).await.unwrap_or(1) == 0;
+    Ok(Json(StatusResponse {
         current_tag: config.current_tag.clone(),
         takeover: TakeoverInfo {
             active: claude_status.active,
@@ -147,13 +378,34 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
             active: codex_status.active,
             proxy_url: codex_status.proxy_url,
         },
-    })
+        setup_required,
+    }))
 }
 
 // GET /api/logs
-pub async fn get_logs(State(state): State<AppState>) -> Json<Vec<RequestLog>> {
-    let logs = state.request_log.read().await;
-    Json(logs.clone())
+pub async fn get_logs(State(state): State<AppState>) -> Result<Json<Vec<RequestLog>>, ApiError> {
+    let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT '' as request_model, tag, provider, model as target_model, modality, timestamp
+         FROM usage_logs
+         ORDER BY timestamp DESC
+         LIMIT 200",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let logs = rows
+        .into_iter()
+        .map(|(request_model, tag, provider, target_model, modality, timestamp)| RequestLog {
+            request_model,
+            tag,
+            provider,
+            target_model,
+            modality,
+            timestamp,
+        })
+        .collect();
+    Ok(Json(logs))
 }
 
 // POST /api/test
@@ -231,9 +483,6 @@ pub async fn takeover_codex_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let port = state.config.read().await.port;
-    // Use "gpt-5.5" — a model that exists in Codex's bundled catalog so Codex
-    // uses full model metadata instead of degraded fallback.  The proxy routes
-    // by current_tag regardless of the model name sent by the client.
     let proxy_url = take_over_codex(port, "gpt-5.5").map_err(ApiError::from)?;
     Ok(Json(serde_json::json!({ "proxy_url": proxy_url })))
 }
@@ -250,7 +499,6 @@ pub async fn export_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let config = state.config.read().await;
     let mut export_config = config.clone();
-    // Replace real management_key with placeholder for security
     export_config.management_key = "YOUR_MANAGEMENT_KEY".to_string();
     let json_value =
         serde_json::to_value(&export_config).map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -262,10 +510,8 @@ pub async fn import_config(
     State(state): State<AppState>,
     Json(mut import_config): Json<AppConfig>,
 ) -> Result<StatusCode, ApiError> {
-    // Validate the imported config
     validate_config(&import_config).map_err(ApiError::Validation)?;
 
-    // If the imported management_key is the placeholder, preserve the existing key
     if import_config.management_key == "YOUR_MANAGEMENT_KEY" {
         let current = state.config.read().await;
         import_config.management_key = current.management_key.clone();

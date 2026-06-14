@@ -88,20 +88,6 @@ export interface AppConfig {
   management_key: string;
 }
 
-let managementKey: string | null = null;
-
-export function setManagementKey(key: string) {
-  managementKey = key;
-}
-
-function authHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {};
-  if (managementKey) {
-    headers['x-management-key'] = managementKey;
-  }
-  return headers;
-}
-
 export interface Status {
   current_tag: string;
   takeover: {
@@ -112,6 +98,7 @@ export interface Status {
     active: boolean;
     proxy_url: string | null;
   };
+  setup_required: boolean;
 }
 
 export interface RequestLog {
@@ -123,92 +110,283 @@ export interface RequestLog {
   timestamp: string;
 }
 
-export async function getConfig(): Promise<AppConfig> {
-  const res = await fetch(`${API_BASE}/config`);
-  const config = await res.json();
-  if (config.management_key) {
-    setManagementKey(config.management_key);
+export interface CallerKey {
+  id: number;
+  name: string;
+  note: string;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface CreateCallerKeyResponse extends CallerKey {
+  token: string;
+}
+
+export interface CostRate {
+  id: number;
+  provider: string;
+  model: string;
+  input_price_per_1k: number;
+  output_price_per_1k: number;
+}
+
+export interface DailyUsage {
+  day: string;
+  caller_key_id: number | null;
+  request_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost: number;
+}
+
+export interface MonthlyUsage {
+  month: string;
+  caller_key_id: number | null;
+  request_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost: number;
+}
+
+export interface UsageSummary {
+  caller_key_id: number | null;
+  request_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost: number;
+}
+
+function jsonHeaders(): Record<string, string> {
+  return { 'Content-Type': 'application/json' };
+}
+
+async function checkOk(res: Response): Promise<void> {
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Request failed: ${res.status}`);
   }
-  return config;
+}
+
+// ─── Admin auth ─────────────────────────────────────────────────────────
+
+export async function adminSetup(username: string, password: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/admin/setup`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    body: JSON.stringify({ username, password }),
+  });
+  await checkOk(res);
+}
+
+export async function adminLogin(username: string, password: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/admin/login`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    body: JSON.stringify({ username, password }),
+    credentials: 'include',
+  });
+  await checkOk(res);
+}
+
+export async function adminLogout(): Promise<void> {
+  await fetch(`${API_BASE}/admin/logout`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+}
+
+export async function getMe(): Promise<{ username: string }> {
+  const res = await fetch(`${API_BASE}/admin/me`, { credentials: 'include' });
+  await checkOk(res);
+  return res.json();
+}
+
+// ─── Caller keys ────────────────────────────────────────────────────────
+
+export async function listKeys(): Promise<CallerKey[]> {
+  const res = await fetch(`${API_BASE}/keys`, { credentials: 'include' });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function createKey(name: string, note?: string): Promise<CreateCallerKeyResponse> {
+  const res = await fetch(`${API_BASE}/keys`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify({ name, note }),
+  });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function updateKey(key: CallerKey): Promise<void> {
+  const res = await fetch(`${API_BASE}/keys/${key.id}`, {
+    method: 'PUT',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify(key),
+  });
+  await checkOk(res);
+}
+
+export async function deleteKey(id: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/keys/${id}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  await checkOk(res);
+}
+
+// ─── Cost rates ─────────────────────────────────────────────────────────
+
+export async function listCostRates(): Promise<CostRate[]> {
+  const res = await fetch(`${API_BASE}/cost-rates`, { credentials: 'include' });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function setCostRate(rate: Omit<CostRate, 'id'>): Promise<CostRate> {
+  const res = await fetch(`${API_BASE}/cost-rates`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify(rate),
+  });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function deleteCostRate(id: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/cost-rates/${id}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  await checkOk(res);
+}
+
+// ─── Usage ──────────────────────────────────────────────────────────────
+
+export async function getDailyUsage(
+  from: string,
+  to: string,
+  keyId?: number | null
+): Promise<DailyUsage[]> {
+  const params = new URLSearchParams({ from, to });
+  if (keyId != null) params.set('key_id', String(keyId));
+  const res = await fetch(`${API_BASE}/usage/daily?${params}`, { credentials: 'include' });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function getMonthlyUsage(
+  year: number,
+  month: number,
+  keyId?: number | null
+): Promise<MonthlyUsage[]> {
+  const params = new URLSearchParams({ year: String(year), month: String(month) });
+  if (keyId != null) params.set('key_id', String(keyId));
+  const res = await fetch(`${API_BASE}/usage/monthly?${params}`, { credentials: 'include' });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function getUsageSummary(): Promise<UsageSummary[]> {
+  const res = await fetch(`${API_BASE}/usage/summary`, { credentials: 'include' });
+  await checkOk(res);
+  return res.json();
+}
+
+// ─── Config / status / logs ─────────────────────────────────────────────
+
+export async function getConfig(): Promise<AppConfig> {
+  const res = await fetch(`${API_BASE}/config`, { credentials: 'include' });
+  await checkOk(res);
+  return res.json();
 }
 
 export async function updateConfig(config: AppConfig): Promise<void> {
-  await fetch(`${API_BASE}/config`, {
+  const res = await fetch(`${API_BASE}/config`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: jsonHeaders(),
+    credentials: 'include',
     body: JSON.stringify(config),
   });
+  await checkOk(res);
 }
 
 export async function setCurrentTag(tag: string): Promise<void> {
-  await fetch(`${API_BASE}/current-tag`, {
+  const res = await fetch(`${API_BASE}/current-tag`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: jsonHeaders(),
+    credentials: 'include',
     body: JSON.stringify({ tag }),
   });
+  await checkOk(res);
 }
 
 export async function getStatus(): Promise<Status> {
-  const res = await fetch(`${API_BASE}/status`);
+  const res = await fetch(`${API_BASE}/status`, { credentials: 'include' });
+  await checkOk(res);
   return res.json();
 }
 
 export async function takeoverClaude(): Promise<{ proxy_url: string }> {
   const res = await fetch(`${API_BASE}/takeover/claude`, {
     method: 'POST',
-    headers: authHeaders(),
+    credentials: 'include',
   });
+  await checkOk(res);
   return res.json();
 }
 
 export async function restoreClaude(): Promise<void> {
-  await fetch(`${API_BASE}/takeover/claude`, {
+  const res = await fetch(`${API_BASE}/takeover/claude`, {
     method: 'DELETE',
-    headers: authHeaders(),
+    credentials: 'include',
   });
+  await checkOk(res);
 }
 
 export async function takeoverCodex(): Promise<{ proxy_url: string }> {
   const res = await fetch(`${API_BASE}/takeover/codex`, {
     method: 'POST',
-    headers: authHeaders(),
+    credentials: 'include',
   });
+  await checkOk(res);
   return res.json();
 }
 
 export async function restoreCodex(): Promise<void> {
-  await fetch(`${API_BASE}/takeover/codex`, {
+  const res = await fetch(`${API_BASE}/takeover/codex`, {
     method: 'DELETE',
-    headers: authHeaders(),
+    credentials: 'include',
   });
+  await checkOk(res);
 }
 
 export async function exportConfig(): Promise<AppConfig> {
   const res = await fetch(`${API_BASE}/config/export`, {
     method: 'POST',
-    headers: { ...authHeaders() },
+    credentials: 'include',
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || 'Export failed');
-  }
+  await checkOk(res);
   return res.json();
 }
 
 export async function importConfig(config: AppConfig): Promise<void> {
   const res = await fetch(`${API_BASE}/config/import`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: jsonHeaders(),
+    credentials: 'include',
     body: JSON.stringify(config),
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || 'Import failed');
-  }
+  await checkOk(res);
 }
 
 export async function getLogs(): Promise<RequestLog[]> {
-  const res = await fetch(`${API_BASE}/logs`);
+  const res = await fetch(`${API_BASE}/logs`, { credentials: 'include' });
+  await checkOk(res);
   return res.json();
 }
 
@@ -226,9 +404,11 @@ export interface TestResult {
 export async function testRoute(tag: string, prompt?: string): Promise<TestResult> {
   const res = await fetch(`${API_BASE}/test`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ tag, prompt: prompt || 'Hi, reply with one word.' }),
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify({ tag, prompt }),
   });
+  await checkOk(res);
   return res.json();
 }
 
@@ -237,7 +417,7 @@ export interface GenerateImageRequest {
   prompt: string;
   size?: string;
   n?: number;
-  extra?: Record<string, unknown>;
+  extra?: Record<string, any>;
 }
 
 export interface GeneratedImage {
@@ -259,8 +439,10 @@ export interface GenerateImageResponse {
 export async function generateImage(req: GenerateImageRequest): Promise<GenerateImageResponse> {
   const res = await fetch(`${API_BASE}/brain/generate/image`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: jsonHeaders(),
+    credentials: 'include',
     body: JSON.stringify(req),
   });
+  await checkOk(res);
   return res.json();
 }

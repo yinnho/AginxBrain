@@ -1,9 +1,14 @@
 use crate::config::AppState;
-use axum::extract::Request;
-use axum::http::{Method, StatusCode, Uri};
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
+use axum::response::Response;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_sessions::cookie::SameSite;
+use tower_sessions::{Expiry, SessionManagerLayer};
+use tower_sessions_sqlx_store::SqliteStore;
 
 // Embed frontend files at compile time (release builds only).
 // In dev mode, Vite serves the frontend directly.
@@ -15,13 +20,24 @@ use rust_embed::RustEmbed;
 #[folder = "../web/dist/"]
 struct Asset;
 
+pub const CALLER_KEY_ID_EXTENSION: &str = "caller_key_id";
+
 /// Start the axum HTTP server. Returns the actual host:port once bound.
 pub async fn start(state: AppState) -> (String, u16) {
     let port = state.config.read().await.port;
     let host = state.config.read().await.host.clone();
 
-    let app = axum::Router::new()
-        // Anthropic client paths
+    // Session store and layer
+    let session_store = SqliteStore::new(state.db.clone());
+    session_store.migrate().await.expect("failed to migrate session store");
+
+    let session_layer = SessionManagerLayer::new(session_store)
+        .with_secure(false) // set true when served over HTTPS
+        .with_same_site(SameSite::Lax)
+        .with_expiry(Expiry::OnInactivity(time::Duration::hours(24)));
+
+    // Router split into public, proxy (caller-key protected), and admin-protected APIs.
+    let proxy_routes = axum::Router::new()
         .route(
             "/anthropic/v1/messages",
             axum::routing::post(crate::proxy::handle_anthropic_messages),
@@ -30,7 +46,6 @@ pub async fn start(state: AppState) -> (String, u16) {
             "/anthropic/v1/messages/count_tokens",
             axum::routing::post(crate::proxy::handle_anthropic_count_tokens),
         )
-        // OpenAI client paths
         .route(
             "/openai/v1/chat/completions",
             axum::routing::post(crate::proxy::handle_openai_chat),
@@ -39,7 +54,6 @@ pub async fn start(state: AppState) -> (String, u16) {
             "/openai/v1/responses",
             axum::routing::post(crate::proxy::handle_openai_responses),
         )
-        // Legacy paths (backward compatible)
         .route(
             "/v1/messages",
             axum::routing::post(crate::proxy::handle_anthropic_messages),
@@ -48,7 +62,6 @@ pub async fn start(state: AppState) -> (String, u16) {
             "/v1/messages/count_tokens",
             axum::routing::post(crate::proxy::handle_anthropic_count_tokens),
         )
-        // Codex / OpenAI client paths
         .route(
             "/v1/responses",
             axum::routing::post(crate::proxy::handle_openai_responses),
@@ -62,34 +75,53 @@ pub async fn start(state: AppState) -> (String, u16) {
             axum::routing::post(crate::proxy::handle_openai_chat),
         )
         .route("/v1/models", axum::routing::get(crate::api::get_models))
-        // Codex route aliases (v1 compatibility)
         .route("/responses", axum::routing::post(crate::proxy::handle_openai_responses))
         .route("/responses/compact", axum::routing::post(crate::proxy::handle_openai_responses))
         .route("/models", axum::routing::get(crate::api::get_models))
-        // API endpoints — read-only (no auth required)
-        .route("/api/config", axum::routing::get(crate::api::get_config))
-        .route("/api/status", axum::routing::get(crate::api::get_status))
-        .route("/api/logs", axum::routing::get(crate::api::get_logs))
-        // API endpoints — write operations (auth required)
-        .nest(
-            "/api",
-            axum::Router::new()
-                .route("/config", axum::routing::put(crate::api::update_config))
-                .route("/current-tag", axum::routing::put(crate::api::set_current_tag))
-                .route("/takeover/claude", axum::routing::post(crate::api::takeover_claude_handler))
-                .route("/takeover/claude", axum::routing::delete(crate::api::restore_claude_handler))
-                .route("/takeover/codex", axum::routing::post(crate::api::takeover_codex_handler))
-                .route("/takeover/codex", axum::routing::delete(crate::api::restore_codex_handler))
-                .route("/test", axum::routing::post(crate::api::test_route_handler))
-                .route("/brain/generate/image", axum::routing::post(crate::api::generate_image_handler))
-                .route("/config/export", axum::routing::post(crate::api::export_config))
-                .route("/config/import", axum::routing::post(crate::api::import_config))
-                .route_layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    crate::api::require_management_key,
-                )),
-        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_caller_key,
+        ));
+
+    let admin_api_routes = axum::Router::new()
+        .route("/admin/setup", axum::routing::post(crate::api::admin_setup))
+        // The setup endpoint must be public (only works when no admin exists).
+        .route("/admin/login", axum::routing::post(crate::api::admin_login))
+        .route("/admin/logout", axum::routing::post(crate::api::admin_logout))
+        .route("/admin/me", axum::routing::get(crate::api::admin_me))
+        .route("/keys", axum::routing::get(crate::api::list_keys))
+        .route("/keys", axum::routing::post(crate::api::create_key))
+        .route("/keys/:id", axum::routing::put(crate::api::update_key))
+        .route("/keys/:id", axum::routing::delete(crate::api::delete_key))
+        .route("/cost-rates", axum::routing::get(crate::api::list_cost_rates))
+        .route("/cost-rates", axum::routing::post(crate::api::set_cost_rate))
+        .route("/cost-rates/:id", axum::routing::delete(crate::api::delete_cost_rate))
+        .route("/usage/daily", axum::routing::get(crate::api::daily_usage))
+        .route("/usage/monthly", axum::routing::get(crate::api::monthly_usage))
+        .route("/usage/summary", axum::routing::get(crate::api::usage_summary))
+        .route("/config", axum::routing::put(crate::api::update_config))
+        .route("/current-tag", axum::routing::put(crate::api::set_current_tag))
+        .route("/takeover/claude", axum::routing::post(crate::api::takeover_claude_handler))
+        .route("/takeover/claude", axum::routing::delete(crate::api::restore_claude_handler))
+        .route("/takeover/codex", axum::routing::post(crate::api::takeover_codex_handler))
+        .route("/takeover/codex", axum::routing::delete(crate::api::restore_codex_handler))
+        .route("/test", axum::routing::post(crate::api::test_route_handler))
+        .route("/brain/generate/image", axum::routing::post(crate::api::generate_image_handler))
+        .route("/config/export", axum::routing::post(crate::api::export_config))
+        .route("/config/import", axum::routing::post(crate::api::import_config))
+        .route_layer(axum::middleware::from_fn(crate::api::require_admin_session));
+
+    let read_api_routes = axum::Router::new()
+        .route("/config", axum::routing::get(crate::api::get_config))
+        .route("/status", axum::routing::get(crate::api::get_status))
+        .route("/logs", axum::routing::get(crate::api::get_logs));
+
+    let app = axum::Router::new()
+        .merge(proxy_routes)
+        .merge(admin_api_routes)
+        .merge(read_api_routes)
         .layer(axum::middleware::from_fn(request_log_middleware))
+        .layer(session_layer)
         // Codex conversations can be very large (system prompt + tool results).
         // v1 uses 200MB; axum's default is 2MB which causes silent failures.
         .layer(RequestBodyLimitLayer::new(200 * 1024 * 1024))
@@ -108,9 +140,6 @@ pub async fn start(state: AppState) -> (String, u16) {
 
     log::info!("aginxbrain listening on {}", listen_addr);
 
-    // Use oneshot channel to signal when the spawned server task has started,
-    // preventing the race where the Tauri window connects before the server
-    // accept loop is running.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         ready_tx.send(()).ok();
@@ -118,11 +147,39 @@ pub async fn start(state: AppState) -> (String, u16) {
             log::error!("[Server] axum server error: {}", e);
         }
     });
-    // Wait until the spawned task has been polled at least once,
-    // ensuring the accept loop is active before the caller proceeds.
     ready_rx.await.ok();
 
     (host, port)
+}
+
+/// Middleware that validates `Authorization: Bearer <caller-token>` for proxy routes.
+async fn require_caller_key(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: axum::middleware::Next,
+) -> Result<Response, StatusCode> {
+    let token = extract_bearer_token(req.headers());
+    let Some(token) = token else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let result = crate::db::find_caller_key_by_token(&state.db, &token)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some((caller_key_id, enabled)) = result else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    if !enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    req.extensions_mut().insert(caller_key_id);
+    Ok(next.run(req).await)
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let auth = headers.get("authorization")?.to_str().ok()?;
+    auth.strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))
+        .map(|s| s.trim().to_string())
 }
 
 /// Middleware that logs every incoming request.
@@ -187,7 +244,6 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
         let file_path = uri.path().trim_start_matches('/');
         let file_path = if file_path.is_empty() { "index.html" } else { file_path };
 
-        // Try exact file match first
         if let Some(content) = Asset::get(file_path) {
             let ct = content.metadata.mimetype();
             log::info!("[Fallback] GET {} → 200 (embedded, {})", uri.path(), ct);
@@ -199,7 +255,6 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
                 .into_response();
         }
 
-        // SPA fallback: for paths without a file extension, serve index.html
         let has_extension = std::path::Path::new(file_path)
             .extension()
             .is_some();
@@ -226,7 +281,6 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
 
     #[cfg(debug_assertions)]
     {
-        // Dev mode: serve from disk (web/dist/) so browser access works during development
         let file_path = uri.path().trim_start_matches('/');
         let file_path = if file_path.is_empty() { "index.html" } else { file_path };
 
@@ -239,7 +293,6 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
             }
         }
 
-        // SPA fallback: for paths without a file extension, serve index.html
         let has_extension = std::path::Path::new(file_path).extension().is_some();
         if !has_extension {
             let html_path = std::path::PathBuf::from("../web/dist/index.html");
