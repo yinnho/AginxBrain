@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use sqlx::{migrate::MigrateDatabase, sqlite::SqlitePoolOptions, Sqlite, SqlitePool};
 use std::path::PathBuf;
 
@@ -225,10 +226,11 @@ pub struct UsageInsert {
 }
 
 pub async fn insert_usage_log(pool: &SqlitePool, usage: UsageInsert) -> Result<i64> {
+    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO usage_logs
-         (caller_key_id, tag, provider, model, modality, input_tokens, output_tokens, latency_ms, status, error_message)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         (caller_key_id, tag, provider, model, modality, input_tokens, output_tokens, latency_ms, status, error_message, timestamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          RETURNING id",
     )
     .bind(usage.caller_key_id)
@@ -241,6 +243,7 @@ pub async fn insert_usage_log(pool: &SqlitePool, usage: UsageInsert) -> Result<i
     .bind(usage.latency_ms)
     .bind(usage.status)
     .bind(usage.error_message)
+    .bind(timestamp)
     .fetch_one(pool)
     .await
     .context("inserting usage log")?;
