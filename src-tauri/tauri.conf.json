@@ -24,7 +24,9 @@
     "active": true,
     "targets": [
       "dmg",
-      "app"
+      "app",
+      "nsis",
+      "msi"
     ],
     "icon": [
       "icons/32x32.png",
