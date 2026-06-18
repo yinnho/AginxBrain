@@ -1,5 +1,16 @@
 name: Release
 
+# Build desktop installers for macOS (arm64 + x86_64) and Windows whenever a
+# version tag (v*) is pushed, then attach them to a GitHub Release.
+#
+# Usage:
+#   git tag v0.x.x
+#   git push origin v0.x.x
+#
+# We build with the plain `tauri build` CLI and upload artifacts ourselves
+# (softprops/action-gh-release) rather than tauri-action's uploader, which
+# errors with "No artifacts were found" when the updater isn't signed.
+
 on:
   push:
     tags:
@@ -16,11 +27,11 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
+            target: aarch64-apple-darwin
           - platform: macos-latest
-            args: '--target x86_64-apple-darwin'
+            target: x86_64-apple-darwin
           - platform: windows-latest
-            args: ''
+            target: ''
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -52,22 +63,55 @@ jobs:
 
       - name: Install macOS targets
         if: matrix.platform == 'macos-latest'
-        run: |
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+        run: rustup target add ${{ matrix.target }}
 
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # No signing for now — unsigned installers are fine for manual
-          # download; auto-update just won't verify signatures. Set these
-          # secrets later to enable signed auto-updates.
-          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build app bundle
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo tauri build --target ${{ matrix.target }}
+          else
+            cargo tauri build
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: ${{ github.ref_name }}
-          releaseBody: |
+          name: bundle-${{ matrix.platform }}-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.app
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.exe
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Flatten release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.exe" \) \
+            -exec cp {} release-assets/ \;
+          ls -la release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
             AginxBrain desktop client. Download the installer for your platform below.
 
             - **macOS Apple Silicon**: `*_aarch64.dmg`
@@ -75,6 +119,4 @@ jobs:
             - **Windows**: `*_x64-setup.exe` / `*_x64_en-US.msi`
 
             Usage: open the app, enter your API key from brain.aginx.net, toggle Claude Code/Codex on.
-          releaseDraft: false
-          prerelease: false
-          args: ${{ matrix.args }}
+          files: release-assets/*
