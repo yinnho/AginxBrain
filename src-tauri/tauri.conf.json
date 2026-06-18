@@ -4,15 +4,15 @@
   "version": "0.2.5",
   "identifier": "com.aginx.brain",
   "build": {
-    "beforeBuildCommand": "npm --prefix ../web run build",
-    "beforeDevCommand": "npm --prefix ../web run dev",
-    "devUrl": "http://localhost:5173",
-    "frontendDist": "../web/dist"
+    "beforeBuildCommand": "",
+    "beforeDevCommand": "",
+    "devUrl": "http://localhost:5174",
+    "frontendDist": "../web-client/dist"
   },
   "app": {
     "windows": [],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; connect-src 'self' https://*.aginx.net https://brain.aginx.net http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
     },
     "trayIcon": {
       "iconPath": "icons/icon.png",
@@ -24,9 +24,7 @@
     "active": true,
     "targets": [
       "dmg",
-      "app",
-      "nsis",
-      "msi"
+      "app"
     ],
     "icon": [
       "icons/32x32.png",

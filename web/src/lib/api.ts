@@ -108,6 +108,12 @@ export interface RequestLog {
   target_model: string;
   modality: string;
   timestamp: string;
+  caller_key_name?: string | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  latency_ms: number;
+  cost: number;
+  timestamp_ms: number;
 }
 
 export interface CallerKey {
@@ -116,6 +122,7 @@ export interface CallerKey {
   note: string;
   enabled: boolean;
   created_at: string;
+  token?: string | null;
 }
 
 export interface CreateCallerKeyResponse extends CallerKey {

@@ -103,20 +103,27 @@ pub async fn start(state: AppState) -> (String, u16) {
         .route("/usage/monthly", axum::routing::get(crate::api::monthly_usage))
         .route("/usage/summary", axum::routing::get(crate::api::usage_summary))
         .route("/config", axum::routing::get(crate::api::get_config).put(crate::api::update_config))
-        .route("/logs", axum::routing::get(crate::api::get_logs))
         .route("/current-tag", axum::routing::put(crate::api::set_current_tag))
-        .route("/takeover/claude", axum::routing::post(crate::api::takeover_claude_handler))
-        .route("/takeover/claude", axum::routing::delete(crate::api::restore_claude_handler))
-        .route("/takeover/codex", axum::routing::post(crate::api::takeover_codex_handler))
-        .route("/takeover/codex", axum::routing::delete(crate::api::restore_codex_handler))
         .route("/test", axum::routing::post(crate::api::test_route_handler))
         .route("/brain/generate/image", axum::routing::post(crate::api::generate_image_handler))
         .route("/config/export", axum::routing::post(crate::api::export_config))
         .route("/config/import", axum::routing::post(crate::api::import_config))
         .route_layer(axum::middleware::from_fn(crate::api::require_admin_session));
 
+    // Client-facing routes: accessible via admin session OR caller-key Bearer token.
+    // Desktop app uses these with just an API key (no admin login).
+    let client_api_routes = axum::Router::new()
+        .route("/logs", axum::routing::get(crate::api::get_logs))
+        .route("/takeover/claude", axum::routing::post(crate::api::takeover_claude_handler))
+        .route("/takeover/claude", axum::routing::delete(crate::api::restore_claude_handler))
+        .route("/takeover/codex", axum::routing::post(crate::api::takeover_codex_handler))
+        .route("/takeover/codex", axum::routing::delete(crate::api::restore_codex_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::api::require_admin_or_caller_key,
+        ));
+
     // Public read APIs: only /status (login page needs setup_required before auth).
-    // /config and /logs are admin-only — they live in admin_api_routes above.
     let read_api_routes = axum::Router::new()
         .route("/status", axum::routing::get(crate::api::get_status));
 
@@ -124,6 +131,7 @@ pub async fn start(state: AppState) -> (String, u16) {
     // API_BASE = '/api'. Proxy routes stay at root (e.g. /v1/chat/completions).
     let api_routes = public_auth_routes
         .merge(admin_api_routes)
+        .merge(client_api_routes)
         .merge(read_api_routes);
 
     let app = axum::Router::new()
@@ -186,7 +194,7 @@ async fn require_caller_key(
     Ok(next.run(req).await)
 }
 
-fn extract_caller_token(headers: &HeaderMap) -> Option<String> {
+pub fn extract_caller_token(headers: &HeaderMap) -> Option<String> {
     // Prefer Authorization: Bearer (OpenAI / Responses / Codex), then fall back
     // to x-api-key (Anthropic clients).
     if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {

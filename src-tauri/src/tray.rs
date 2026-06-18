@@ -5,8 +5,8 @@ use tauri::{
 };
 
 pub fn setup_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
-    let show_item = MenuItemBuilder::with_id("show", "Show AginxBrain").build(app)?;
-    let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+    let show_item = MenuItemBuilder::with_id("show", "显示 AginxBrain").build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", "退出").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .items(&[&show_item, &quit_item])
@@ -31,11 +31,6 @@ pub fn setup_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "quit" => {
-                // Notify the background axum server thread to shut down
-                // before exiting the process.
-                if let Some(shutdown) = app.try_state::<crate::config::ServerShutdown>() {
-                    shutdown.shutdown();
-                }
                 app.exit(0);
             }
             _ => {}

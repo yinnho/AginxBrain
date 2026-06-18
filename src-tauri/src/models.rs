@@ -32,6 +32,9 @@ pub struct CallerKey {
     pub note: String,
     pub enabled: bool,
     pub created_at: String,
+    /// Plaintext token, present only for keys created after the
+    /// 003_add_caller_token_plain migration. NULL for legacy keys.
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

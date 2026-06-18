@@ -15,6 +15,18 @@ pub struct RequestLog {
     #[serde(default = "default_modality")]
     pub modality: String,
     pub timestamp: String,
+    #[serde(default)]
+    pub caller_key_name: Option<String>,
+    #[serde(default)]
+    pub input_tokens: Option<i64>,
+    #[serde(default)]
+    pub output_tokens: Option<i64>,
+    #[serde(default)]
+    pub latency_ms: i64,
+    #[serde(default)]
+    pub cost: f64,
+    #[serde(default)]
+    pub timestamp_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

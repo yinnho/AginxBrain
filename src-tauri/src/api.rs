@@ -37,6 +37,35 @@ pub async fn require_admin_session(
     }
 }
 
+/// Accept either an admin session or a valid caller-key Bearer token.
+/// Used for client-facing endpoints (logs, status, takeover) that the
+/// desktop app accesses with just an API key.
+pub async fn require_admin_or_caller_key(
+    State(state): State<AppState>,
+    session: Session,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, ApiError> {
+    // 1. Check admin session first
+    match session.get::<i64>(ADMIN_SESSION_KEY).await {
+        Ok(Some(_)) => return Ok(next.run(request).await),
+        _ => {}
+    }
+    // 2. Fall back to Bearer caller key
+    let token = crate::axum_server::extract_caller_token(request.headers());
+    if let Some(token) = token {
+        let result = db::find_caller_key_by_token(&state.db, &token)
+            .await
+            .map_err(|_| ApiError::Internal("db error".to_string()))?;
+        if let Some((_id, enabled)) = result {
+            if enabled {
+                return Ok(next.run(request).await);
+            }
+        }
+    }
+    Err(ApiError::Unauthorized)
+}
+
 // ─── Admin auth endpoints ───────────────────────────────────────────────
 
 // POST /api/admin/setup
@@ -391,10 +420,15 @@ pub async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResp
 
 // GET /api/logs
 pub async fn get_logs(State(state): State<AppState>) -> Result<Json<Vec<RequestLog>>, ApiError> {
-    let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
-        "SELECT '' as request_model, tag, provider, model as target_model, modality, timestamp
-         FROM usage_logs
-         ORDER BY timestamp DESC
+    let rows: Vec<(String, String, String, String, String, String, Option<String>, Option<i64>, Option<i64>, i64, f64, i64)> = sqlx::query_as(
+        "SELECT u.request_model, u.tag, u.provider, u.model as target_model, u.modality, u.timestamp, k.name as caller_key_name,
+                u.input_tokens, u.output_tokens, u.latency_ms,
+                COALESCE((u.input_tokens / 1000.0) * COALESCE(r.input_price_per_1k, 0.0) + (u.output_tokens / 1000.0) * COALESCE(r.output_price_per_1k, 0.0), 0.0) as cost,
+                CAST((strftime('%s', u.timestamp) * 1000) AS INTEGER) as timestamp_ms
+         FROM usage_logs u
+         LEFT JOIN caller_keys k ON u.caller_key_id = k.id
+         LEFT JOIN cost_rates r ON u.provider = r.provider AND u.model = r.model
+         ORDER BY u.timestamp DESC
          LIMIT 200",
     )
     .fetch_all(&state.db)
@@ -403,13 +437,19 @@ pub async fn get_logs(State(state): State<AppState>) -> Result<Json<Vec<RequestL
 
     let logs = rows
         .into_iter()
-        .map(|(request_model, tag, provider, target_model, modality, timestamp)| RequestLog {
+        .map(|(request_model, tag, provider, target_model, modality, timestamp, caller_key_name, input_tokens, output_tokens, latency_ms, cost, timestamp_ms)| RequestLog {
             request_model,
             tag,
             provider,
             target_model,
             modality,
             timestamp,
+            caller_key_name,
+            input_tokens,
+            output_tokens,
+            latency_ms,
+            cost,
+            timestamp_ms,
         })
         .collect();
     Ok(Json(logs))

@@ -269,6 +269,7 @@ async fn handle_proxy(
                 tag: tag.clone(),
                 provider: "".into(),
                 model: "".into(),
+                request_model: request_model.clone(),
                 modality: "chat".into(),
                 input_tokens: None,
                 output_tokens: None,
@@ -336,21 +337,24 @@ async fn handle_proxy(
             let mut b = body.clone();
             b["model"] = Value::String(route.model.clone());
             normalize_roles(&mut b);
+            strip_anthropic_specific_fields(&mut b);
             inject_reasoning_content(&mut b);
             b
         }
         ("anthropic", ProviderFormat::Openai) => {
             // Anthropic → OpenAI Chat Completions
-            // Note: don't strip_thinking here — thinking blocks are converted
-            // to reasoning_content in anthropic_to_openai_request
+            // Strip thinking blocks — DeepSeek doesn't need reasoning_content
             let mut b = body.clone();
             normalize_roles(&mut b);
+            strip_anthropic_specific_fields(&mut b);
+            strip_thinking(&mut b);
             convert::anthropic_to_openai_request(&b, &route.model)
         }
         ("anthropic", ProviderFormat::OpenaiResponses) => {
             // Anthropic → OpenAI Responses API
             let mut b = body.clone();
             normalize_roles(&mut b);
+            strip_anthropic_specific_fields(&mut b);
             strip_thinking(&mut b);
             convert::anthropic_to_responses_request(&b, &route.model)
         }
@@ -475,6 +479,7 @@ async fn handle_proxy(
                 tag: tag.clone(),
                 provider: provider.name.clone(),
                 model: route.model.clone(),
+                request_model: request_model.clone(),
                 modality: route.modality.clone(),
                 input_tokens: None,
                 output_tokens: None,
@@ -504,6 +509,7 @@ async fn handle_proxy(
             tag: tag.clone(),
             provider: provider.name.clone(),
             model: route.model.clone(),
+            request_model: request_model.clone(),
             modality: route.modality.clone(),
             input_tokens: None,
             output_tokens: None,
@@ -517,14 +523,41 @@ async fn handle_proxy(
 
     // 8. Convert response if needed
     if is_streaming {
+        // ── Tee raw provider stream to background usage extraction ──
+        // This runs BEFORE the match so ALL streaming paths (conversion +
+        // passthrough) capture input/output tokens.
+        let (usage_tx, mut usage_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+        let db = state.db.clone();
+        let log_id = usage_log_id;
+        let usage_format = provider_format.clone();
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            while let Some(result) = usage_rx.recv().await {
+                if let Ok(bytes) = result {
+                    buf.extend_from_slice(&bytes);
+                }
+            }
+            let (input, output) = extract_usage_from_sse_buffer(&buf, &usage_format);
+            if let (Some(i), Some(o)) = (input, output) {
+                if let Some(id) = log_id {
+                    let _ = crate::db::update_usage_tokens(&db, id, i, o).await;
+                }
+            }
+        });
+
+        let raw_stream = resp.bytes_stream().map(move |result| {
+            if let Ok(ref bytes) = result {
+                let _ = usage_tx.send(Ok(bytes.clone()));
+            }
+            result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        });
+
         match (client_protocol, provider_format) {
             ("anthropic", ProviderFormat::Openai) => {
                 // Convert OpenAI Chat SSE → Anthropic SSE
-                let stream = resp.bytes_stream().map(|result| {
-                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                });
                 let converted = convert::convert_openai_stream_to_anthropic(
-                    Box::pin(stream),
+                    Box::pin(raw_stream),
                     request_model,
                 );
                 let body = Body::from_stream(converted);
@@ -538,11 +571,8 @@ async fn handle_proxy(
             }
             ("anthropic", ProviderFormat::OpenaiResponses) => {
                 // Convert OpenAI Responses SSE → Anthropic SSE
-                let stream = resp.bytes_stream().map(|result| {
-                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                });
                 let converted = convert::convert_responses_stream_to_anthropic(
-                    Box::pin(stream),
+                    Box::pin(raw_stream),
                     request_model,
                 );
                 let body = Body::from_stream(converted);
@@ -556,11 +586,8 @@ async fn handle_proxy(
             }
             ("openai_responses", ProviderFormat::Openai) => {
                 // Convert OpenAI Chat SSE → Responses SSE (for Codex)
-                let stream = resp.bytes_stream().map(|result| {
-                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                });
                 let converted = convert::convert_chat_stream_to_responses(
-                    Box::pin(stream),
+                    Box::pin(raw_stream),
                     &request_model,
                 );
                 let body = Body::from_stream(converted);
@@ -574,11 +601,8 @@ async fn handle_proxy(
             }
             ("openai_responses", ProviderFormat::Anthropic) => {
                 // Convert Anthropic SSE → Responses SSE (for Codex)
-                let stream = resp.bytes_stream().map(|result| {
-                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                });
                 let converted = convert::convert_anthropic_stream_to_responses(
-                    Box::pin(stream),
+                    Box::pin(raw_stream),
                     &request_model,
                 );
                 let body = Body::from_stream(converted);
@@ -592,11 +616,8 @@ async fn handle_proxy(
             }
             ("openai", ProviderFormat::OpenaiResponses) => {
                 // Convert OpenAI Responses SSE → OpenAI Chat SSE
-                let stream = resp.bytes_stream().map(|result| {
-                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                });
                 let converted = convert::convert_responses_stream_to_chat(
-                    Box::pin(stream),
+                    Box::pin(raw_stream),
                     &request_model,
                 );
                 let body = Body::from_stream(converted);
@@ -610,11 +631,8 @@ async fn handle_proxy(
             }
             ("openai", ProviderFormat::Anthropic) => {
                 // Convert Anthropic SSE → OpenAI Chat SSE
-                let stream = resp.bytes_stream().map(|result| {
-                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                });
                 let converted = convert::convert_anthropic_stream_to_openai(
-                    Box::pin(stream),
+                    Box::pin(raw_stream),
                     request_model.clone(),
                 );
                 let body = Body::from_stream(converted);
@@ -630,10 +648,7 @@ async fn handle_proxy(
             | ("openai", ProviderFormat::Openai)
             | ("openai_responses", ProviderFormat::OpenaiResponses) => {
                 // Passthrough: forward raw bytes without JSON parsing
-                let stream = resp.bytes_stream().map(|result| {
-                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                });
-                let body = Body::from_stream(stream);
+                let body = Body::from_stream(raw_stream);
 
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -644,10 +659,7 @@ async fn handle_proxy(
             }
             _ => {
                 // Passthrough streaming with model preservation
-                let stream = resp.bytes_stream().map(|result| {
-                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                });
-                let converted = replace_model_in_anthropic_stream(Box::pin(stream), request_model);
+                let converted = replace_model_in_anthropic_stream(Box::pin(raw_stream), request_model);
                 let body = Body::from_stream(converted);
 
                 return Ok(Response::builder()
@@ -796,6 +808,7 @@ async fn handle_proxy(
             tag: tag.clone(),
             provider: "".into(),
             model: "".into(),
+            request_model: request_model.clone(),
             modality: "chat".into(),
             input_tokens: None,
             output_tokens: None,
@@ -842,6 +855,7 @@ async fn handle_count_tokens(
                 tag: tag.clone(),
                 provider: "".into(),
                 model: "".into(),
+                request_model: request_model.clone(),
                 modality: "chat".into(),
                 input_tokens: None,
                 output_tokens: None,
@@ -1003,6 +1017,50 @@ use futures::stream::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Extract input/output tokens from an SSE stream buffer by scanning all data lines.
+/// Works for both Anthropic-format SSE (usage in message_start/message_delta) and
+/// OpenAI-format SSE (usage in the final chunk).
+fn extract_usage_from_sse_buffer(buf: &[u8], format: &ProviderFormat) -> (Option<i64>, Option<i64>) {
+    let text = String::from_utf8_lossy(buf);
+    let mut input = None;
+    let mut output = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.trim();
+            if data == "[DONE]" {
+                continue;
+            }
+            if let Ok(json) = serde_json::from_str::<Value>(data) {
+                if let Some(usage) = json.get("usage") {
+                    match format {
+                        ProviderFormat::Anthropic | ProviderFormat::OpenaiResponses => {
+                            if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+                                input = Some(v);
+                            }
+                            if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+                                output = Some(v);
+                            }
+                        }
+                        ProviderFormat::Openai | ProviderFormat::OpenaiImages => {
+                            if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
+                                input = Some(v);
+                            }
+                            if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
+                                output = Some(v);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    (input, output)
+}
 
 /// Extract input/output tokens from an upstream response body.
 fn extract_usage_tokens(value: &Value, format: &ProviderFormat) -> (Option<i64>, Option<i64>) {
@@ -1246,6 +1304,24 @@ fn inject_reasoning_content(value: &mut Value) {
     }
 }
 
+/// Strip Anthropic-specific fields that domestic providers do not understand.
+/// These fields are meaningful only to the real Anthropic API; leaving them in
+/// the forwarded body can cause providers to return errors or unexpectedly
+/// large responses, which makes Claude Code retry with an ever-growing context.
+fn strip_anthropic_specific_fields(value: &mut Value) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("context_management");
+        obj.remove("metadata");
+        obj.remove("tool_choice");
+        // Providers handle their own thinking policy; sending Anthropic's
+        // thinking config can break non-Anthropic endpoints.
+        obj.remove("thinking");
+        // beta/extended fields are provider-specific
+        obj.remove("anthropic_beta");
+        obj.remove("anthropic_version");
+    }
+}
+
 /// Strip "thinking" blocks from assistant content arrays
 fn strip_thinking(value: &mut Value) {
     match value {
@@ -1373,6 +1449,7 @@ pub async fn generate_image(state: &AppState, req: GenerateImageRequest) -> Gene
                         tag: tag.clone(),
                         provider: provider.name.clone(),
                         model: route.model.clone(),
+                        request_model: route.model.clone(),
                         modality: "image_generation".into(),
                         input_tokens: None,
                         output_tokens: None,

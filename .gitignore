@@ -8,6 +8,10 @@ src-tauri/target/
 web/node_modules/
 web/dist/
 
+# Desktop client
+web-client/node_modules/
+web-client/dist/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -107,8 +107,8 @@ fn hash_token(token: &str) -> String {
 }
 
 pub async fn list_caller_keys(pool: &SqlitePool) -> Result<Vec<CallerKey>> {
-    let rows: Vec<(i64, String, String, i64, String)> = sqlx::query_as(
-        "SELECT id, name, note, enabled, created_at FROM caller_keys ORDER BY created_at DESC",
+    let rows: Vec<(i64, String, String, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, name, note, enabled, created_at, token FROM caller_keys ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await
@@ -116,12 +116,13 @@ pub async fn list_caller_keys(pool: &SqlitePool) -> Result<Vec<CallerKey>> {
 
     Ok(rows
         .into_iter()
-        .map(|(id, name, note, enabled, created_at)| CallerKey {
+        .map(|(id, name, note, enabled, created_at, token)| CallerKey {
             id,
             name,
             note,
             enabled: enabled != 0,
             created_at,
+            token,
         })
         .collect())
 }
@@ -135,9 +136,10 @@ pub async fn create_caller_key(
     let key_hash = hash_token(&token);
 
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO caller_keys (key_hash, name, note) VALUES (?1, ?2, ?3) RETURNING id",
+        "INSERT INTO caller_keys (key_hash, token, name, note) VALUES (?1, ?2, ?3, ?4) RETURNING id",
     )
     .bind(&key_hash)
+    .bind(&token)
     .bind(name)
     .bind(note)
     .fetch_one(pool)
@@ -217,6 +219,7 @@ pub struct UsageInsert {
     pub tag: String,
     pub provider: String,
     pub model: String,
+    pub request_model: String,
     pub modality: String,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -229,14 +232,15 @@ pub async fn insert_usage_log(pool: &SqlitePool, usage: UsageInsert) -> Result<i
     let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO usage_logs
-         (caller_key_id, tag, provider, model, modality, input_tokens, output_tokens, latency_ms, status, error_message, timestamp)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         (caller_key_id, tag, provider, model, request_model, modality, input_tokens, output_tokens, latency_ms, status, error_message, timestamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          RETURNING id",
     )
     .bind(usage.caller_key_id)
     .bind(usage.tag)
     .bind(usage.provider)
     .bind(usage.model)
+    .bind(usage.request_model)
     .bind(usage.modality)
     .bind(usage.input_tokens)
     .bind(usage.output_tokens)

@@ -139,6 +139,7 @@ export function ApiKeysPage() {
           <thead>
             <tr style={{ borderBottom: '1px solid var(--border)' }}>
               <th style={{ textAlign: 'left', padding: '8px 0', color: 'var(--text-muted)', fontWeight: 500 }}>Name</th>
+              <th style={{ textAlign: 'left', padding: '8px 0', color: 'var(--text-muted)', fontWeight: 500 }}>API Key</th>
               <th style={{ textAlign: 'left', padding: '8px 0', color: 'var(--text-muted)', fontWeight: 500 }}>Note</th>
               <th style={{ textAlign: 'left', padding: '8px 0', color: 'var(--text-muted)', fontWeight: 500 }}>Status</th>
               <th style={{ textAlign: 'left', padding: '8px 0', color: 'var(--text-muted)', fontWeight: 500 }}>Created</th>
@@ -147,38 +148,11 @@ export function ApiKeysPage() {
           </thead>
           <tbody>
             {keys.map((key) => (
-              <tr key={key.id} style={{ borderBottom: '1px solid var(--border)' }}>
-                <td style={{ padding: '10px 0' }}>{key.name}</td>
-                <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{key.note || '-'}</td>
-                <td style={{ padding: '10px 0' }}>
-                  <button
-                    onClick={() => toggleEnabled(key)}
-                    style={{
-                      background: key.enabled ? 'rgba(34, 197, 94, 0.12)' : 'rgba(100, 116, 139, 0.12)',
-                      color: key.enabled ? '#22C55E' : 'var(--text-muted)',
-                      border: 'none', borderRadius: 12, padding: '3px 10px',
-                      fontSize: 12, cursor: 'pointer', fontWeight: 500,
-                    }}
-                  >
-                    {key.enabled ? 'Active' : 'Disabled'}
-                  </button>
-                </td>
-                <td style={{ padding: '10px 0', color: 'var(--text-muted)', fontSize: 12 }}>{key.created_at.slice(0, 10)}</td>
-                <td style={{ padding: '10px 0', textAlign: 'right' }}>
-                  <button
-                    onClick={() => handleDelete(key.id)}
-                    style={{
-                      background: 'transparent', border: '1px solid var(--border)',
-                      borderRadius: 6, padding: '4px 10px', fontSize: 12,
-                      color: '#EF4444', cursor: 'pointer',
-                    }}
-                  >Delete</button>
-                </td>
-              </tr>
+              <KeyRow key={key.id} keyData={key} onDelete={handleDelete} onToggle={toggleEnabled} />
             ))}
             {keys.length === 0 && (
               <tr>
-                <td colSpan={5} style={{ padding: 20, textAlign: 'center', color: 'var(--text-muted)' }}>
+                <td colSpan={6} style={{ padding: 20, textAlign: 'center', color: 'var(--text-muted)' }}>
                   No API keys yet.
                 </td>
               </tr>
@@ -203,5 +177,94 @@ export function ApiKeysPage() {
         </div>
       )}
     </div>
+  );
+}
+
+// One row in the keys table, with a reveal/copy control for the API key value.
+function KeyRow({
+  keyData,
+  onDelete,
+  onToggle,
+}: {
+  keyData: api.CallerKey;
+  onDelete: (id: number) => void;
+  onToggle: (key: api.CallerKey) => void;
+}) {
+  const [revealed, setRevealed] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const token = keyData.token;
+  const masked = token ? `${token.slice(0, 10)}…${token.slice(-4)}` : null;
+
+  const copy = () => {
+    if (!token) return;
+    navigator.clipboard?.writeText(token).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+
+  return (
+    <tr style={{ borderBottom: '1px solid var(--border)' }}>
+      <td style={{ padding: '10px 0' }}>{keyData.name}</td>
+      <td style={{ padding: '10px 0' }}>
+        {token ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span className="mono" style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+              {revealed ? token : masked}
+            </span>
+            <button
+              onClick={() => setRevealed((v) => !v)}
+              style={{
+                background: 'transparent', border: '1px solid var(--border)',
+                borderRadius: 4, padding: '1px 6px', fontSize: 11,
+                color: 'var(--text-muted)', cursor: 'pointer',
+              }}
+            >
+              {revealed ? '隐藏' : '显示'}
+            </button>
+            <button
+              onClick={copy}
+              style={{
+                background: 'transparent', border: '1px solid var(--border)',
+                borderRadius: 4, padding: '1px 6px', fontSize: 11,
+                color: copied ? 'var(--success, #22C55E)' : 'var(--accent, #3B82F6)', cursor: 'pointer',
+              }}
+            >
+              {copied ? '已复制' : '复制'}
+            </button>
+          </div>
+        ) : (
+          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            仅创建时可见（旧 key）
+          </span>
+        )}
+      </td>
+      <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{keyData.note || '-'}</td>
+      <td style={{ padding: '10px 0' }}>
+        <button
+          onClick={() => onToggle(keyData)}
+          style={{
+            background: keyData.enabled ? 'rgba(34, 197, 94, 0.12)' : 'rgba(100, 116, 139, 0.12)',
+            color: keyData.enabled ? '#22C55E' : 'var(--text-muted)',
+            border: 'none', borderRadius: 12, padding: '3px 10px',
+            fontSize: 12, cursor: 'pointer', fontWeight: 500,
+          }}
+        >
+          {keyData.enabled ? 'Active' : 'Disabled'}
+        </button>
+      </td>
+      <td style={{ padding: '10px 0', color: 'var(--text-muted)', fontSize: 12 }}>{keyData.created_at.slice(0, 10)}</td>
+      <td style={{ padding: '10px 0', textAlign: 'right' }}>
+        <button
+          onClick={() => onDelete(keyData.id)}
+          style={{
+            background: 'transparent', border: '1px solid var(--border)',
+            borderRadius: 6, padding: '4px 10px', fontSize: 12,
+            color: '#EF4444', cursor: 'pointer',
+          }}
+        >Delete</button>
+      </td>
+    </tr>
   );
 }
