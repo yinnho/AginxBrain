@@ -37,7 +37,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/yinnho/model-router/releases/latest/download/latest.json"
+        "https://github.com/yinnho/AginxBrain/releases/latest/download/latest.json"
       ],
       "pubkey": "PK8IEe+JwXXWRZGAOXZ+v0RhLUBeb1ATKc8Zu4DbqtQ="
     }

@@ -34,13 +34,21 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: pnpm
+          cache-dependency-path: web-client/pnpm-lock.yaml
 
-      - name: Install frontend dependencies
-        run: cd web && npm install
+      - name: Build desktop client frontend
+        run: pnpm install --frozen-lockfile && pnpm build
+        working-directory: web-client
 
       - name: Install macOS targets
         if: matrix.platform == 'macos-latest'
@@ -57,7 +65,13 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: ${{ github.ref_name }}
           releaseBody: |
-            See [README](https://github.com/yinnho/model-router#readme) for usage instructions.
+            AginxBrain desktop client. Download the installer for your platform below.
+
+            - **macOS Apple Silicon**: `*_aarch64.dmg`
+            - **macOS Intel**: `*_x64.dmg`
+            - **Windows**: `*_x64-setup.exe` / `*_x64_en-US.msi`
+
+            Usage: open the app, enter your API key from brain.aginx.net, toggle Claude Code/Codex on.
           releaseDraft: false
           prerelease: false
           updaterJsonPreferNew: true
