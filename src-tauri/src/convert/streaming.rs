@@ -201,7 +201,7 @@ pub fn convert_openai_stream_to_anthropic(
                         let has_reasoning = delta.and_then(|d| d.get("reasoning_content")).is_some();
                         let has_content = delta.and_then(|d| d.get("content")).map(|c| !c.is_null()).unwrap_or(false);
                         let has_tool_calls = delta.and_then(|d| d.get("tool_calls")).is_some();
-                        log::info!("[Stream] delta: reasoning={} content={} tools={} finish={:?} blk_idx={} thinking_open={} text_open={}",
+                        log::debug!("[Stream] delta: reasoning={} content={} tools={} finish={:?} blk_idx={} thinking_open={} text_open={}",
                                 has_reasoning, has_content, has_tool_calls, finish_reason,
                                 st.block_index, st.thinking_block_open, st.text_block_open);
 

@@ -1,30 +1,31 @@
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Admin auth
-// ---------------------------------------------------------------------------
+// ─── Admin auth ──────────────────────────────────────────────────────────────
 
+/// Request to create the initial admin account. Only succeeds when no admin exists.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AdminSetupRequest {
     pub username: String,
     pub password: String,
 }
 
+/// Admin login request.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AdminLoginRequest {
     pub username: String,
     pub password: String,
 }
 
+/// Response from the me endpoint.
 #[derive(Debug, Clone, Serialize)]
 pub struct AdminMeResponse {
     pub username: String,
 }
 
-// ---------------------------------------------------------------------------
-// Caller keys
-// ---------------------------------------------------------------------------
+// ─── Caller keys ─────────────────────────────────────────────────────────────
 
+/// A caller API key as stored in the database. The raw token is hashed;
+/// plaintext is only available if created after the 003 migration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallerKey {
     pub id: i64,
@@ -32,11 +33,11 @@ pub struct CallerKey {
     pub note: String,
     pub enabled: bool,
     pub created_at: String,
-    /// Plaintext token, present only for keys created after the
-    /// 003_add_caller_token_plain migration. NULL for legacy keys.
+    /// Plaintext token (nullable for legacy keys before 003 migration).
     pub token: Option<String>,
 }
 
+/// Request to create a new caller API key.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateCallerKeyRequest {
     pub name: String,
@@ -44,6 +45,7 @@ pub struct CreateCallerKeyRequest {
     pub note: String,
 }
 
+/// Response after creating a key; the raw token is shown exactly once.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateCallerKeyResponse {
     pub id: i64,
@@ -51,10 +53,11 @@ pub struct CreateCallerKeyResponse {
     pub note: String,
     pub enabled: bool,
     pub created_at: String,
-    /// The raw token is shown exactly once on creation.
+    /// The raw API key token (shown once at creation).
     pub token: String,
 }
 
+/// Request to update a caller key's name, note, or enabled status.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateCallerKeyRequest {
     pub name: String,
@@ -63,26 +66,9 @@ pub struct UpdateCallerKeyRequest {
     pub enabled: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Usage
-// ---------------------------------------------------------------------------
+// ─── Usage ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
-pub struct UsageLog {
-    pub id: i64,
-    pub caller_key_id: Option<i64>,
-    pub timestamp: String,
-    pub tag: String,
-    pub provider: String,
-    pub model: String,
-    pub modality: String,
-    pub input_tokens: Option<i64>,
-    pub output_tokens: Option<i64>,
-    pub latency_ms: i64,
-    pub status: String,
-    pub error_message: Option<String>,
-}
-
+/// Aggregated usage for one day, grouped by caller key (if any).
 #[derive(Debug, Clone, Serialize)]
 pub struct DailyUsage {
     pub day: String,
@@ -93,6 +79,7 @@ pub struct DailyUsage {
     pub estimated_cost: f64,
 }
 
+/// Aggregated usage for one calendar month.
 #[derive(Debug, Clone, Serialize)]
 pub struct MonthlyUsage {
     pub month: String,
@@ -103,6 +90,7 @@ pub struct MonthlyUsage {
     pub estimated_cost: f64,
 }
 
+/// All-time usage summary grouped by caller key.
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageSummary {
     pub caller_key_id: Option<i64>,
@@ -112,10 +100,9 @@ pub struct UsageSummary {
     pub estimated_cost: f64,
 }
 
-// ---------------------------------------------------------------------------
-// Cost rates
-// ---------------------------------------------------------------------------
+// ─── Cost rates ──────────────────────────────────────────────────────────────
 
+/// A per-provider-per-model cost rate for estimating usage cost.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostRate {
     pub id: i64,
@@ -125,6 +112,7 @@ pub struct CostRate {
     pub output_price_per_1k: f64,
 }
 
+/// Request to create or update a cost rate.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SetCostRateRequest {
     pub provider: String,

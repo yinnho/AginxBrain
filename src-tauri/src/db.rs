@@ -25,7 +25,7 @@ pub async fn init_db() -> Result<SqlitePool> {
     log::info!("[DB] using database {}", path.display());
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        tokio::fs::create_dir_all(parent).await.with_context(|| format!("creating {}", parent.display()))?;
     }
 
     let url = format!("sqlite:{}", path.display());
@@ -338,7 +338,7 @@ pub async fn monthly_usage(
     year: i32,
     month: i32,
 ) -> Result<Vec<MonthlyUsage>> {
-    let start = format!("{:04}-{:02}-01", year, month);
+    let _start = format!("{:04}-{:02}-01", year, month);
     let rows: Vec<(String, Option<i64>, i64, Option<i64>, Option<i64>)> = if let Some(key_id) = caller_key_id {
         sqlx::query_as(
             "SELECT strftime('%Y-%m', timestamp) as month, caller_key_id,
@@ -417,8 +417,8 @@ pub async fn usage_summary(pool: &SqlitePool) -> Result<Vec<UsageSummary>> {
 async fn estimate_cost(
     pool: &SqlitePool,
     caller_key_id: Option<i64>,
-    input_tokens: i64,
-    output_tokens: i64,
+    _input_tokens: i64,
+    _output_tokens: i64,
 ) -> Result<f64> {
     // Cost is computed per-provider/model using cost_rates. Without a specific
     // provider/model per aggregate row we cannot accurately cost it. For now,

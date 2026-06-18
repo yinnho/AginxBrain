@@ -255,6 +255,7 @@ pub async fn delete_cost_rate(
 
 // ─── Usage ──────────────────────────────────────────────────────────────
 
+/// Query parameters for daily usage aggregation.
 #[derive(Deserialize)]
 pub struct DailyUsageQuery {
     pub key_id: Option<i64>,
@@ -273,6 +274,7 @@ pub async fn daily_usage(
     Ok(Json(rows))
 }
 
+/// Query parameters for monthly usage aggregation.
 #[derive(Deserialize)]
 pub struct MonthlyUsageQuery {
     pub key_id: Option<i64>,

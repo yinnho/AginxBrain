@@ -288,8 +288,6 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-const MAX_LOG_ENTRIES: usize = 50;
-
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
@@ -311,27 +309,6 @@ impl AppState {
         })
     }
 }
-/// Holds a shutdown signal for the background axum server thread.
-/// When dropped or notified, the server thread's tokio runtime shuts down.
-pub struct ServerShutdown {
-    notify: Arc<tokio::sync::Notify>,
-}
-
-impl ServerShutdown {
-    pub fn new() -> Self {
-        Self { notify: Arc::new(tokio::sync::Notify::new()) }
-    }
-
-    pub fn notifier(&self) -> Arc<tokio::sync::Notify> {
-        self.notify.clone()
-    }
-
-    pub fn shutdown(&self) {
-        self.notify.notify_one();
-    }
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

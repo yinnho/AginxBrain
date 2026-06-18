@@ -1,4 +1,4 @@
-use crate::config::{AppState, Provider, ProviderFormat, RequestLog, Route};
+use crate::config::{AppState, Provider, ProviderFormat, Route};
 use crate::convert;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -8,6 +8,10 @@ use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+const STREAM_TIMEOUT: u64 = 3600;
+const NON_STREAM_TIMEOUT: u64 = 300;
+const HEALTH_CHECK_TIMEOUT: u64 = 30;
 
 /// Extract tag from Claude model name by keyword matching.
 /// e.g. "claude-opus-4-8" → "opus", "claude-sonnet-4-6" → "sonnet", "claude-haiku-4-5" → "haiku"
@@ -342,12 +346,13 @@ async fn handle_proxy(
             b
         }
         ("anthropic", ProviderFormat::Openai) => {
-            // Anthropic → OpenAI Chat Completions
-            // Strip thinking blocks — DeepSeek doesn't need reasoning_content
+            // Anthropic → OpenAI Chat Completions.
+            // Don't strip_thinking here — anthropic_to_openai_request converts
+            // thinking blocks to reasoning_content which providers like DeepSeek
+            // require to be echoed back when thinking mode is active.
             let mut b = body.clone();
             normalize_roles(&mut b);
             strip_anthropic_specific_fields(&mut b);
-            strip_thinking(&mut b);
             convert::anthropic_to_openai_request(&b, &route.model)
         }
         ("anthropic", ProviderFormat::OpenaiResponses) => {
@@ -428,7 +433,7 @@ async fn handle_proxy(
     // 7. Send
     let resp = match req_builder
         .json(&fwd_body)
-        .timeout(std::time::Duration::from_secs(if is_streaming { 3600 } else { 300 }))
+        .timeout(std::time::Duration::from_secs(if is_streaming { STREAM_TIMEOUT } else { NON_STREAM_TIMEOUT }))
         .send()
         .await
     {
@@ -1559,7 +1564,7 @@ async fn send_image_get(state: &AppState, provider: &Provider, url: &str) -> Res
 async fn parse_image_response(resp: reqwest::Response) -> Result<Value, ProxyError> {
     let status = resp.status();
     let status_code = status.as_u16();
-    let text = resp.text().await.unwrap_or_default();
+    let text = resp.text().await.map_err(|e| ProxyError::Upstream(format!("failed to read image response body: {}", e)))?;
     if !status.is_success() {
         return Err(ProxyError::Upstream(format!("HTTP {}: {}", status_code, &text[..text.len().min(500)])));
     }
@@ -1920,7 +1925,7 @@ pub async fn test_route(
         )
         .header("content-type", "application/json")
         .json(&fwd_body)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(HEALTH_CHECK_TIMEOUT))
         .send()
         .await
     {
@@ -2059,10 +2064,6 @@ fn parse_upstream_json(resp_body: &[u8]) -> Result<Value, ProxyError> {
         .map_err(|e| ProxyError::Upstream(format!("failed to parse upstream response: {}", e)))
 }
 
-
-fn chrono_now() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
-}
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {

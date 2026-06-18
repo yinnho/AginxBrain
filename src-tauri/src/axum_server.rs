@@ -1,5 +1,4 @@
 use crate::config::AppState;
-use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
@@ -19,8 +18,6 @@ use rust_embed::RustEmbed;
 #[derive(RustEmbed)]
 #[folder = "../web/dist/"]
 struct Asset;
-
-pub const CALLER_KEY_ID_EXTENSION: &str = "caller_key_id";
 
 /// Start the axum HTTP server. Returns the actual host:port once bound.
 pub async fn start(state: AppState) -> (String, u16) {

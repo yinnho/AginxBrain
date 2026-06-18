@@ -63,7 +63,8 @@ pub fn run_desktop() {
 
     if let Err(e) = result {
         log::error!("[Tauri] fatal error: {}", e);
-        panic!("error while running tauri application: {}", e);
+        eprintln!("Fatal error: {}", e);
+        std::process::exit(1);
     }
 }
 
@@ -128,9 +129,8 @@ pub fn run_server(port_override: Option<u16>, host_override: Option<String>) {
     rt.block_on(async {
         let mut app_config = load_config().expect("failed to load config");
         if let Some(p) = port_override { app_config.port = p; }
-        // Server mode defaults to 0.0.0.0 unless explicitly overridden
-        if host_override.is_some() {
-            app_config.host = host_override.unwrap();
+        if let Some(h) = host_override {
+            app_config.host = h;
         } else {
             app_config.host = "0.0.0.0".to_string();
         }

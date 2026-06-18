@@ -29,11 +29,15 @@ const ROUTER_OVERRIDE_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_API_KEY",
 ];
 
+/// Result of checking whether a takeover is active.
+#[derive(Debug)]
 pub struct TakeoverStatus {
     pub active: bool,
     pub proxy_url: Option<String>,
 }
 
+/// Write ~/.claude/settings.json so Claude Code routes through the local proxy
+/// at `127.0.0.1:{port}/anthropic`. Returns the proxy URL on success.
 pub fn take_over_claude(port: u16) -> Result<String> {
     let path = claude_settings_path()?;
     let backup = claude_settings_backup_path()?;
@@ -109,6 +113,7 @@ pub fn take_over_claude(port: u16) -> Result<String> {
     Ok(proxy_url)
 }
 
+/// Restore ~/.claude/settings.json from the backup created during takeover.
 pub fn restore_claude() -> Result<()> {
     let path = claude_settings_path()?;
     let backup = claude_settings_backup_path()?;
@@ -121,6 +126,7 @@ pub fn restore_claude() -> Result<()> {
     Ok(())
 }
 
+/// Check whether Claude Code is currently pointing at the local proxy on `port`.
 pub fn check_takeover_status(port: u16) -> TakeoverStatus {
     let path = match claude_settings_path() {
         Ok(p) => p,
@@ -211,6 +217,8 @@ fn codex_auth_backup_path() -> Result<PathBuf> {
     Ok(codex_dir()?.join("auth.json.aginxbrain-backup"))
 }
 
+/// Write ~/.codex/config.toml + auth.json so Codex routes through the local
+/// proxy at `http://127.0.0.1:{port}` using the given model name.
 pub fn take_over_codex(port: u16, default_model: &str) -> Result<String> {
     let config_path = codex_config_path()?;
     let config_backup = codex_config_backup_path()?;
@@ -286,6 +294,7 @@ stream_idle_timeout_ms = 600000
     Ok(proxy_url)
 }
 
+/// Restore Codex config from backup (deletes files created from scratch).
 pub fn restore_codex() -> Result<()> {
     let config_path = codex_config_path()?;
     let config_backup = codex_config_backup_path()?;
@@ -296,14 +305,12 @@ pub fn restore_codex() -> Result<()> {
         std::fs::copy(&config_backup, &config_path)?;
         std::fs::remove_file(&config_backup)?;
     } else if config_path.exists() {
-        // File was created from scratch (no pre-existing backup), delete it
         std::fs::remove_file(&config_path)?;
     }
     if auth_backup.exists() {
         std::fs::copy(&auth_backup, &auth_path)?;
         std::fs::remove_file(&auth_backup)?;
     } else if auth_path.exists() {
-        // File was created from scratch (no pre-existing backup), delete it
         std::fs::remove_file(&auth_path)?;
     }
 
@@ -311,6 +318,7 @@ pub fn restore_codex() -> Result<()> {
     Ok(())
 }
 
+/// Check whether Codex is currently pointing at the local proxy on `port`.
 pub fn check_codex_takeover_status(port: u16) -> TakeoverStatus {
     let config_path = match codex_config_path() {
         Ok(p) => p,
@@ -354,18 +362,21 @@ pub fn check_codex_takeover_status(port: u16) -> TakeoverStatus {
 // Unlike the local-proxy takeover above, these write config files that point
 // Claude Code / Codex directly at a remote AginxBrain server (e.g.
 // https://brain.aginx.net), embedding the caller API key. Used by the desktop
-// client's toggle switches.
+// client's toggle switches. Feature-gated to desktop only.
 
 /// Marker stored alongside the takeover to detect whether the current config
 /// was written by a remote takeover (so status checks don't depend on a port).
+#[cfg(feature = "desktop")]
 const REMOTE_MARKER_PREFIX: &str = "# aginxbrain-remote=";
 
+#[cfg(feature = "desktop")]
 fn remote_marker(server: &str) -> String {
     format!("{}{}", REMOTE_MARKER_PREFIX, server)
 }
 
-/// Write ~/.claude/settings.json so Claude Code routes through `server` using
-/// `api_key`. Returns true on success.
+/// Write ~/.claude/settings.json so Claude Code routes through a remote
+/// AginxBrain server (e.g. https://brain.aginx.net) with the given API key.
+#[cfg(feature = "desktop")]
 pub fn take_over_claude_remote(server: &str, api_key: &str) -> Result<bool> {
     let path = claude_settings_path()?;
     let backup = claude_settings_backup_path()?;
@@ -413,8 +424,9 @@ pub fn take_over_claude_remote(server: &str, api_key: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Check whether ~/.claude/settings.json currently routes through a remote
-/// AginxBrain server (any server), regardless of which one.
+/// Check whether ~/.claude/settings.json is currently pointing at a remote
+/// AginxBrain server (any server, not just localhost).
+#[cfg(feature = "desktop")]
 pub fn check_claude_remote_active() -> bool {
     let path = match claude_settings_path() {
         Ok(p) => p,
@@ -441,8 +453,9 @@ pub fn check_claude_remote_active() -> bool {
     base.starts_with("https://") && base.contains("aginx")
 }
 
-/// Write ~/.codex/config.toml + auth.json so Codex routes through `server`
-/// using `api_key`. Returns true on success.
+/// Write ~/.codex/config.toml + auth.json so Codex routes through a remote
+/// AginxBrain server with the given API key.
+#[cfg(feature = "desktop")]
 pub fn take_over_codex_remote(server: &str, api_key: &str) -> Result<bool> {
     let config_path = codex_config_path()?;
     let config_backup = codex_config_backup_path()?;
@@ -499,6 +512,7 @@ stream_idle_timeout_ms = 600000
 
 /// Check whether ~/.codex/config.toml currently routes through a remote
 /// AginxBrain server.
+#[cfg(feature = "desktop")]
 pub fn check_codex_remote_active() -> bool {
     let config_path = match codex_config_path() {
         Ok(p) => p,
