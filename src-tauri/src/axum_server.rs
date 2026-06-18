@@ -9,12 +9,13 @@ use tower_sessions::cookie::SameSite;
 use tower_sessions::{Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
 
-// Embed frontend files at compile time (release builds only).
-// In dev mode, Vite serves the frontend directly.
-#[cfg(not(debug_assertions))]
+// Embed the admin dashboard frontend at compile time (server release builds
+// only). The desktop client never serves a frontend — it's a thin client that
+// connects to a remote AginxBrain server — so it doesn't need web/dist.
+#[cfg(all(not(debug_assertions), feature = "server"))]
 use rust_embed::RustEmbed;
 
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), feature = "server"))]
 #[derive(RustEmbed)]
 #[folder = "../web/dist/"]
 struct Asset;
@@ -265,7 +266,7 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
             .into_response();
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(all(not(debug_assertions), feature = "server"))]
     {
         let file_path = uri.path().trim_start_matches('/');
         let file_path = if file_path.is_empty() { "index.html" } else { file_path };
@@ -305,39 +306,14 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
             .into_response()
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(not(all(not(debug_assertions), feature = "server")))]
     {
-        let file_path = uri.path().trim_start_matches('/');
-        let file_path = if file_path.is_empty() { "index.html" } else { file_path };
-
-        let disk_path = std::path::PathBuf::from("../web/dist").join(file_path);
-        if disk_path.exists() && disk_path.is_file() {
-            if let Ok(bytes) = tokio::fs::read(&disk_path).await {
-                let ct = mime_guess::from_path(file_path).first_or_octet_stream().to_string();
-                log::info!("[Fallback] GET {} → 200 (disk, {})", uri.path(), ct);
-                return (StatusCode::OK, [("content-type", ct)], bytes).into_response();
-            }
-        }
-
-        let has_extension = std::path::Path::new(file_path).extension().is_some();
-        if !has_extension {
-            let html_path = std::path::PathBuf::from("../web/dist/index.html");
-            if let Ok(bytes) = tokio::fs::read(&html_path).await {
-                log::info!("[Fallback] GET {} → 200 (SPA fallback, disk)", uri.path());
-                return (
-                    StatusCode::OK,
-                    [("content-type", "text/html; charset=utf-8")],
-                    bytes,
-                )
-                    .into_response();
-            }
-        }
-
-        log::warn!("[Fallback] GET {} → 404 (dev, not on disk)", uri.path());
+        // Dev mode (Vite serves frontend) or desktop build (no embedded
+        // frontend — the desktop client connects to a remote server).
         (
             StatusCode::NOT_FOUND,
-            [("content-type", "text/plain")],
-            "Not Found",
+            [("content-type", "application/json")],
+            serde_json::json!({"error": format!("not found: {}", uri.path())}).to_string(),
         )
             .into_response()
     }
