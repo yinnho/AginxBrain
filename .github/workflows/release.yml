@@ -59,8 +59,11 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          # No signing for now — unsigned installers are fine for manual
+          # download; auto-update just won't verify signatures. Set these
+          # secrets later to enable signed auto-updates.
+          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           tagName: ${{ github.ref_name }}
           releaseName: ${{ github.ref_name }}
@@ -74,5 +77,4 @@ jobs:
             Usage: open the app, enter your API key from brain.aginx.net, toggle Claude Code/Codex on.
           releaseDraft: false
           prerelease: false
-          updaterJsonPreferNew: true
           args: ${{ matrix.args }}
