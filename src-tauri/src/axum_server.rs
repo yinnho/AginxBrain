@@ -1,5 +1,5 @@
 use crate::config::AppState;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::response::Response;
@@ -21,6 +21,28 @@ use rust_embed::RustEmbed;
 struct Asset;
 
 /// Start the axum HTTP server. Returns the actual host:port once bound.
+/// Serve a saved TTS audio file from ~/.aginxbrain/audio/. Public (no auth) —
+/// OpenCarrier downloads these URLs with a bare GET. Rejects any filename
+/// containing path separators or `..` to prevent traversal.
+async fn serve_audio_file(Path(filename): Path<String>) -> Response {
+    // Path traversal guard: only allow plain filenames.
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return (StatusCode::NOT_FOUND, [("content-type", "text/plain")], "Not Found".to_string()).into_response();
+    }
+    let path = match dirs::home_dir() {
+        Some(h) => h.join(".aginxbrain").join("audio").join(&filename),
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, [("content-type", "text/plain")], "no home dir".to_string()).into_response(),
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [("content-type", "audio/mpeg")],
+            bytes,
+        ).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, [("content-type", "text/plain")], "Not Found".to_string()).into_response(),
+    }
+}
+
 pub async fn start(state: AppState) -> (String, u16) {
     let port = state.config.read().await.port;
     let host = state.config.read().await.host.clone();
@@ -132,7 +154,14 @@ pub async fn start(state: AppState) -> (String, u16) {
         .merge(client_api_routes)
         .merge(read_api_routes);
 
+    // Public audio file route: serves TTS output. NOT behind caller-key auth —
+    // OpenCarrier downloads these URLs without a token. Registered at root so
+    // it's reachable via brain.aginx.net/audio/<file> through nginx.
+    let audio_routes = axum::Router::new()
+        .route("/audio/{filename}", axum::routing::get(serve_audio_file));
+
     let app = axum::Router::new()
+        .merge(audio_routes)
         .merge(proxy_routes)
         .nest("/api", api_routes)
         .layer(axum::middleware::from_fn(request_log_middleware))

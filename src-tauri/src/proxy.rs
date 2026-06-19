@@ -4,6 +4,8 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
+use base64::Engine as _;
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
@@ -220,6 +222,83 @@ fn is_image_format(format: &ProviderFormat) -> bool {
     )
 }
 
+// ─── Multimodal extraction helpers ─────────────────────────────────────────
+//
+// OpenCarrier sends non-chat capabilities (image/tts/audio) as OpenAI chat
+// requests: the payload is in `messages`. These helpers pull the relevant
+// content out of that chat-shaped body.
+
+/// Extract text from the last user message. Handles both plain-string content
+/// and the content-block array form (`[{"type":"text","text":"..."}, ...]`).
+/// Used for image prompt and TTS text.
+fn last_user_text(body: &Value) -> Option<String> {
+    let messages = body.get("messages").and_then(|m| m.as_array())?;
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let content = msg.get("content")?;
+        if let Some(s) = content.as_str() {
+            if !s.trim().is_empty() {
+                return Some(s.to_string());
+            }
+        }
+        if let Some(arr) = content.as_array() {
+            let mut parts = Vec::new();
+            for block in arr {
+                // content blocks: {"type":"text","text":"..."} or {"text":"..."}
+                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                    if !t.is_empty() {
+                        parts.push(t.to_string());
+                    }
+                }
+            }
+            if !parts.is_empty() {
+                return Some(parts.join(""));
+            }
+        }
+    }
+    None
+}
+
+/// Find an audio content block anywhere in messages and return its decoded
+/// (base64, format). Handles OpenAI chat audio format
+/// `{"type":"input_audio","input_audio":{"data":"<b64>","format":"mp3"}}`
+/// and strips a `data:audio/...;base64,` prefix if present.
+fn find_input_audio(body: &Value) -> Option<(String, String)> {
+    let messages = body.get("messages").and_then(|m| m.as_array())?;
+    for msg in messages {
+        let content = msg.get("content")?;
+        if let Some(arr) = content.as_array() {
+            for block in arr {
+                if block.get("type").and_then(|t| t.as_str()) != Some("input_audio") {
+                    continue;
+                }
+                let audio = block.get("input_audio")?;
+                let raw = audio.get("data").and_then(|d| d.as_str())?;
+                let (data, fmt_from_data) = if let Some((mime, b64)) = raw.split_once(";base64,") {
+                    // data URL form: data:audio/mp3;base64,...
+                    let fmt = mime
+                        .strip_prefix("data:audio/")
+                        .unwrap_or("mp3")
+                        .to_string();
+                    (b64.to_string(), Some(fmt))
+                } else {
+                    (raw.to_string(), None)
+                };
+                let fmt = audio
+                    .get("format")
+                    .and_then(|f| f.as_str())
+                    .map(|s| s.to_string())
+                    .or(fmt_from_data)
+                    .unwrap_or_else(|| "mp3".to_string());
+                return Some((data, fmt));
+            }
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Core proxy logic (protocol-aware)
 // ---------------------------------------------------------------------------
@@ -295,16 +374,6 @@ async fn handle_proxy(
         }
 
         let provider_format = &route.format;
-        if !is_chat_format(provider_format) {
-            let err = ProxyError::Upstream(format!(
-                "route format {:?} (modality={}) is not yet supported by the chat proxy",
-                provider_format, route.modality
-            ));
-            log::warn!("[Proxy] skipping non-chat route: {}", err);
-            last_error = Some(err);
-            continue;
-        }
-
         let provider = match config.providers.get(&route.provider) {
             Some(p) => p,
             None => {
@@ -322,6 +391,50 @@ async fn handle_proxy(
                 route.provider
             )));
             continue;
+        }
+
+        // 4. Non-chat capabilities (image/tts/audio) are dispatched by modality
+        //    and early-return. They MUST NOT fall through to the chat fwd_body /
+        //    streaming conversion below — their bodies are not chat-shaped.
+        if !is_chat_format(provider_format) {
+            match route.modality.as_str() {
+                "image_generation" => {
+                    match handle_image_request(state.clone(), caller_key_id, route, provider, &body, start).await {
+                        Ok(resp) => return Ok(resp),
+                        Err(e) => {
+                            log::warn!("[Proxy] image route failed: {}", e);
+                            if is_retryable(&e) { last_error = Some(e); continue; }
+                            return Err(e);
+                        }
+                    }
+                }
+                "tts" => {
+                    match handle_tts_request(state.clone(), caller_key_id, route, provider, &body, start).await {
+                        Ok(resp) => return Ok(resp),
+                        Err(e) => {
+                            log::warn!("[Proxy] tts route failed: {}", e);
+                            if is_retryable(&e) { last_error = Some(e); continue; }
+                            return Err(e);
+                        }
+                    }
+                }
+                "audio" | "asr" => {
+                    match handle_asr_request(state.clone(), caller_key_id, route, provider, &body, start).await {
+                        Ok(resp) => return Ok(resp),
+                        Err(e) => {
+                            log::warn!("[Proxy] audio route failed: {}", e);
+                            if is_retryable(&e) { last_error = Some(e); continue; }
+                            return Err(e);
+                        }
+                    }
+                }
+                other => {
+                    last_error = Some(ProxyError::Upstream(format!(
+                        "modality '{}' with non-chat format {:?} is not supported", other, provider_format
+                    )));
+                    continue;
+                }
+            }
         }
 
     log::info!(
@@ -1529,6 +1642,242 @@ fn format_string(format: &ProviderFormat) -> String {
     }.to_string()
 }
 
+// ─── Multimodal handlers (dispatched from handle_proxy) ────────────────────
+//
+// OpenCarrier sends image/tts/audio as OpenAI chat requests. These handlers
+// extract the payload, call the provider, and return the OpenCarrier-expected
+// response shape (see AGINXBRAIN_MULTIMODAL_SPEC.md).
+
+/// Image generation: reuse existing per-format drivers, wrap result in
+/// OpenCarrier format A. url-or-data-url per GeneratedImage.
+async fn handle_image_request(
+    state: AppState,
+    caller_key_id: Option<i64>,
+    route: &Route,
+    provider: &Provider,
+    body: &Value,
+    start: std::time::Instant,
+) -> Result<Response, ProxyError> {
+    let prompt = last_user_text(body)
+        .ok_or_else(|| ProxyError::Upstream("image: no text prompt found in messages".into()))?;
+    let size = body.get("size").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let n = body.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+
+    let req = GenerateImageRequest {
+        tag: None,
+        prompt: prompt.clone(),
+        size,
+        n,
+        extra: std::collections::HashMap::new(),
+    };
+
+    let url = format!("{}{}", provider.base_url.trim_end_matches('/'), route.endpoint.as_str());
+    let images: Vec<GeneratedImage> = match &route.format {
+        ProviderFormat::OpenaiImages => generate_openai_images(&state, provider, route, &url, &prompt, &req).await?,
+        ProviderFormat::DashscopeImage => generate_dashscope_image(&state, provider, route, &url, &prompt, &req).await?,
+        ProviderFormat::MinimaxImage => generate_minimax_image(&state, provider, route, &url, &prompt, &req).await?,
+        other => return Err(ProxyError::Upstream(format!("format {:?} is not an image format", other))),
+    };
+
+    if images.is_empty() {
+        return Err(ProxyError::Upstream("image provider returned no images".into()));
+    }
+
+    // Build OpenCarrier format A: output.choices[].message.content[].image
+    let content: Vec<Value> = images.iter().map(|img| {
+        let src = if let Some(url) = &img.url {
+            url.clone()
+        } else if !img.base64.is_empty() {
+            format!("data:image/png;base64,{}", img.base64)
+        } else {
+            String::new()
+        };
+        json!({ "image": src })
+    }).collect();
+
+    let _ = crate::db::insert_usage_log(
+        &state.db,
+        crate::db::UsageInsert {
+            caller_key_id,
+            tag: route.tags.first().cloned().unwrap_or_default(),
+            provider: provider.name.clone(),
+            model: route.model.clone(),
+            request_model: route.model.clone(),
+            modality: "image_generation".into(),
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: start.elapsed().as_millis() as i64,
+            status: "success".into(),
+            error_message: None,
+        },
+    ).await;
+
+    let resp = json!({
+        "output": { "choices": [{ "message": { "content": content } }] },
+        "code": "Success"
+    });
+    Ok(Json(resp).into_response())
+}
+
+/// TTS: call DashScope text-to-speech, save audio bytes to disk, return a
+/// relative URL that OpenCarrier downloads via the public /audio/ route.
+async fn handle_tts_request(
+    state: AppState,
+    caller_key_id: Option<i64>,
+    route: &Route,
+    provider: &Provider,
+    body: &Value,
+    start: std::time::Instant,
+) -> Result<Response, ProxyError> {
+    let text = last_user_text(body)
+        .ok_or_else(|| ProxyError::Upstream("tts: no text found in messages".into()))?;
+    let voice = body.get("voice").and_then(|v| v.as_str()).unwrap_or("Cherry").to_string();
+
+    let url = format!("{}{}", provider.base_url.trim_end_matches('/'), route.endpoint.as_str());
+    let req_body = json!({
+        "model": route.model,
+        "input": { "text": text, "voice": voice }
+    });
+
+    let resp = state.http_client.post(&url)
+        .header("content-type", "application/json")
+        .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key))
+        .json(&req_body)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("tts request failed: {}", e)))?;
+
+    let status = resp.status();
+    // DashScope TTS returns audio bytes directly when successful.
+    if !status.is_success() {
+        let txt = resp.text().await.unwrap_or_default();
+        return Err(ProxyError::Upstream(format!("tts upstream HTTP {}: {}", status.as_u16(), &txt[..txt.len().min(500)])));
+    }
+    let audio_bytes = resp.bytes().await
+        .map_err(|e| ProxyError::Upstream(format!("tts: failed to read audio body: {}", e)))?;
+
+    // Save to ~/.aginxbrain/audio/{id}.mp3
+    let audio_dir = match dirs::home_dir() {
+        Some(h) => h.join(".aginxbrain").join("audio"),
+        None => return Err(ProxyError::Upstream("no home directory for audio storage".into())),
+    };
+    let _ = tokio::fs::create_dir_all(&audio_dir).await;
+    // Unique filename: timestamp (ms) + random suffix. std::time is fine here
+    // (this is a normal handler, not a workflow script).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let rand_suffix: u64 = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        caller_key_id.hash(&mut h);
+        text.hash(&mut h);
+        now_ms.hash(&mut h);
+        h.finish()
+    };
+    let filename = format!("{}_{}.mp3", now_ms, rand_suffix);
+    let file_path = audio_dir.join(&filename);
+    if let Err(e) = tokio::fs::write(&file_path, &audio_bytes).await {
+        return Err(ProxyError::Upstream(format!("tts: failed to save audio: {}", e)));
+    }
+
+    let _ = crate::db::insert_usage_log(
+        &state.db,
+        crate::db::UsageInsert {
+            caller_key_id,
+            tag: route.tags.first().cloned().unwrap_or_default(),
+            provider: provider.name.clone(),
+            model: route.model.clone(),
+            request_model: route.model.clone(),
+            modality: "tts".into(),
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: start.elapsed().as_millis() as i64,
+            status: "success".into(),
+            error_message: None,
+        },
+    ).await;
+
+    let resp_json = json!({
+        "output": { "audio": format!("/audio/{}", filename) },
+        "code": "Success"
+    });
+    Ok(Json(resp_json).into_response())
+}
+
+/// ASR (audio → text): decode base64 audio from the chat body, send it as
+/// multipart to a Whisper endpoint, wrap the transcription in an OpenAI chat
+/// response.
+async fn handle_asr_request(
+    state: AppState,
+    caller_key_id: Option<i64>,
+    route: &Route,
+    provider: &Provider,
+    body: &Value,
+    start: std::time::Instant,
+) -> Result<Response, ProxyError> {
+    let (b64, format) = find_input_audio(body)
+        .ok_or_else(|| ProxyError::Upstream("audio: no input_audio block found in messages".into()))?;
+    let audio_bytes = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes())
+        .map_err(|e| ProxyError::Upstream(format!("audio: invalid base64: {}", e)))?;
+
+    let url = format!("{}{}", provider.base_url.trim_end_matches('/'), route.endpoint.as_str());
+
+    // Whisper expects multipart/form-data: a "file" part + a "model" part.
+    let part = reqwest::multipart::Part::bytes(audio_bytes)
+        .file_name(format!("audio.{}", format))
+        .mime_str("audio/mpeg")
+        .map_err(|e| ProxyError::Upstream(format!("audio: multipart mime: {}", e)))?;
+    let form = reqwest::multipart::Form::new()
+        .text("model", route.model.clone())
+        .part("file", part);
+
+    let resp = state.http_client.post(&url)
+        .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key))
+        .multipart(form)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("asr request failed: {}", e)))?;
+
+    let status = resp.status();
+    let resp_json: Value = resp.json().await
+        .map_err(|e| ProxyError::Upstream(format!("asr: failed to parse response: {}", e)))?;
+    if !status.is_success() {
+        return Err(ProxyError::Upstream(format!("asr upstream HTTP {}: {}", status.as_u16(), resp_json)));
+    }
+    let transcription = resp_json.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+
+    let _ = crate::db::insert_usage_log(
+        &state.db,
+        crate::db::UsageInsert {
+            caller_key_id,
+            tag: route.tags.first().cloned().unwrap_or_default(),
+            provider: provider.name.clone(),
+            model: route.model.clone(),
+            request_model: route.model.clone(),
+            modality: "audio".into(),
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: start.elapsed().as_millis() as i64,
+            status: "success".into(),
+            error_message: None,
+        },
+    ).await;
+
+    // Wrap as a standard OpenAI chat response.
+    let chat_resp = json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": transcription },
+            "finish_reason": "stop"
+        }]
+    });
+    Ok(Json(chat_resp).into_response())
+}
+
 async fn send_image_post(
     state: &AppState,
     provider: &Provider,
@@ -2082,6 +2431,83 @@ impl IntoResponse for ProxyError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_last_user_text_string_content() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "describe a cat"}
+            ]
+        });
+        assert_eq!(last_user_text(&body).as_deref(), Some("describe a cat"));
+    }
+
+    #[test]
+    fn test_last_user_text_block_array_content() {
+        // OpenCarrier image/vision form: content is an array of blocks.
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "a cat on the moon"}]}
+            ]
+        });
+        assert_eq!(last_user_text(&body).as_deref(), Some("a cat on the moon"));
+    }
+
+    #[test]
+    fn test_last_user_text_joins_multiple_blocks() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": [{"text": "hello "}, {"text": "world"}]}
+            ]
+        });
+        assert_eq!(last_user_text(&body).as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn test_last_user_text_skips_assistant() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer"}
+            ]
+        });
+        // last user message is "question"
+        assert_eq!(last_user_text(&body).as_deref(), Some("question"));
+    }
+
+    #[test]
+    fn test_find_input_audio_plain_b64() {
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": {"data": "AAAA", "format": "mp3"}
+                }]
+            }]
+        });
+        let (data, fmt) = find_input_audio(&body).expect("audio not found");
+        assert_eq!(data, "AAAA");
+        assert_eq!(fmt, "mp3");
+    }
+
+    #[test]
+    fn test_find_input_audio_data_url_prefix() {
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": {"data": "data:audio/wav;base64,UklGRg=="}
+                }]
+            }]
+        });
+        let (data, fmt) = find_input_audio(&body).expect("audio not found");
+        assert_eq!(data, "UklGRg==");
+        assert_eq!(fmt, "wav");
+    }
 
     #[test]
     fn test_normalize_roles_converts_system_to_user() {

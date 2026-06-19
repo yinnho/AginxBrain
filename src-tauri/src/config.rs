@@ -194,6 +194,12 @@ fn default_tags() -> Vec<Tag> {
         // the "gpt-5.5" tag, and the route below routes it to DeepSeek.
         Tag { name: "gpt-5.5".into(), color: "#10B981".into(), is_auto: false },
         Tag { name: "codex".into(), color: "#6366F1".into(), is_auto: false },
+        // Multimodal tags: OpenCarrier sends model="<tag>" for non-chat
+        // capabilities (POST /v1/chat/completions), routed by modality.
+        Tag { name: "image".into(), color: "#10B981".into(), is_auto: false },
+        Tag { name: "tts".into(), color: "#F59E0B".into(), is_auto: false },
+        Tag { name: "vision".into(), color: "#EC4899".into(), is_auto: false },
+        Tag { name: "audio".into(), color: "#06B6D4".into(), is_auto: false },
     ]
 }
 
@@ -322,7 +328,7 @@ mod tests {
         assert!(!cfg.providers.is_empty());
         assert!(!cfg.routes.is_empty());
         assert!(!cfg.tags.is_empty());
-        assert_eq!(cfg.tags.len(), 6); // opus, sonnet, haiku, auto, gpt-5.5, codex
+        assert_eq!(cfg.tags.len(), 10); // opus, sonnet, haiku, auto, gpt-5.5, codex, image, tts, vision, audio
     }
 
     #[test]

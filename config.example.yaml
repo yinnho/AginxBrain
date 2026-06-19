@@ -32,10 +32,22 @@ providers:
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     api_key: your-dashscope-key
     auth_type: bearer
+  # DashScope native endpoints (image/TTS) — the compatible-mode base_url
+  # above is for chat; image/TTS use the raw /api/v1/services/... paths.
+  dashscope_media:
+    name: DashScope Media
+    base_url: https://dashscope.aliyuncs.com
+    api_key: your-dashscope-key
+    auth_type: bearer
   minimax:
     name: MiniMax
     base_url: https://api.minimaxi.com/anthropic
     api_key: your-minimax-key
+    auth_type: bearer
+  groq:
+    name: Groq (Whisper ASR)
+    base_url: https://api.groq.com/openai
+    api_key: your-groq-key
     auth_type: bearer
 
 routes:
@@ -85,27 +97,37 @@ routes:
     format: openai
     modality: chat
 
-  # Future media routes (configuration-only in this phase; driver support comes later):
-  # - endpoint: /api/v1/services/aigc/text2image/image-synthesis
-  #   model: wanx2.1-t2i-plus
-  #   provider: dashscope
-  #   tags: [image]
-  #   format: dashscope_image
-  #   modality: image_generation
-  #
-  # - endpoint: /v1/videos/text2video
-  #   model: kling-v1-6
-  #   provider: kling
-  #   tags: [video]
-  #   format: kling
-  #   modality: video_generation
-  #
-  # - endpoint: /api/v1/services/aigc/text-to-speech/stream
-  #   model: cosyvoice-v1
-  #   provider: dashscope
-  #   tags: [tts]
-  #   format: dashscope_tts
-  #   modality: tts
+  # ─── Multimodal routes ────────────────────────────────────────────────
+  # OpenCarrier sends model="<tag>" to POST /v1/chat/completions; aginxbrain
+  # dispatches by modality (see AGINXBRAIN_MULTIMODAL_SPEC.md). Real API keys
+  # go in config.yaml (config.example.yaml is just a template).
+  - endpoint: /api/v1/services/aigc/text2image/image-synthesis
+    model: wan2.7-image
+    provider: dashscope_media
+    tags: [image]
+    format: dashscope_image
+    modality: image_generation
+
+  - endpoint: /api/v1/services/aigc/text-to-speech/stream
+    model: cosyvoice-v1
+    provider: dashscope_media
+    tags: [tts]
+    format: dashscope_tts
+    modality: tts
+
+  - endpoint: /v1/chat/completions
+    model: qwen-vision-max
+    provider: dashscope
+    tags: [vision]
+    format: openai
+    modality: vision
+
+  - endpoint: /v1/audio/transcriptions
+    model: whisper-large-v3-turbo
+    provider: groq
+    tags: [audio]
+    format: openai
+    modality: audio
 
 tags:
   - name: opus
@@ -127,6 +149,19 @@ tags:
 
   - name: codex
     color: "#6366F1"
+
+  # Multimodal tags — model="<tag>" routes to the corresponding capability.
+  - name: image
+    color: "#10B981"
+
+  - name: tts
+    color: "#F59E0B"
+
+  - name: vision
+    color: "#EC4899"
+
+  - name: audio
+    color: "#06B6D4"
 
 current_tag: auto
 management_key: aginxbrain-local
