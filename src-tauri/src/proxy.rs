@@ -547,6 +547,21 @@ async fn handle_proxy(
         inject_openai_reasoning_content(&mut fwd_body);
     }
 
+    // 4c. For Anthropic format, if the route's tag suggests reasoning/thinking
+    //     is needed (e.g. "reasoning" tag) and the request doesn't already have
+    //     a thinking config, inject one. This ensures providers like Zhipu GLM
+    //     activate thinking mode even when the client uses OpenAI Chat format
+    //     (which has no thinking field).
+    if matches!(provider_format, ProviderFormat::Anthropic) {
+        let needs_thinking = route.tags.iter().any(|t| t == "reasoning")
+            || tag == "reasoning";
+        if needs_thinking && fwd_body.get("thinking").is_none() {
+            if let Some(obj) = fwd_body.as_object_mut() {
+                obj.insert("thinking".to_string(), json!({"type": "enabled", "budget_tokens": 10000}));
+            }
+        }
+    }
+
     // 5. Build URL
     let url = format!(
         "{}{}",
