@@ -487,6 +487,10 @@ async fn handle_proxy(
             let mut b = body.clone();
             normalize_roles(&mut b);
             strip_anthropic_specific_fields(&mut b);
+            // Remove the top-level thinking config — OpenAI providers don't
+            // understand it, but keep the thinking blocks in messages for
+            // conversion to reasoning_content.
+            if let Some(obj) = b.as_object_mut() { obj.remove("thinking"); }
             convert::anthropic_to_openai_request(&b, &route.model)
         }
         ("anthropic", ProviderFormat::OpenaiResponses) => {
@@ -495,6 +499,7 @@ async fn handle_proxy(
             normalize_roles(&mut b);
             strip_anthropic_specific_fields(&mut b);
             strip_thinking(&mut b);
+            if let Some(obj) = b.as_object_mut() { obj.remove("thinking"); }
             convert::anthropic_to_responses_request(&b, &route.model)
         }
         ("openai", ProviderFormat::Openai) => {
@@ -1503,14 +1508,16 @@ fn inject_openai_reasoning_content(value: &mut Value) {
 /// These fields are meaningful only to the real Anthropic API; leaving them in
 /// the forwarded body can cause providers to return errors or unexpectedly
 /// large responses, which makes Claude Code retry with an ever-growing context.
+///
+/// Note: `thinking` is NOT stripped here — Anthropic-compatible providers like
+/// Zhipu GLM and Kimi support it and require it for thinking mode. It is
+/// removed in the conversion functions for non-Anthropic formats (OpenAI Chat,
+/// Responses) where providers don't understand it.
 fn strip_anthropic_specific_fields(value: &mut Value) {
     if let Some(obj) = value.as_object_mut() {
         obj.remove("context_management");
         obj.remove("metadata");
         obj.remove("tool_choice");
-        // Providers handle their own thinking policy; sending Anthropic's
-        // thinking config can break non-Anthropic endpoints.
-        obj.remove("thinking");
         // beta/extended fields are provider-specific
         obj.remove("anthropic_beta");
         obj.remove("anthropic_version");
