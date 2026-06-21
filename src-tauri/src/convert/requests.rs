@@ -308,6 +308,12 @@ pub fn openai_to_anthropic_request(body: &Value, target_model: &str) -> Value {
                 }
                 "assistant" => {
                     let mut blocks: Vec<Value> = Vec::new();
+                    // reasoning_content → thinking block (must come first)
+                    if let Some(rc) = msg.get("reasoning_content").and_then(|v| v.as_str()) {
+                        if !rc.is_empty() {
+                            blocks.push(serde_json::json!({"type": "thinking", "thinking": rc}));
+                        }
+                    }
                     // Text content
                     if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                         if !content.is_empty() {
@@ -710,6 +716,16 @@ pub fn openai_to_responses_request(body: &Value, target_model: &str) -> Value {
                     }
                 }
                 "assistant" => {
+                    // reasoning_content → reasoning item (must precede the message)
+                    if let Some(rc) = msg.get("reasoning_content").and_then(|v| v.as_str()) {
+                        if !rc.is_empty() {
+                            input.push(json!({
+                                "type": "reasoning",
+                                "summary": [{"type": "summary_text", "text": rc}]
+                            }));
+                        }
+                    }
+
                     let mut text_parts: Vec<Value> = Vec::new();
                     let mut tool_calls: Vec<Value> = Vec::new();
 

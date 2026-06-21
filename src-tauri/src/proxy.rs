@@ -160,26 +160,46 @@ async fn parse_body(body: Body) -> Result<Value, ProxyError> {
 // ---------------------------------------------------------------------------
 
 /// Find all candidate routes for a tag in priority order (array index).
-/// Filters out disabled routes. Three-tier fallback:
-/// 1. Exact tag match → all matching enabled routes
-/// 2. Routes tagged "auto"
-/// 3. All enabled routes as last resort
-fn find_candidate_routes<'a>(routes: &'a [Route], tag: &str) -> Vec<&'a Route> {
+/// Infer the expected modality from a tag name. If any enabled route carries
+/// this tag, use its modality. Otherwise fall back to a convention mapping
+/// (image → image_generation, tts → tts, audio → audio, vision → vision,
+/// everything else → chat). This prevents cross-modality fallback: a chat
+/// request must never fall back to an image route, and vice versa.
+fn infer_modality_from_tag(tag: &str, routes: &[Route]) -> String {
+    if let Some(route) = routes.iter().find(|r| r.enabled && r.tags.iter().any(|t| t == tag)) {
+        return route.modality.clone();
+    }
+    match tag {
+        "image" => "image_generation".to_string(),
+        "tts" => "tts".to_string(),
+        "vision" => "vision".to_string(),
+        "audio" | "asr" => "audio".to_string(),
+        _ => "chat".to_string(),
+    }
+}
+
+/// Filters out disabled routes. Three-tier fallback, scoped to the expected
+/// modality so that chat requests never fall back to image/TTS routes (and
+/// vice versa):
+/// 1. Exact tag match + modality → all matching enabled routes
+/// 2. Routes tagged "auto" + modality
+/// 3. All enabled routes with matching modality as last resort
+fn find_candidate_routes<'a>(routes: &'a [Route], tag: &str, expected_modality: &str) -> Vec<&'a Route> {
     let exact: Vec<&Route> = routes
         .iter()
-        .filter(|r| r.enabled && r.tags.iter().any(|t| t == tag))
+        .filter(|r| r.enabled && r.tags.iter().any(|t| t == tag) && r.modality == expected_modality)
         .collect();
     if !exact.is_empty() {
         return exact;
     }
     let auto: Vec<&Route> = routes
         .iter()
-        .filter(|r| r.enabled && r.tags.iter().any(|t| t == "auto"))
+        .filter(|r| r.enabled && r.tags.iter().any(|t| t == "auto") && r.modality == expected_modality)
         .collect();
     if !auto.is_empty() {
         return auto;
     }
-    routes.iter().filter(|r| r.enabled).collect()
+    routes.iter().filter(|r| r.enabled && r.modality == expected_modality).collect()
 }
 
 /// Whether a proxy error is retryable (connection-level failure or upstream 5xx).
@@ -342,8 +362,9 @@ async fn handle_proxy(
     let tag = resolve_tag_from_model(&request_model, &config.tags)
         .unwrap_or_else(|| config.current_tag.clone());
 
-    // 2. Find candidate routes for failover (array order = priority)
-    let candidates = find_candidate_routes(&config.routes, &tag);
+    // 2. Infer modality from tag + routes, then find candidates scoped to that modality
+    let expected_modality = infer_modality_from_tag(&tag, &config.routes);
+    let candidates = find_candidate_routes(&config.routes, &tag, &expected_modality);
     if candidates.is_empty() {
         let _ = crate::db::insert_usage_log(
             &state.db,
@@ -353,7 +374,7 @@ async fn handle_proxy(
                 provider: "".into(),
                 model: "".into(),
                 request_model: request_model.clone(),
-                modality: "chat".into(),
+                modality: expected_modality.clone(),
                 input_tokens: None,
                 output_tokens: None,
                 latency_ms: start.elapsed().as_millis() as i64,
@@ -446,7 +467,7 @@ async fn handle_proxy(
     );
 
     // 4. Build forwarded request body based on protocol conversion
-    let fwd_body = match (client_protocol, provider_format) {
+    let mut fwd_body = match (client_protocol, provider_format) {
         ("anthropic", ProviderFormat::Anthropic) => {
             // Anthropic → Anthropic: passthrough with fixes
             // Note: don't strip_thinking here — Anthropic-compatible providers
@@ -512,6 +533,14 @@ async fn handle_proxy(
             b
         }
     };
+
+    // 4b. For OpenAI Chat format, ensure reasoning_content is present on all
+    //     assistant messages when thinking mode is active. Clients like
+    //     OpenCarrier don't echo reasoning_content back, but providers like
+    //     DeepSeek require it and return 400 if it's missing.
+    if matches!(provider_format, ProviderFormat::Openai) {
+        inject_openai_reasoning_content(&mut fwd_body);
+    }
 
     // 5. Build URL
     let url = format!(
@@ -964,7 +993,7 @@ async fn handle_count_tokens(
     let tag = resolve_tag_from_model(&request_model, &config.tags)
         .unwrap_or_else(|| config.current_tag.clone());
 
-    let candidates = find_candidate_routes(&config.routes, &tag);
+    let candidates = find_candidate_routes(&config.routes, &tag, "chat");
     if candidates.is_empty() {
         let _ = crate::db::insert_usage_log(
             &state.db,
@@ -1422,6 +1451,54 @@ fn inject_reasoning_content(value: &mut Value) {
     }
 }
 
+/// Inject placeholder `reasoning_content` into OpenAI Chat assistant messages
+/// when thinking mode is active. Providers like DeepSeek require
+/// `reasoning_content` on all assistant messages when thinking mode is enabled
+/// — if the client doesn't echo it back (because its runtime treats it as a
+/// transparent extension), the provider returns 400.
+///
+/// Detection heuristic:
+/// - Any assistant message already has `reasoning_content` → thinking was
+///   active in a prior turn, so it's still active now.
+/// - The request has `enable_thinking: true` (DeepSeek's thinking switch).
+fn inject_openai_reasoning_content(value: &mut Value) {
+    // Detect thinking mode in two steps to satisfy the borrow checker:
+    // 1. Check enable_thinking flag (immutable borrow)
+    // 2. Check messages for existing reasoning_content (immutable borrow)
+    // 3. Mutate messages (mutable borrow)
+    let enable_thinking = value.get("enable_thinking").and_then(|v| v.as_bool()) == Some(true);
+    let has_reasoning_in_messages = value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter().any(|msg| {
+                msg.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                    && msg.get("reasoning_content").is_some()
+            })
+        })
+        .unwrap_or(false);
+
+    if !enable_thinking && !has_reasoning_in_messages {
+        return;
+    }
+
+    let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        if msg.get("reasoning_content").is_some() {
+            continue;
+        }
+        // Inject placeholder reasoning_content so the provider doesn't reject
+        // the request for missing it on a prior-turn assistant message.
+        msg["reasoning_content"] = Value::String(" ".to_string());
+    }
+}
+
 /// Strip Anthropic-specific fields that domestic providers do not understand.
 /// These fields are meaningful only to the real Anthropic API; leaving them in
 /// the forwarded body can cause providers to return errors or unexpectedly
@@ -1518,9 +1595,9 @@ pub async fn generate_image(state: &AppState, req: GenerateImageRequest) -> Gene
     let (tag, candidates, providers) = {
         let config = state.config.read().await;
         let tag = req.tag.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| config.current_tag.clone());
-        let candidates: Vec<Route> = find_candidate_routes(&config.routes, &tag)
+        let candidates: Vec<Route> = find_candidate_routes(&config.routes, &tag, "image_generation")
             .into_iter()
-            .filter(|r| r.modality == "image_generation" && is_image_format(&r.format))
+            .filter(|r| is_image_format(&r.format))
             .cloned()
             .collect();
         (tag, candidates, config.providers.clone())
@@ -2138,8 +2215,9 @@ pub async fn test_route(
 ) -> TestResult {
     let config = state.config.read().await;
 
-    // Find candidate routes (same logic as proxy: enabled, priority order)
-    let candidates = find_candidate_routes(&config.routes, tag);
+    // Find candidate routes (same logic as proxy: enabled, priority order, modality-scoped)
+    let expected_modality = infer_modality_from_tag(tag, &config.routes);
+    let candidates = find_candidate_routes(&config.routes, tag, &expected_modality);
     if candidates.is_empty() {
         return TestResult {
             success: false,
@@ -2685,5 +2763,48 @@ mod tests {
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["thinking"], "real reasoning");
+    }
+
+    #[test]
+    fn test_inject_openai_reasoning_content_from_enable_thinking() {
+        let mut body = json!({
+            "enable_thinking": true,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"}
+            ]
+        });
+        inject_openai_reasoning_content(&mut body);
+        assert_eq!(body["messages"][1]["reasoning_content"], " ");
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn test_inject_openai_reasoning_content_from_prior_reasoning() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "thinking...", "reasoning_content": "I thought about it"},
+                {"role": "user", "content": "follow up"},
+                {"role": "assistant", "content": "response"}
+            ]
+        });
+        inject_openai_reasoning_content(&mut body);
+        // First assistant already has reasoning_content — untouched
+        assert_eq!(body["messages"][1]["reasoning_content"], "I thought about it");
+        // Second assistant gets placeholder injected
+        assert_eq!(body["messages"][3]["reasoning_content"], " ");
+    }
+
+    #[test]
+    fn test_inject_openai_reasoning_content_noop_when_not_thinking() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"}
+            ]
+        });
+        inject_openai_reasoning_content(&mut body);
+        assert!(body["messages"][1].get("reasoning_content").is_none());
     }
 }
