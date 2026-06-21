@@ -238,6 +238,7 @@ fn is_image_format(format: &ProviderFormat) -> bool {
         format,
         ProviderFormat::OpenaiImages
             | ProviderFormat::DashscopeImage
+            | ProviderFormat::DashscopeChatImage
             | ProviderFormat::MinimaxImage
     )
 }
@@ -1652,6 +1653,7 @@ pub async fn generate_image(state: &AppState, req: GenerateImageRequest) -> Gene
         let result = match route.format {
             ProviderFormat::OpenaiImages => generate_openai_images(state, provider, route, &url, &prompt, &req).await,
             ProviderFormat::DashscopeImage => generate_dashscope_image(state, provider, route, &url, &prompt, &req).await,
+            ProviderFormat::DashscopeChatImage => generate_dashscope_chat_image(state, provider, route, &url, &prompt, &req).await,
             ProviderFormat::MinimaxImage => generate_minimax_image(state, provider, route, &url, &prompt, &req).await,
             _ => Err(ProxyError::Upstream(format!("format {:?} is not an image generation format", route.format))),
         };
@@ -1734,6 +1736,7 @@ fn format_string(format: &ProviderFormat) -> String {
         ProviderFormat::OpenaiResponses => "openai_responses",
         ProviderFormat::OpenaiImages => "openai_images",
         ProviderFormat::DashscopeImage => "dashscope_image",
+        ProviderFormat::DashscopeChatImage => "dashscope_chat_image",
         ProviderFormat::DashscopeVideo => "dashscope_video",
         ProviderFormat::DashscopeTts => "dashscope_tts",
         ProviderFormat::Kling => "kling",
@@ -1774,6 +1777,7 @@ async fn handle_image_request(
     let images: Vec<GeneratedImage> = match &route.format {
         ProviderFormat::OpenaiImages => generate_openai_images(&state, provider, route, &url, &prompt, &req).await?,
         ProviderFormat::DashscopeImage => generate_dashscope_image(&state, provider, route, &url, &prompt, &req).await?,
+        ProviderFormat::DashscopeChatImage => generate_dashscope_chat_image(&state, provider, route, &url, &prompt, &req).await?,
         ProviderFormat::MinimaxImage => generate_minimax_image(&state, provider, route, &url, &prompt, &req).await?,
         other => return Err(ProxyError::Upstream(format!("format {:?} is not an image format", other))),
     };
@@ -2126,6 +2130,70 @@ async fn poll_dashscope_image_task(
             _ => continue,
         }
     }
+}
+
+/// Generate image via DashScope's OpenAI-compatible chat completions endpoint
+/// (e.g. token-plan.cn-beijing.maas.aliyuncs.com). These providers serve
+/// image models like wan2.7-image-pro via POST /v1/chat/completions, where
+/// the response contains `output.choices[].message.content[].image` URLs
+/// instead of the standard OpenAI images format.
+async fn generate_dashscope_chat_image(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    url: &str,
+    prompt: &str,
+    req: &GenerateImageRequest,
+) -> Result<Vec<GeneratedImage>, ProxyError> {
+    let mut body = json!({
+        "model": route.model,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+    });
+    if let Some(size) = &req.size {
+        body["size"] = Value::String(size.clone());
+    }
+    if req.n > 1 {
+        body["n"] = json!(req.n);
+    }
+    let result = send_image_post(state, provider, url, &body, &[]).await?;
+
+    // Parse response: output.choices[].message.content[].image
+    let mut images = Vec::new();
+    if let Some(choices) = result.pointer("/output/choices").and_then(|c| c.as_array()) {
+        for choice in choices {
+            if let Some(content) = choice.pointer("/message/content").and_then(|c| c.as_array()) {
+                for block in content {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("image") {
+                        if let Some(url) = block.get("image").and_then(|u| u.as_str()) {
+                            images.push(GeneratedImage { url: Some(url.to_string()), base64: String::new() });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: try standard OpenAI choices[] format (some endpoints may wrap differently)
+    if images.is_empty() {
+        if let Some(choices) = result.get("choices").and_then(|c| c.as_array()) {
+            for choice in choices {
+                if let Some(content) = choice.pointer("/message/content").and_then(|c| c.as_array()) {
+                    for block in content {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("image") {
+                            if let Some(url) = block.get("image").and_then(|u| u.as_str()) {
+                                images.push(GeneratedImage { url: Some(url.to_string()), base64: String::new() });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if images.is_empty() {
+        return Err(ProxyError::Upstream("No images in DashScope chat-image response".to_string()));
+    }
+    Ok(images)
 }
 
 async fn generate_minimax_image(

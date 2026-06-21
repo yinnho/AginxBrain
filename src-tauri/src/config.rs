@@ -96,6 +96,8 @@ pub enum ProviderFormat {
     DashscopeVideo,
     #[serde(rename = "dashscope_tts")]
     DashscopeTts,
+    #[serde(rename = "dashscope_chat_image")]
+    DashscopeChatImage,
     Kling,
     #[serde(rename = "minimax_image")]
     MinimaxImage,
@@ -358,6 +360,10 @@ mod tests {
         let yaml = "dashscope_image";
         let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(fmt, ProviderFormat::DashscopeImage);
+
+        let yaml = "dashscope_chat_image";
+        let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fmt, ProviderFormat::DashscopeChatImage);
 
         let yaml = "dashscope_video";
         let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
