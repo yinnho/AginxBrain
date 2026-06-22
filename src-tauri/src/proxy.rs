@@ -205,25 +205,9 @@ fn find_candidate_routes<'a>(routes: &'a [Route], tag: &str, expected_modality: 
 /// Whether a proxy error is retryable (connection-level failure or upstream 5xx).
 /// Non-retryable errors (NoRoute, NoProvider, 4xx responses) are returned immediately.
 fn is_retryable(err: &ProxyError) -> bool {
-    match err {
-        ProxyError::Upstream(msg) => {
-            let lower = msg.to_lowercase();
-            lower.contains("connection")
-                || lower.contains("timeout")
-                || lower.contains("dns")
-                || lower.contains("tls")
-                || lower.contains("reset")
-                || lower.contains("eof")
-                || lower.contains("broken pipe")
-                || lower.contains("refused")
-                || lower.contains("unreachable")
-                || lower.contains("http 500")
-                || lower.contains("http 502")
-                || lower.contains("http 503")
-                || lower.contains("http 504")
-        }
-        ProxyError::NoRoute(_) | ProxyError::NoProvider(_) => false,
-    }
+    // Any upstream error is retryable — try the next route in the failover chain.
+    // Only config-level errors (no route, unknown provider) are non-retryable.
+    matches!(err, ProxyError::Upstream(_))
 }
 
 fn is_chat_format(format: &ProviderFormat) -> bool {
@@ -967,8 +951,8 @@ async fn handle_proxy(
     }
     } // end of for loop over candidates
 
-    // All candidates failed — log the error before returning.
-    let error_message = last_error.as_ref().map(|e| e.to_string());
+    // All candidates failed — return a clean, user-friendly error instead of
+    // leaking the raw upstream provider error to the user.
     let _ = crate::db::insert_usage_log(
         &state.db,
         crate::db::UsageInsert {
@@ -982,12 +966,12 @@ async fn handle_proxy(
             output_tokens: None,
             latency_ms: start.elapsed().as_millis() as i64,
             status: "error".into(),
-            error_message,
+            error_message: last_error.as_ref().map(|e| e.to_string()),
         },
     )
     .await;
 
-    Err(last_error.unwrap_or_else(|| ProxyError::NoRoute(tag.clone())))
+    Err(ProxyError::Upstream("all providers unavailable, please try again later".into()))
 }
 
 // ---------------------------------------------------------------------------
