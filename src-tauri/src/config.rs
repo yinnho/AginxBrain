@@ -54,6 +54,11 @@ pub struct Provider {
     pub api_key: String,
     #[serde(default = "default_auth_type")]
     pub auth_type: AuthType,
+    /// Optional WebSocket endpoint URL. Used by dashscope_tts and dashscope_asr
+    /// formats that require WebSocket instead of HTTP. Defaults to
+    /// wss://dashscope.aliyuncs.com/api-ws/v1/inference if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -96,6 +101,8 @@ pub enum ProviderFormat {
     DashscopeVideo,
     #[serde(rename = "dashscope_tts")]
     DashscopeTts,
+    #[serde(rename = "dashscope_asr")]
+    DashscopeAsr,
     #[serde(rename = "dashscope_chat_image")]
     DashscopeChatImage,
     Kling,
@@ -162,13 +169,13 @@ fn default_auth_type() -> AuthType {
 fn default_providers() -> HashMap<String, Provider> {
     let mut m = HashMap::new();
     let key = "your-key-here".to_string();
-    m.insert("deepseek".into(), Provider { name: "DeepSeek".into(), base_url: "https://api.deepseek.com".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("deepseek_anthropic".into(), Provider { name: "DeepSeek (Anthropic)".into(), base_url: "https://api.deepseek.com/anthropic".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("zhipu".into(), Provider { name: "Zhipu GLM".into(), base_url: "https://open.bigmodel.cn/api/anthropic".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("baidu".into(), Provider { name: "Baidu ERNIE".into(), base_url: "https://qianfan.baidubce.com/anthropic/coding".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("kimi".into(), Provider { name: "Kimi".into(), base_url: "https://api.kimi.com/coding".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("dashscope".into(), Provider { name: "Qwen (DashScope)".into(), base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("minimax".into(), Provider { name: "MiniMax".into(), base_url: "https://api.minimaxi.com/anthropic".into(), api_key: key, auth_type: AuthType::Bearer });
+    m.insert("deepseek".into(), Provider { name: "DeepSeek".into(), base_url: "https://api.deepseek.com".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
+    m.insert("deepseek_anthropic".into(), Provider { name: "DeepSeek (Anthropic)".into(), base_url: "https://api.deepseek.com/anthropic".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
+    m.insert("zhipu".into(), Provider { name: "Zhipu GLM".into(), base_url: "https://open.bigmodel.cn/api/anthropic".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
+    m.insert("baidu".into(), Provider { name: "Baidu ERNIE".into(), base_url: "https://qianfan.baidubce.com/anthropic/coding".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
+    m.insert("kimi".into(), Provider { name: "Kimi".into(), base_url: "https://api.kimi.com/coding".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
+    m.insert("dashscope".into(), Provider { name: "Qwen (DashScope)".into(), base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
+    m.insert("minimax".into(), Provider { name: "MiniMax".into(), base_url: "https://api.minimaxi.com/anthropic".into(), api_key: key, auth_type: AuthType::Bearer, ws_url: None });
     m
 }
 
@@ -364,6 +371,10 @@ mod tests {
         let yaml = "dashscope_chat_image";
         let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(fmt, ProviderFormat::DashscopeChatImage);
+
+        let yaml = "dashscope_asr";
+        let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fmt, ProviderFormat::DashscopeAsr);
 
         let yaml = "dashscope_video";
         let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();

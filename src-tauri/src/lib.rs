@@ -2,6 +2,7 @@ mod api;
 mod axum_server;
 mod config;
 mod convert;
+mod dashscope_ws;
 mod db;
 mod models;
 mod proxy;

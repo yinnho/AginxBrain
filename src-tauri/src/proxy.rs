@@ -1739,6 +1739,7 @@ fn format_string(format: &ProviderFormat) -> String {
         ProviderFormat::DashscopeChatImage => "dashscope_chat_image",
         ProviderFormat::DashscopeVideo => "dashscope_video",
         ProviderFormat::DashscopeTts => "dashscope_tts",
+        ProviderFormat::DashscopeAsr => "dashscope_asr",
         ProviderFormat::Kling => "kling",
         ProviderFormat::MinimaxImage => "minimax_image",
     }.to_string()
@@ -1834,31 +1835,29 @@ async fn handle_tts_request(
 ) -> Result<Response, ProxyError> {
     let text = last_user_text(body)
         .ok_or_else(|| ProxyError::Upstream("tts: no text found in messages".into()))?;
-    let voice = body.get("voice").and_then(|v| v.as_str()).unwrap_or("Cherry").to_string();
+    let voice = body.get("voice").and_then(|v| v.as_str()).unwrap_or("longxiaochun_v2").to_string();
+    let format = body.get("audio_format").and_then(|v| v.as_str()).unwrap_or("mp3").to_string();
+    let sample_rate = body.get("sample_rate").and_then(|v| v.as_u64()).unwrap_or(22050) as u32;
 
-    let url = format!("{}{}", provider.base_url.trim_end_matches('/'), route.endpoint.as_str());
-    let req_body = json!({
-        "model": route.model,
-        "input": { "text": text, "voice": voice }
-    });
+    let ws_url = provider.ws_url.as_deref().unwrap_or("");
 
-    let resp = state.http_client.post(&url)
-        .header("content-type", "application/json")
-        .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key))
-        .json(&req_body)
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|e| ProxyError::Upstream(format!("tts request failed: {}", e)))?;
+    let audio_bytes = crate::dashscope_ws::tts_via_websocket(
+        ws_url,
+        &provider.api_key,
+        &crate::dashscope_ws::TtsParams {
+            text,
+            model: route.model.clone(),
+            voice,
+            format,
+            sample_rate,
+        },
+    )
+    .await
+    .map_err(|e| ProxyError::Upstream(format!("tts websocket failed: {}", e)))?;
 
-    let status = resp.status();
-    // DashScope TTS returns audio bytes directly when successful.
-    if !status.is_success() {
-        let txt = resp.text().await.unwrap_or_default();
-        return Err(ProxyError::Upstream(format!("tts upstream HTTP {}: {}", status.as_u16(), &txt[..txt.len().min(500)])));
+    if audio_bytes.is_empty() {
+        return Err(ProxyError::Upstream("tts: no audio data received".into()));
     }
-    let audio_bytes = resp.bytes().await
-        .map_err(|e| ProxyError::Upstream(format!("tts: failed to read audio body: {}", e)))?;
 
     // Save to ~/.aginxbrain/audio/{id}.mp3
     let audio_dir = match dirs::home_dir() {
@@ -1866,8 +1865,6 @@ async fn handle_tts_request(
         None => return Err(ProxyError::Upstream("no home directory for audio storage".into())),
     };
     let _ = tokio::fs::create_dir_all(&audio_dir).await;
-    // Unique filename: timestamp (ms) + random suffix. std::time is fine here
-    // (this is a normal handler, not a workflow script).
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -1877,15 +1874,13 @@ async fn handle_tts_request(
         use std::hash::{Hash, Hasher};
         let mut h = DefaultHasher::new();
         caller_key_id.hash(&mut h);
-        text.hash(&mut h);
         now_ms.hash(&mut h);
         h.finish()
     };
     let filename = format!("{}_{}.mp3", now_ms, rand_suffix);
     let file_path = audio_dir.join(&filename);
-    if let Err(e) = tokio::fs::write(&file_path, &audio_bytes).await {
-        return Err(ProxyError::Upstream(format!("tts: failed to save audio: {}", e)));
-    }
+    tokio::fs::write(&file_path, &audio_bytes).await
+        .map_err(|e| ProxyError::Upstream(format!("tts: failed to save audio: {}", e)))?;
 
     let _ = crate::db::insert_usage_log(
         &state.db,
@@ -1911,8 +1906,8 @@ async fn handle_tts_request(
     Ok(Json(resp_json).into_response())
 }
 
-/// ASR (audio → text): decode base64 audio from the chat body, send it as
-/// multipart to a Whisper endpoint, wrap the transcription in an OpenAI chat
+/// ASR (audio → text): decode base64 audio from the chat body, send it via
+/// DashScope WebSocket (Paraformer/Fun-ASR), wrap the transcription in an
 /// response.
 async fn handle_asr_request(
     state: AppState,
@@ -1927,32 +1922,21 @@ async fn handle_asr_request(
     let audio_bytes = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes())
         .map_err(|e| ProxyError::Upstream(format!("audio: invalid base64: {}", e)))?;
 
-    let url = format!("{}{}", provider.base_url.trim_end_matches('/'), route.endpoint.as_str());
+    let ws_url = provider.ws_url.as_deref().unwrap_or("");
+    let sample_rate = body.get("sample_rate").and_then(|v| v.as_u64()).unwrap_or(22050) as u32;
 
-    // Whisper expects multipart/form-data: a "file" part + a "model" part.
-    let part = reqwest::multipart::Part::bytes(audio_bytes)
-        .file_name(format!("audio.{}", format))
-        .mime_str("audio/mpeg")
-        .map_err(|e| ProxyError::Upstream(format!("audio: multipart mime: {}", e)))?;
-    let form = reqwest::multipart::Form::new()
-        .text("model", route.model.clone())
-        .part("file", part);
-
-    let resp = state.http_client.post(&url)
-        .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key))
-        .multipart(form)
-        .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await
-        .map_err(|e| ProxyError::Upstream(format!("asr request failed: {}", e)))?;
-
-    let status = resp.status();
-    let resp_json: Value = resp.json().await
-        .map_err(|e| ProxyError::Upstream(format!("asr: failed to parse response: {}", e)))?;
-    if !status.is_success() {
-        return Err(ProxyError::Upstream(format!("asr upstream HTTP {}: {}", status.as_u16(), resp_json)));
-    }
-    let transcription = resp_json.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let transcription = crate::dashscope_ws::asr_via_websocket(
+        ws_url,
+        &provider.api_key,
+        &crate::dashscope_ws::AsrParams {
+            audio_bytes,
+            model: route.model.clone(),
+            format,
+            sample_rate,
+        },
+    )
+    .await
+    .map_err(|e| ProxyError::Upstream(format!("asr websocket failed: {}", e)))?;
 
     let _ = crate::db::insert_usage_log(
         &state.db,

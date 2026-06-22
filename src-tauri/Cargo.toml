@@ -40,6 +40,8 @@ time = "0.3"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+uuid = { version = "1", features = ["v4"] }
 
 # Tauri dependencies (desktop only)
 tauri = { version = "2", features = ["tray-icon"], optional = true }
