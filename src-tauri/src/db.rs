@@ -62,16 +62,24 @@ pub async fn admin_count(pool: &SqlitePool) -> Result<i64> {
     Ok(count)
 }
 
-pub async fn create_admin(pool: &SqlitePool, username: &str, password_hash: &str) -> Result<i64> {
+/// Create an admin only if no admin exists yet. Returns the new admin's ID,
+/// or None if an admin already exists (prevents concurrent setup races).
+pub async fn create_admin_if_none(pool: &SqlitePool, username: &str, password_hash: &str) -> Result<Option<i64>> {
     let result = sqlx::query(
-        "INSERT INTO admins (username, password_hash) VALUES (?1, ?2)",
+        "INSERT INTO admins (username, password_hash)
+         SELECT ?1, ?2
+         WHERE NOT EXISTS (SELECT 1 FROM admins)",
     )
     .bind(username)
     .bind(password_hash)
     .execute(pool)
     .await
     .context("creating admin")?;
-    Ok(result.last_insert_rowid())
+    if result.rows_affected() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(result.last_insert_rowid()))
+    }
 }
 
 pub async fn find_admin_by_username(
@@ -269,6 +277,26 @@ pub async fn update_usage_tokens(
     .execute(pool)
     .await
     .context("updating usage tokens")?;
+    Ok(())
+}
+
+/// Update usage tokens, preserving existing DB values for None fields (unknown).
+pub async fn update_usage_tokens_opt(
+    pool: &SqlitePool,
+    id: i64,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+) -> Result<()> {
+    // COALESCE keeps the existing value when the new one is NULL
+    sqlx::query(
+        "UPDATE usage_logs SET input_tokens = COALESCE(?1, input_tokens), output_tokens = COALESCE(?2, output_tokens) WHERE id = ?3",
+    )
+    .bind(input_tokens)
+    .bind(output_tokens)
+    .bind(id)
+    .execute(pool)
+    .await
+    .context("updating usage tokens (optional)")?;
     Ok(())
 }
 

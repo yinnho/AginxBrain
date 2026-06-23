@@ -387,6 +387,7 @@ async fn handle_proxy(
     }
 
     let mut last_error: Option<ProxyError> = None;
+    let mut last_modality: String = String::new();
 
     for (attempt, (_route_idx, route)) in candidates.iter().enumerate() {
         if attempt > 0 {
@@ -395,6 +396,7 @@ async fn handle_proxy(
         }
 
         let provider_format = &route.format;
+        last_modality = format!("{:?}", route.format);
         let provider = match config.providers.get(&route.provider) {
             Some(p) => p,
             None => {
@@ -534,11 +536,10 @@ async fn handle_proxy(
             convert::responses_to_anthropic_request(&body, &route.model)
         }
         _ => {
-            let mut b = body.clone();
-            b["model"] = Value::String(route.model.clone());
-            normalize_roles(&mut b);
-            strip_thinking(&mut b);
-            b
+            return Err(ProxyError::Upstream(format!(
+                "unsupported protocol conversion: {} → {:?}",
+                client_protocol, provider_format
+            )));
         }
     };
 
@@ -870,11 +871,11 @@ async fn handle_proxy(
             if let Ok(value) = serde_json::from_slice::<Value>(&resp_body) {
                 let (input, output) = extract_usage_tokens(&value, provider_format);
                 if input.is_some() || output.is_some() {
-                    let _ = crate::db::update_usage_tokens(
+                    let _ = crate::db::update_usage_tokens_opt(
                         &state.db,
                         log_id,
-                        input.unwrap_or(0),
-                        output.unwrap_or(0),
+                        input,
+                        output,
                     )
                     .await;
                 }
@@ -988,7 +989,7 @@ async fn handle_proxy(
             provider: "".into(),
             model: "".into(),
             request_model: request_model.clone(),
-            modality: "chat".into(),
+            modality: last_modality.clone(),
             input_tokens: None,
             output_tokens: None,
             latency_ms: start.elapsed().as_millis() as i64,
@@ -1035,7 +1036,7 @@ async fn handle_count_tokens(
                 provider: "".into(),
                 model: "".into(),
                 request_model: request_model.clone(),
-                modality: "chat".into(),
+                modality: String::new(),
                 input_tokens: None,
                 output_tokens: None,
                 latency_ms: 0,
@@ -1048,6 +1049,7 @@ async fn handle_count_tokens(
     }
 
     let mut last_error: Option<ProxyError> = None;
+    let mut last_modality: String = String::new();
 
     for (attempt, (_route_idx, route)) in candidates.iter().enumerate() {
         if attempt > 0 {
@@ -1055,6 +1057,7 @@ async fn handle_count_tokens(
                 tag, attempt + 1, route.provider, route.model);
         }
 
+        last_modality = format!("{:?}", route.format);
         if !is_chat_format(&route.format) {
             let err = ProxyError::Upstream(format!(
                 "count_tokens is not supported for route format {:?}",
@@ -1099,21 +1102,10 @@ async fn handle_count_tokens(
             normalize_roles(&mut b);
             b
         }
-        ("anthropic", ProviderFormat::Openai) => {
-            let mut b = body.clone();
-            normalize_roles(&mut b);
-            convert::anthropic_to_openai_request(&b, &route.model)
-        }
-        ("anthropic", ProviderFormat::OpenaiResponses) => {
-            let mut b = body.clone();
-            normalize_roles(&mut b);
-            strip_thinking(&mut b);
-            convert::anthropic_to_responses_request(&b, &route.model)
-        }
         _ => {
             return Err(ProxyError::Upstream(format!(
-                "count_tokens not supported for protocol {} with format {:?}",
-                client_protocol, route.format
+                "count_tokens only supports Anthropic-format routes, got {:?}",
+                route.format
             )));
         }
     };
@@ -1368,7 +1360,8 @@ fn replace_model_in_anthropic_stream(
                     }
                 }
 
-                yield Ok(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&parsed).unwrap_or_default())));
+                let serialized = serde_json::to_string(&parsed).unwrap_or_else(|_| data.clone());
+                yield Ok(Bytes::from(format!("data: {}\n\n", serialized)));
             }
 
             // Save remaining buffer
@@ -1405,7 +1398,7 @@ fn normalize_roles(value: &mut Value) {
                         }
                         Some(c) if !(c.is_string() || c.is_array()) => {
                             let s = if c.is_object() || c.is_number() || c.is_boolean() {
-                                serde_json::to_string(c).unwrap_or_default()
+                                serde_json::to_string(c).unwrap_or_else(|_| c.to_string())
                             } else {
                                 String::new()
                             };

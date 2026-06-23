@@ -83,10 +83,6 @@ pub async fn admin_setup(
     session: Session,
     Json(req): Json<AdminSetupRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let count = db::admin_count(&state.db).await.map_err(ApiError::from)?;
-    if count > 0 {
-        return Err(ApiError::Validation("admin already exists".to_string()));
-    }
     let trimmed = req.username.trim();
     if trimmed.is_empty() || req.password.len() < 6 {
         return Err(ApiError::Validation(
@@ -94,9 +90,13 @@ pub async fn admin_setup(
         ));
     }
     let hash = hash_password(&req.password).map_err(|e| ApiError::Internal(e.to_string()))?;
-    let id = db::create_admin(&state.db, trimmed, &hash)
+    let id = db::create_admin_if_none(&state.db, trimmed, &hash)
         .await
         .map_err(ApiError::from)?;
+    let id = match id {
+        Some(id) => id,
+        None => return Err(ApiError::Validation("admin already exists".to_string())),
+    };
     // Log the new admin in immediately — setup establishes the session so the
     // UI lands in the dashboard without a separate login step.
     session
@@ -706,6 +706,9 @@ fn validate_provider(provider: &crate::config::Provider) -> Result<(), String> {
     }
     if provider.api_key.trim().is_empty() {
         return Err("provider has empty api_key".to_string());
+    }
+    if provider.api_key == "your-key-here" || provider.api_key.starts_with("sk-your-") {
+        return Err("provider has placeholder api_key — please set a real API key".to_string());
     }
     Ok(())
 }

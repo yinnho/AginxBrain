@@ -259,7 +259,7 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 
 ---
 
-### M-3: CorsLayer::permissive() 在 SaaS 部署不安全
+### M-3: CorsLayer::permissive() 在 SaaS 部署不安全 ✅ 已修复
 
 **文件**: `axum_server.rs:185`
 **影响**: 允许任何源跨域请求。本地开发可接受，但 brain.aginx.net 上可被恶意网站利用。
@@ -268,7 +268,7 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 
 ---
 
-### M-4: Session Cookie Secure 标记硬编码为 false
+### M-4: Session Cookie Secure 标记硬编码为 false ✅ 已修复
 
 **文件**: `axum_server.rs:57`
 **影响**: HTTPS 环境下 cookie 缺少 `Secure` 标记，可被 HTTP 拦截。
@@ -277,7 +277,7 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 
 ---
 
-### M-5: Token 统计 None 与 0 混淆
+### M-5: Token 统计 None 与 0 混淆 ✅ 已修复
 
 **文件**: `proxy.rs:852-864`
 **影响**: `input.unwrap_or(0)` 将"未知"记为"零"，污染使用量统计。
@@ -286,7 +286,7 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 
 ---
 
-### M-6: 所有候选失败时 modality 硬编码为 "chat"
+### M-6: 所有候选失败时 modality 硬编码为 "chat" ✅ 已修复
 
 **文件**: `proxy.rs:966`
 **影响**: TTS/图片请求失败时日志记录错误的 modality。
@@ -295,7 +295,7 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 
 ---
 
-### M-7: count_tokens URL 对非 Anthropic 格式拼接错误
+### M-7: count_tokens URL 对非 Anthropic 格式拼接错误 ✅ 已修复
 
 **文件**: `proxy.rs:1104-1108, 1152`
 **影响**: OpenAI 格式路由的 count_tokens 请求会发到 `/v1/chat/completions/count_tokens`，这不是有效端点。
@@ -304,7 +304,7 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 
 ---
 
-### M-8: admin_setup 并发创建多个 Admin
+### M-8: admin_setup 并发创建多个 Admin ✅ 已修复
 
 **文件**: `api.rs:81-107`
 **影响**: 并发 setup 请求可能同时通过 `admin_count == 0` 检查，创建多个 admin。
@@ -324,11 +324,11 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 
 ## 🔵 低优先级问题
 
-### L-1: SSE 序列化失败时发送空 data 行
+### L-1: SSE 序列化失败时发送空 data 行 ✅ 已修复
 **文件**: `proxy.rs:1354`
 **修复**: 序列化失败时传回原始 data 行，而非发送空的 `data: \n\n`。
 
-### L-2: 不支持的协议组合静默转发
+### L-2: 不支持的协议组合静默转发 ✅ 已修复
 **文件**: `proxy.rs:528-534`
 **修复**: 对不支持的 (client_protocol, provider_format) 组合返回明确错误。
 
@@ -340,7 +340,7 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 **文件**: `config.rs:123`
 **说明**: 该字段仅作文档用途，容易误导。建议加注释或重命名。
 
-### L-5: 默认 api_key "your-key-here" 通过验证
+### L-5: 默认 api_key "your-key-here" 通过验证 ✅ 已修复
 **文件**: `config.rs:175`
 **修复**: 在 `validate_config` 中增加占位符检测。
 

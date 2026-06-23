@@ -49,12 +49,14 @@ pub async fn start(state: AppState) -> (String, u16) {
     let port = state.config.read().await.port;
     let host = state.config.read().await.host.clone();
 
+    let is_local = host == "127.0.0.1" || host == "localhost" || host == "0.0.0.0";
+
     // Session store and layer
     let session_store = SqliteStore::new(state.db.clone());
     session_store.migrate().await.expect("failed to migrate session store");
 
     let session_layer = SessionManagerLayer::new(session_store)
-        .with_secure(false) // set true when served over HTTPS
+        .with_secure(!is_local) // Secure flag only for non-local deployments
         .with_same_site(SameSite::Lax)
         .with_expiry(Expiry::OnInactivity(time::Duration::hours(24)));
 
@@ -182,7 +184,22 @@ pub async fn start(state: AppState) -> (String, u16) {
         // Codex conversations can be very large (system prompt + tool results).
         // v1 uses 200MB; axum's default is 2MB which causes silent failures.
         .layer(RequestBodyLimitLayer::new(200 * 1024 * 1024))
-        .layer(CorsLayer::permissive())
+        .layer(if is_local {
+            CorsLayer::permissive()
+        } else {
+            CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::PUT,
+                    axum::http::Method::PATCH,
+                    axum::http::Method::DELETE,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers(tower_http::cors::Any)
+                .allow_credentials(true)
+        })
         .layer(CompressionLayer::new())
         .fallback(fallback_handler)
         .with_state(state);
