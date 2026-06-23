@@ -313,7 +313,7 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 
 ---
 
-### M-9: route_priority 用路由索引作 Key
+### M-9: route_priority 用路由索引作 Key ✅ 已修复
 
 **文件**: `config.rs:143`
 **影响**: 路由增删改后索引偏移，所有优先级映射失效。
@@ -332,11 +332,11 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 **文件**: `proxy.rs:528-534`
 **修复**: 对不支持的 (client_protocol, provider_format) 组合返回明确错误。
 
-### L-3: management_key 存储但从未校验
+### L-3: management_key 存储但从未校验 ✅ 已修复
 **文件**: `config.rs:165-167`
 **说明**: 死代码，当前所有管理端点通过 session auth，management_key 未被任何中间件检查。
 
-### L-4: Route.endpoint 字段不控制实际路由
+### L-4: Route.endpoint 字段不控制实际路由 ✅ 已修复
 **文件**: `config.rs:123`
 **说明**: 该字段仅作文档用途，容易误导。建议加注释或重命名。
 
@@ -344,11 +344,11 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 **文件**: `config.rs:175`
 **修复**: 在 `validate_config` 中增加占位符检测。
 
-### L-6: save_config 临时文件名不唯一
+### L-6: save_config 临时文件名不唯一 ✅ 已修复
 **文件**: `config.rs:301`
 **说明**: 并发调用可能互相覆盖 `.yaml.tmp`，单进程场景无影响。
 
-### L-7: RequestLog 有 #[serde(default)] 但未 derive Deserialize
+### L-7: RequestLog 有 #[serde(default)] 但未 derive Deserialize ✅ 已修复
 **文件**: `config.rs:15-29`
 **说明**: `#[serde(default)]` 仅在 `Deserialize` 时有效，当前无害但误导。
 

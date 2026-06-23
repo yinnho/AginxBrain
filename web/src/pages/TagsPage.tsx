@@ -28,12 +28,12 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
     }
   };
 
-  const handlePriorityMove = async (tagName: string, routeIdx: number, direction: 'up' | 'down') => {
+  const handlePriorityMove = async (tagName: string, routeId: string, direction: 'up' | 'down') => {
     // Find routes associated with this tag, sorted by current priority
     const tagRoutes = getTagRoutes(config.routes, tagName, config.tags.find(t => t.name === tagName)?.route_priority || {});
     if (tagRoutes.length < 2) return;
 
-    const currentPos = tagRoutes.findIndex(r => r.routeIdx === routeIdx);
+    const currentPos = tagRoutes.findIndex(r => r.route.id === routeId);
     if (currentPos < 0) return;
     const swapPos = direction === 'up' ? currentPos - 1 : currentPos + 1;
     if (swapPos < 0 || swapPos >= tagRoutes.length) return;
@@ -47,7 +47,7 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
 
     const newPriority: Record<string, number> = {};
     newOrder.forEach((r, i) => {
-      newPriority[String(r.routeIdx)] = i;
+      newPriority[r.route.id] = i;
     });
 
     try {
@@ -128,12 +128,12 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
                 </div>
               </div>
 
-              {/* Expandable route priority list */}
+	              {/* Expandable route priority list */}
               {isExpanded && tagRoutes.length > 0 && (
                 <div style={{ borderTop: '1px solid var(--border)', padding: '8px 16px 12px' }}>
                   {tagRoutes.map((r, i) => {
                     return (
-                      <div key={r.routeIdx} style={{
+                      <div key={r.route.id} style={{
                         display: 'flex', alignItems: 'center', gap: 8,
                         padding: '6px 0',
                         borderTop: i > 0 ? '1px solid var(--border)' : 'none',
@@ -150,12 +150,12 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                           <button
                             disabled={i === 0}
-                            onClick={() => handlePriorityMove(tag.name, r.routeIdx, 'up')}
+                            onClick={() => handlePriorityMove(tag.name, r.route.id, 'up')}
                             style={{ background: 'var(--bg-input)', border: '1px solid var(--border)', color: 'var(--text-secondary)', borderRadius: 3, padding: '0 6px', cursor: i === 0 ? 'default' : 'pointer', fontSize: 10, lineHeight: '16px', opacity: i === 0 ? 0.3 : 1 }}
                           >▲</button>
                           <button
                             disabled={i === tagRoutes.length - 1}
-                            onClick={() => handlePriorityMove(tag.name, r.routeIdx, 'down')}
+                            onClick={() => handlePriorityMove(tag.name, r.route.id, 'down')}
                             style={{ background: 'var(--bg-input)', border: '1px solid var(--border)', color: 'var(--text-secondary)', borderRadius: 3, padding: '0 6px', cursor: i === tagRoutes.length - 1 ? 'default' : 'pointer', fontSize: 10, lineHeight: '16px', opacity: i === tagRoutes.length - 1 ? 0.3 : 1 }}
                           >▼</button>
                         </div>
@@ -178,21 +178,19 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
   );
 }
 
-/** Get routes associated with a tag, sorted by route_priority. */
-function getTagRoutes(routes: Route[], tagName: string, tagPriority?: Record<string, number> | null): { routeIdx: number; route: Route }[] {
+/** Get routes associated with a tag, sorted by route_priority (keyed by route ID). */
+function getTagRoutes(routes: Route[], tagName: string, tagPriority?: Record<string, number> | null): { route: Route }[] {
   const matched = routes
-    .map((route, idx) => ({ routeIdx: idx, route }))
-    .filter(({ route }) => route.tags.includes(tagName));
+    .filter(route => route.tags.includes(tagName));
 
   if (tagPriority && Object.keys(tagPriority).length > 0) {
     matched.sort((a, b) => {
-      const pa = tagPriority[String(a.routeIdx)] ?? Infinity;
-      const pb = tagPriority[String(b.routeIdx)] ?? Infinity;
-      if (pa !== pb) return pa - pb;
-      return a.routeIdx - b.routeIdx;
+      const pa = tagPriority[a.id] ?? Infinity;
+      const pb = tagPriority[b.id] ?? Infinity;
+      return pa - pb;
     });
   }
-  return matched;
+  return matched.map(route => ({ route }));
 }
 
 function TagForm({ onSave, onCancel }: { onSave: (tag: Tag) => void; onCancel: () => void }) {

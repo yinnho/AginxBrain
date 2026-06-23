@@ -206,8 +206,8 @@ fn find_candidate_routes<'a>(
     let mut sorted = candidates;
     if let Some(tag_config) = tags.iter().find(|t| t.name == tag) {
         if !tag_config.route_priority.is_empty() {
-            sorted.sort_by_key(|(idx, _)| {
-                tag_config.route_priority.get(&idx.to_string()).copied().unwrap_or(u32::MAX)
+            sorted.sort_by_key(|(_, route)| {
+                tag_config.route_priority.get(&route.id).copied().unwrap_or(u32::MAX)
             });
         }
     }

@@ -12,20 +12,13 @@ pub struct RequestLog {
     pub tag: String,
     pub provider: String,
     pub target_model: String,
-    #[serde(default)]
     pub modality: String,
     pub timestamp: String,
-    #[serde(default)]
     pub caller_key_name: Option<String>,
-    #[serde(default)]
     pub input_tokens: Option<i64>,
-    #[serde(default)]
     pub output_tokens: Option<i64>,
-    #[serde(default)]
     pub latency_ms: i64,
-    #[serde(default)]
     pub cost: f64,
-    #[serde(default)]
     pub timestamp_ms: i64,
 }
 
@@ -43,6 +36,8 @@ pub struct AppConfig {
     pub tags: Vec<Tag>,
     #[serde(default = "default_tag")]
     pub current_tag: String,
+    /// Legacy field: kept for config import/export compatibility.
+    /// Admin auth is now handled exclusively via session-based login.
     #[serde(default = "default_management_key")]
     pub management_key: String,
 }
@@ -120,6 +115,11 @@ fn default_enabled() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
+    /// Stable unique ID (auto-generated UUID). Survives reordering/insertion/deletion.
+    #[serde(default = "generate_route_id")]
+    pub id: String,
+    /// Upstream API endpoint path (e.g. "/v1/chat/completions").
+    /// Used to construct the full URL: base_url + endpoint.
     pub endpoint: String,
     pub model: String,
     pub provider: String,
@@ -131,6 +131,30 @@ pub struct Route {
     pub enabled: bool,
 }
 
+fn generate_route_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    // Simple unique ID: timestamp + random suffix
+    format!("r_{:x}_{:04}", ts, rand_digit())
+}
+
+fn rand_digit() -> u16 {
+    // Use a simple hash of the timestamp for pseudo-randomness (no external rand dep)
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    (ts % 10000) as u16
+}
+
+/// Generate a stable route ID (public for use in api.rs).
+pub fn new_route_id() -> String {
+    generate_route_id()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {
     pub name: String,
@@ -138,7 +162,7 @@ pub struct Tag {
     pub color: String,
     #[serde(default)]
     pub is_auto: bool,
-    /// Route priority map: key = route index (as string), value = priority
+    /// Route priority map: key = route ID, value = priority
     /// (lower = tried first). Routes not listed come last in config order.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub route_priority: HashMap<String, u32>,
@@ -185,14 +209,14 @@ fn default_providers() -> HashMap<String, Provider> {
 
 fn default_routes() -> Vec<Route> {
     vec![
-        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { endpoint: "/v1/messages".into(), model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, enabled: true },
-        Route { endpoint: "/v1/chat/completions".into(), model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { endpoint: "/v1/messages".into(), model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true },
-        Route { endpoint: "/v1/messages".into(), model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true },
+        Route { id: "r_default_1".into(), endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { id: "r_default_2".into(), endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { id: "r_default_3".into(), endpoint: "/v1/messages".into(), model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, enabled: true },
+        Route { id: "r_default_4".into(), endpoint: "/v1/chat/completions".into(), model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { id: "r_default_5".into(), endpoint: "/v1/messages".into(), model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true },
+        Route { id: "r_default_6".into(), endpoint: "/v1/messages".into(), model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true },
         // Example: route popular Codex model names directly. Add more tags (gpt-5.4, etc.) as needed.
-        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["gpt-5.5".into(), "codex".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { id: "r_default_7".into(), endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["gpt-5.5".into(), "codex".into()], format: ProviderFormat::Openai, enabled: true },
     ]
 }
 
@@ -279,6 +303,35 @@ pub fn load_config() -> Result<AppConfig> {
         config.management_key = default_management_key();
         dirty = true;
     }
+
+    // Migrate: assign stable IDs to routes that lack them (upgraded from older version)
+    for route in &mut config.routes {
+        if route.id.trim().is_empty() {
+            route.id = generate_route_id();
+            dirty = true;
+        }
+    }
+    // Migrate: convert index-based route_priority keys to route ID keys
+    for tag in &mut config.tags {
+        let mut new_priority = HashMap::new();
+        let mut changed = false;
+        for (key, value) in &tag.route_priority {
+            // If key is a numeric index, resolve to the route's ID
+            if let Ok(idx) = key.parse::<usize>() {
+                if let Some(route) = config.routes.get(idx) {
+                    new_priority.insert(route.id.clone(), *value);
+                    changed = true;
+                }
+            } else {
+                // Already a route ID, keep as-is
+                new_priority.insert(key.clone(), *value);
+            }
+        }
+        if changed {
+            tag.route_priority = new_priority;
+            dirty = true;
+        }
+    }
     if dirty {
         log::info!("[Config] backfilling empty fields with defaults");
         if let Err(e) = save_config(&config) {
@@ -297,8 +350,12 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
     }
     let content = serde_yaml::to_string(config)?;
 
-    // Atomic write: write to temp file then rename
-    let tmp_path = path.with_extension("yaml.tmp");
+    // Atomic write: write to temp file then rename.
+    // Use PID + timestamp to avoid collisions if multiple processes write concurrently.
+    let tmp_path = path.with_extension(format!("yaml.tmp.{}.{}", std::process::id(), std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()));
     std::fs::write(&tmp_path, &content)
         .with_context(|| format!("writing {}", tmp_path.display()))?;
     std::fs::rename(&tmp_path, &path)

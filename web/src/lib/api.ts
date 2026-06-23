@@ -37,6 +37,7 @@ export const FORMAT_ENDPOINTS: Record<RouteFormat, string> = {
 };
 
 export interface Route {
+  id: string;
   endpoint: string;
   model: string;
   provider: string;

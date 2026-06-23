@@ -393,7 +393,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
         </div>
       </div>
       <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
-        <Button variant="primary" disabled={!valid} onClick={() => onSave({ endpoint, model, provider, tags: selectedTags, format, enabled: initial?.enabled ?? true })}>Save</Button>
+        <Button variant="primary" disabled={!valid} onClick={() => onSave({ id: initial?.id || '', endpoint, model, provider, tags: selectedTags, format, enabled: initial?.enabled ?? true })}>Save</Button>
         <Button variant="ghost" onClick={onCancel}>Cancel</Button>
       </div>
     </Card>

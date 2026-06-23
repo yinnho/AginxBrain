@@ -453,9 +453,13 @@ where
 // POST /api/routes
 pub async fn create_route(
     State(state): State<AppState>,
-    Json(route): Json<crate::config::Route>,
+    Json(mut route): Json<crate::config::Route>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let index = mutate_config(&state, |config| {
+        // Auto-generate ID if not provided
+        if route.id.trim().is_empty() {
+            route.id = crate::config::new_route_id();
+        }
         validate_route(config, &route)?;
         config.routes.push(route);
         Ok(config.routes.len() - 1)
@@ -468,7 +472,7 @@ pub async fn create_route(
 pub async fn update_route(
     State(state): State<AppState>,
     Path(index): Path<usize>,
-    Json(route): Json<crate::config::Route>,
+    Json(mut route): Json<crate::config::Route>,
 ) -> Result<Json<crate::config::Route>, ApiError> {
     let updated = mutate_config(&state, |config| {
         validate_route(config, &route)?;
@@ -476,6 +480,11 @@ pub async fn update_route(
             .routes
             .get_mut(index)
             .ok_or_else(|| format!("route index {} out of bounds", index))?;
+        // Preserve existing ID if not provided
+        if route.id.trim().is_empty() {
+            route.id = r.id.clone();
+        }
+        // Clean up route_priority entries that used the old index-based key
         *r = route.clone();
         Ok(route)
     })
@@ -518,7 +527,11 @@ pub async fn delete_route(
         if index >= config.routes.len() {
             return Err(format!("route index {} out of bounds", index));
         }
-        config.routes.remove(index);
+        let removed = config.routes.remove(index);
+        // Clean up route_priority entries referencing this route's ID
+        for tag in &mut config.tags {
+            tag.route_priority.remove(&removed.id);
+        }
         Ok(())
     })
     .await?;
