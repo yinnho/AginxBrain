@@ -199,7 +199,7 @@ if !config.tags.iter().any(|t| t.name == req.tag) {
 
 ---
 
-### H-5: 流式使用量提取无界缓冲（内存泄漏）
+### H-5: 流式使用量提取无界缓冲（内存泄漏） ✅ 已修复
 
 **文件**: `proxy.rs:697`
 **影响**: 流式响应的所有 SSE 字节追加到 `Vec<u8>` 缓冲区。长对话（大段代码生成）可消耗数百 MB 内存，仅在 task 完成后释放。
@@ -208,7 +208,7 @@ if !config.tags.iter().any(|t| t.name == req.tag) {
 
 ---
 
-### H-6: 测试端点泄露 API Key 前缀
+### H-6: 测试端点泄露 API Key 前缀 ✅ 已修复
 
 **文件**: `proxy.rs:2342-2344`
 **影响**: 测试失败时错误信息返回 API key 前 8 个字符（如 `sk-ant-a`），暴露 key 类型。
@@ -226,7 +226,7 @@ if !config.tags.iter().any(|t| t.name == req.tag) {
 
 ---
 
-### H-8: DashScope 轮询 URL 硬编码
+### H-8: DashScope 轮询 URL 硬编码 ✅ 已修复
 
 **文件**: `proxy.rs:2101`
 **影响**: `poll_dashscope_image_task` 硬编码 `https://dashscope.aliyuncs.com/api/v1/tasks/`，忽略了 provider 的 `base_url`。使用兼容 DashScope 的其他服务时，轮询会打错地址。
@@ -241,7 +241,7 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 
 ## 🟡 中优先级问题
 
-### M-1: ApiError::Internal 泄露内部实现细节
+### M-1: ApiError::Internal 泄露内部实现细节 ✅ 已修复
 
 **文件**: `api.rs:897-922`
 **影响**: 内部错误（SQL 错误、文件路径等）直接返回给客户端。
@@ -250,7 +250,7 @@ let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches(
 
 ---
 
-### M-2: GET /api/config 返回所有 Provider 明文 API Key
+### M-2: GET /api/config 返回所有 Provider 明文 API Key ✅ 已修复
 
 **文件**: `api.rs:363-366`
 **影响**: 管理员浏览器 devtools 可见所有上游 API Key。

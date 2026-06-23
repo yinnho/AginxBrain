@@ -702,10 +702,19 @@ async fn handle_proxy(
         let log_id = usage_log_id;
         let usage_format = provider_format.clone();
         tokio::spawn(async move {
+            const MAX_USAGE_BUF: usize = 1024 * 1024; // 1 MB cap for usage extraction
             let mut buf = Vec::new();
+            let mut capped = false;
             while let Some(result) = usage_rx.recv().await {
+                if capped { continue; }
                 if let Ok(bytes) = result {
-                    buf.extend_from_slice(&bytes);
+                    if buf.len() + bytes.len() <= MAX_USAGE_BUF {
+                        buf.extend_from_slice(&bytes);
+                    } else {
+                        buf.extend_from_slice(&bytes[..MAX_USAGE_BUF.saturating_sub(buf.len())]);
+                        capped = true;
+                        log::warn!("[Proxy] usage extraction buffer capped at {} bytes, token stats may be incomplete", MAX_USAGE_BUF);
+                    }
                 }
             }
             let (input, output) = extract_usage_from_sse_buffer(&buf, &usage_format);
@@ -2106,7 +2115,7 @@ async fn poll_dashscope_image_task(
     provider: &Provider,
     task_id: &str,
 ) -> Result<Vec<GeneratedImage>, ProxyError> {
-    let poll_url = format!("https://dashscope.aliyuncs.com/api/v1/tasks/{}", task_id);
+    let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches('/'), task_id);
     let start = std::time::Instant::now();
     loop {
         if start.elapsed() > std::time::Duration::from_secs(120) {

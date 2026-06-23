@@ -338,6 +338,9 @@ fn validate_config(config: &AppConfig) -> Result<(), String> {
         if provider.api_key.trim().is_empty() {
             return Err(format!("provider '{}' has empty api_key", id));
         }
+        if provider.api_key.contains("***") {
+            return Err(format!("provider '{}' has masked api_key — provide the full key", id));
+        }
     }
 
     for (i, route) in config.routes.iter().enumerate() {
@@ -361,17 +364,50 @@ fn validate_config(config: &AppConfig) -> Result<(), String> {
 
 // GET /api/config
 pub async fn get_config(State(state): State<AppState>) -> Json<AppConfig> {
-    let config = state.config.read().await;
-    Json(config.clone())
+    let config = state.config.read().await.clone();
+    Json(mask_config_keys(config))
+}
+
+/// Mask provider API keys and management_key in a config snapshot for safe display.
+fn mask_config_keys(mut config: AppConfig) -> AppConfig {
+    for provider in config.providers.values_mut() {
+        provider.api_key = mask_api_key(&provider.api_key);
+    }
+    config.management_key = mask_api_key(&config.management_key);
+    config
+}
+
+/// Mask an API key for display: show first 4 and last 4 chars, rest as `***`.
+fn mask_api_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 8 {
+        return "***".to_string();
+    }
+    format!(
+        "{}***{}",
+        chars[..4].iter().collect::<String>(),
+        chars[chars.len() - 4..].iter().collect::<String>()
+    )
 }
 
 // PUT /api/config
 pub async fn update_config(
     State(state): State<AppState>,
-    Json(new_config): Json<AppConfig>,
+    Json(mut new_config): Json<AppConfig>,
 ) -> Result<StatusCode, ApiError> {
-    validate_config(&new_config).map_err(ApiError::Validation)?;
     let mut config = state.config.write().await;
+    // Preserve original keys where the submitted value is a masked placeholder
+    for (id, provider) in &mut new_config.providers {
+        if provider.api_key.contains("***") {
+            if let Some(existing) = config.providers.get(id) {
+                provider.api_key = existing.api_key.clone();
+            }
+        }
+    }
+    if new_config.management_key.contains("***") {
+        new_config.management_key = config.management_key.clone();
+    }
+    validate_config(&new_config).map_err(ApiError::Validation)?;
     save_config(&new_config).map_err(ApiError::from)?;
     *config = new_config;
     Ok(StatusCode::OK)
@@ -541,22 +577,32 @@ pub async fn create_provider(
         Ok(req.provider)
     })
     .await?;
-    Ok(Json(provider))
+    let mut masked = provider;
+    masked.api_key = mask_api_key(&masked.api_key);
+    Ok(Json(masked))
 }
 
 // PUT /api/providers/:id
 pub async fn update_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(provider): Json<crate::config::Provider>,
+    Json(mut provider): Json<crate::config::Provider>,
 ) -> Result<Json<crate::config::Provider>, ApiError> {
     let updated = mutate_config(&state, |config| {
+        // Preserve original key if submitted value is masked
+        if provider.api_key.contains("***") {
+            if let Some(existing) = config.providers.get(&id) {
+                provider.api_key = existing.api_key.clone();
+            }
+        }
         validate_provider(&provider)?;
         config.providers.insert(id.clone(), provider.clone());
         Ok(provider)
     })
     .await?;
-    Ok(Json(updated))
+    let mut masked = updated;
+    masked.api_key = mask_api_key(&masked.api_key);
+    Ok(Json(masked))
 }
 
 // DELETE /api/providers/:id
@@ -882,7 +928,7 @@ pub async fn export_config(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let config = state.config.read().await;
-    let mut export_config = config.clone();
+    let mut export_config = mask_config_keys(config.clone());
     export_config.management_key = "YOUR_MANAGEMENT_KEY".to_string();
     let json_value =
         serde_json::to_value(&export_config).map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -894,13 +940,20 @@ pub async fn import_config(
     State(state): State<AppState>,
     Json(mut import_config): Json<AppConfig>,
 ) -> Result<StatusCode, ApiError> {
-    validate_config(&import_config).map_err(ApiError::Validation)?;
-
     let mut config = state.config.write().await;
     if import_config.management_key == "YOUR_MANAGEMENT_KEY" {
         import_config.management_key = config.management_key.clone();
     }
+    // Preserve original keys where imported value is masked
+    for (id, provider) in &mut import_config.providers {
+        if provider.api_key.contains("***") {
+            if let Some(existing) = config.providers.get(id) {
+                provider.api_key = existing.api_key.clone();
+            }
+        }
+    }
 
+    validate_config(&import_config).map_err(ApiError::Validation)?;
     save_config(&import_config).map_err(ApiError::from)?;
     *config = import_config;
     Ok(StatusCode::OK)
@@ -926,7 +979,10 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, msg) = match &self {
             ApiError::Validation(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            ApiError::Internal(e) => {
+                log::error!("[API] internal error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+            }
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
         };
         let body = serde_json::json!({ "error": msg });

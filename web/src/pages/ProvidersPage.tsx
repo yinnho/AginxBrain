@@ -66,7 +66,7 @@ export function ProvidersPage({ config, onConfigChange }: { config: AppConfig; o
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.auth_type}</span>
                   <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                    {showKeys[id] ? p.api_key : `${p.api_key.slice(0, 8)}${'•'.repeat(8)}`}
+                    {showKeys[id] ? p.api_key : p.api_key}
                   </span>
                   <button onClick={() => toggleKeyVisibility(id)} style={{
                     fontSize: 11, background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '0 4px',
@@ -138,7 +138,7 @@ function ProviderForm({ initial, onSave, onCancel }: {
           <option value="x_goog_api_key">x-goog-api-key</option>
         </Select>
         <div style={{ gridColumn: '1 / -1' }}>
-          <Input label="API Key" value={apiKey} onChange={e => setApiKey(e.target.value)} type="password" />
+          <Input label="API Key" value={apiKey} onChange={e => setApiKey(e.target.value)} type="password" placeholder={initial ? "Leave masked value unchanged to keep existing key" : undefined} />
         </div>
       </div>
       <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
