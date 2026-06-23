@@ -40,10 +40,13 @@ pub async fn require_admin_session(
 /// Accept either an admin session or a valid caller-key Bearer token.
 /// Used for client-facing endpoints (logs, status, takeover) that the
 /// desktop app accesses with just an API key.
+///
+/// When authenticated via caller key, attaches the caller_key_id to the
+/// request extensions so downstream handlers can scope data by key.
 pub async fn require_admin_or_caller_key(
     State(state): State<AppState>,
     session: Session,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, ApiError> {
     // 1. Check admin session first
@@ -57,14 +60,20 @@ pub async fn require_admin_or_caller_key(
         let result = db::find_caller_key_by_token(&state.db, &token)
             .await
             .map_err(|_| ApiError::Internal("db error".to_string()))?;
-        if let Some((_id, enabled)) = result {
+        if let Some((id, enabled)) = result {
             if enabled {
+                // Attach caller_key_id so handlers can filter by user
+                request.extensions_mut().insert(CallerKeyId(id));
                 return Ok(next.run(request).await);
             }
         }
     }
     Err(ApiError::Unauthorized)
 }
+
+/// Wrapper type for caller key ID in request extensions.
+#[derive(Debug, Clone, Copy)]
+pub struct CallerKeyId(pub i64);
 
 // ─── Admin auth endpoints ───────────────────────────────────────────────
 
@@ -691,21 +700,47 @@ pub async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResp
 }
 
 // GET /api/logs
-pub async fn get_logs(State(state): State<AppState>) -> Result<Json<Vec<RequestLog>>, ApiError> {
-    let rows: Vec<(String, String, String, String, String, String, Option<String>, Option<i64>, Option<i64>, i64, f64, i64)> = sqlx::query_as(
-        "SELECT u.request_model, u.tag, u.provider, u.model as target_model, u.modality, u.timestamp, k.name as caller_key_name,
-                u.input_tokens, u.output_tokens, u.latency_ms,
-                COALESCE((u.input_tokens / 1000.0) * COALESCE(r.input_price_per_1k, 0.0) + (u.output_tokens / 1000.0) * COALESCE(r.output_price_per_1k, 0.0), 0.0) as cost,
-                CAST((strftime('%s', u.timestamp) * 1000) AS INTEGER) as timestamp_ms
-         FROM usage_logs u
-         LEFT JOIN caller_keys k ON u.caller_key_id = k.id
-         LEFT JOIN cost_rates r ON u.provider = r.provider AND u.model = r.model
-         ORDER BY u.timestamp DESC
-         LIMIT 200",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+pub async fn get_logs(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Result<Json<Vec<RequestLog>>, ApiError> {
+    // If authenticated via caller key (not admin session), scope logs to that key
+    let caller_filter = request.extensions().get::<CallerKeyId>().map(|k| k.0);
+
+    let rows: Vec<(String, String, String, String, String, String, Option<String>, Option<i64>, Option<i64>, i64, f64, i64)> = if let Some(key_id) = caller_filter {
+        sqlx::query_as(
+            "SELECT u.request_model, u.tag, u.provider, u.model as target_model, u.modality, u.timestamp, k.name as caller_key_name,
+                    u.input_tokens, u.output_tokens, u.latency_ms,
+                    COALESCE((u.input_tokens / 1000.0) * COALESCE(r.input_price_per_1k, 0.0) + (u.output_tokens / 1000.0) * COALESCE(r.output_price_per_1k, 0.0), 0.0) as cost,
+                    CAST((strftime('%s', u.timestamp) * 1000) AS INTEGER) as timestamp_ms
+             FROM usage_logs u
+             LEFT JOIN caller_keys k ON u.caller_key_id = k.id
+             LEFT JOIN cost_rates r ON u.provider = r.provider AND u.model = r.model
+             WHERE u.caller_key_id = ?1
+             ORDER BY u.timestamp DESC
+             LIMIT 200",
+        )
+        .bind(key_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+    } else {
+        // Admin session — show all logs
+        sqlx::query_as(
+            "SELECT u.request_model, u.tag, u.provider, u.model as target_model, u.modality, u.timestamp, k.name as caller_key_name,
+                    u.input_tokens, u.output_tokens, u.latency_ms,
+                    COALESCE((u.input_tokens / 1000.0) * COALESCE(r.input_price_per_1k, 0.0) + (u.output_tokens / 1000.0) * COALESCE(r.output_price_per_1k, 0.0), 0.0) as cost,
+                    CAST((strftime('%s', u.timestamp) * 1000) AS INTEGER) as timestamp_ms
+             FROM usage_logs u
+             LEFT JOIN caller_keys k ON u.caller_key_id = k.id
+             LEFT JOIN cost_rates r ON u.provider = r.provider AND u.model = r.model
+             ORDER BY u.timestamp DESC
+             LIMIT 200",
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+    };
 
     let logs = rows
         .into_iter()
