@@ -12,7 +12,7 @@ pub struct RequestLog {
     pub tag: String,
     pub provider: String,
     pub target_model: String,
-    #[serde(default = "default_modality")]
+    #[serde(default)]
     pub modality: String,
     pub timestamp: String,
     #[serde(default)]
@@ -129,8 +129,6 @@ pub struct Route {
     pub format: ProviderFormat,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    #[serde(default = "default_modality")]
-    pub modality: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +138,16 @@ pub struct Tag {
     pub color: String,
     #[serde(default)]
     pub is_auto: bool,
+    /// Route priority map: key = route index (as string), value = priority
+    /// (lower = tried first). Routes not listed come last in config order.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub route_priority: HashMap<String, u32>,
+}
+
+impl Tag {
+    pub fn new(name: &str, color: &str, is_auto: bool) -> Self {
+        Self { name: name.to_string(), color: color.to_string(), is_auto, route_priority: HashMap::new() }
+    }
 }
 
 fn default_port() -> u16 {
@@ -148,10 +156,6 @@ fn default_port() -> u16 {
 
 fn default_host() -> String {
     "127.0.0.1".to_string()
-}
-
-fn default_modality() -> String {
-    "chat".to_string()
 }
 
 fn default_tag() -> String {
@@ -181,34 +185,34 @@ fn default_providers() -> HashMap<String, Provider> {
 
 fn default_routes() -> Vec<Route> {
     vec![
-        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, enabled: true, modality: default_modality() },
-        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, enabled: true, modality: default_modality() },
-        Route { endpoint: "/v1/messages".into(), model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, enabled: true, modality: default_modality() },
-        Route { endpoint: "/v1/chat/completions".into(), model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true, modality: default_modality() },
-        Route { endpoint: "/v1/messages".into(), model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true, modality: default_modality() },
-        Route { endpoint: "/v1/messages".into(), model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true, modality: default_modality() },
+        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { endpoint: "/v1/messages".into(), model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, enabled: true },
+        Route { endpoint: "/v1/chat/completions".into(), model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { endpoint: "/v1/messages".into(), model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true },
+        Route { endpoint: "/v1/messages".into(), model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true },
         // Example: route popular Codex model names directly. Add more tags (gpt-5.4, etc.) as needed.
-        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["gpt-5.5".into(), "codex".into()], format: ProviderFormat::Openai, enabled: true, modality: default_modality() },
+        Route { endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["gpt-5.5".into(), "codex".into()], format: ProviderFormat::Openai, enabled: true },
     ]
 }
 
 fn default_tags() -> Vec<Tag> {
     vec![
-        Tag { name: "opus".into(), color: "#A855F7".into(), is_auto: false },
-        Tag { name: "sonnet".into(), color: "#3B82F6".into(), is_auto: false },
-        Tag { name: "haiku".into(), color: "#22C55E".into(), is_auto: false },
-        Tag { name: "auto".into(), color: "#F59E0B".into(), is_auto: true },
+        Tag { name: "opus".into(), color: "#A855F7".into(), is_auto: false, route_priority: HashMap::new() },
+        Tag { name: "sonnet".into(), color: "#3B82F6".into(), is_auto: false, route_priority: HashMap::new() },
+        Tag { name: "haiku".into(), color: "#22C55E".into(), is_auto: false, route_priority: HashMap::new() },
+        Tag { name: "auto".into(), color: "#F59E0B".into(), is_auto: true, route_priority: HashMap::new() },
         // Popular client model names can be added as tags without code changes.
         // When a request arrives with model="gpt-5.5", it resolves directly to
         // the "gpt-5.5" tag, and the route below routes it to DeepSeek.
-        Tag { name: "gpt-5.5".into(), color: "#10B981".into(), is_auto: false },
-        Tag { name: "codex".into(), color: "#6366F1".into(), is_auto: false },
+        Tag { name: "gpt-5.5".into(), color: "#10B981".into(), is_auto: false, route_priority: HashMap::new() },
+        Tag { name: "codex".into(), color: "#6366F1".into(), is_auto: false, route_priority: HashMap::new() },
         // Multimodal tags: OpenCarrier sends model="<tag>" for non-chat
-        // capabilities (POST /v1/chat/completions), routed by modality.
-        Tag { name: "image".into(), color: "#10B981".into(), is_auto: false },
-        Tag { name: "tts".into(), color: "#F59E0B".into(), is_auto: false },
-        Tag { name: "vision".into(), color: "#EC4899".into(), is_auto: false },
-        Tag { name: "audio".into(), color: "#06B6D4".into(), is_auto: false },
+        // capabilities (POST /v1/chat/completions), routed by format.
+        Tag { name: "image".into(), color: "#10B981".into(), is_auto: false, route_priority: HashMap::new() },
+        Tag { name: "tts".into(), color: "#F59E0B".into(), is_auto: false, route_priority: HashMap::new() },
+        Tag { name: "vision".into(), color: "#EC4899".into(), is_auto: false, route_priority: HashMap::new() },
+        Tag { name: "audio".into(), color: "#06B6D4".into(), is_auto: false, route_priority: HashMap::new() },
     ]
 }
 
@@ -396,27 +400,6 @@ mod tests {
     #[test]
     fn test_default_format_is_openai() {
         assert_eq!(default_format(), ProviderFormat::Openai);
-    }
-
-    #[test]
-    fn test_route_default_modality_is_chat() {
-        let yaml = r#"
-endpoint: /v1/chat/completions
-model: test-model
-provider: test-provider
-tags: [sonnet]
-format: openai
-enabled: true
-"#;
-        let route: Route = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(route.modality, "chat");
-    }
-
-    #[test]
-    fn test_default_routes_are_chat_modality() {
-        for route in default_routes() {
-            assert_eq!(route.modality, "chat");
-        }
     }
 
     #[test]

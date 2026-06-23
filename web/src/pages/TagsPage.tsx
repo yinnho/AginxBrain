@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { AppConfig, Tag } from '../lib/api';
+import type { AppConfig, Tag, Route } from '../lib/api';
 import * as api from '../lib/api';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
@@ -8,12 +8,57 @@ import { Input } from '../components/Input';
 
 export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConfigChange: (c: AppConfig) => void }) {
   const [adding, setAdding] = useState(false);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  const toggleExpand = (name: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
+  };
 
   const handleDelete = async (name: string) => {
-    const newTags = config.tags.filter(t => t.name !== name);
-    const newConfig = { ...config, tags: newTags };
-    await api.updateConfig(newConfig);
-    onConfigChange(newConfig);
+    try {
+      await api.deleteTag(name);
+      const newTags = config.tags.filter(t => t.name !== name);
+      onConfigChange({ ...config, tags: newTags });
+    } catch (e: any) {
+      alert(e.message || 'Failed to delete tag');
+    }
+  };
+
+  const handlePriorityMove = async (tagName: string, routeIdx: number, direction: 'up' | 'down') => {
+    // Find routes associated with this tag, sorted by current priority
+    const tagRoutes = getTagRoutes(config.routes, tagName, config.tags.find(t => t.name === tagName)?.route_priority || {});
+    if (tagRoutes.length < 2) return;
+
+    const currentPos = tagRoutes.findIndex(r => r.routeIdx === routeIdx);
+    if (currentPos < 0) return;
+    const swapPos = direction === 'up' ? currentPos - 1 : currentPos + 1;
+    if (swapPos < 0 || swapPos >= tagRoutes.length) return;
+
+    // Build new route_priority: assign sequential priorities in the new order
+    const tag = config.tags.find(t => t.name === tagName);
+    if (!tag) return;
+
+    const newOrder = [...tagRoutes];
+    [newOrder[currentPos], newOrder[swapPos]] = [newOrder[swapPos], newOrder[currentPos]];
+
+    const newPriority: Record<string, number> = {};
+    newOrder.forEach((r, i) => {
+      newPriority[String(r.routeIdx)] = i;
+    });
+
+    try {
+      await api.patchTag(tagName, { route_priority: newPriority });
+      const newTags = config.tags.map(t =>
+        t.name === tagName ? { ...t, route_priority: newPriority } : t
+      );
+      onConfigChange({ ...config, tags: newTags });
+    } catch (e: any) {
+      alert(e.message || 'Failed to update tag priority');
+    }
   };
 
   return (
@@ -26,10 +71,13 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
       {adding && (
         <TagForm
           onSave={async (tag) => {
-            const newConfig = { ...config, tags: [...config.tags, tag] };
-            await api.updateConfig(newConfig);
-            onConfigChange(newConfig);
-            setAdding(false);
+            try {
+              await api.createTag(tag);
+              onConfigChange({ ...config, tags: [...config.tags, tag] });
+              setAdding(false);
+            } catch (e: any) {
+              alert(e.message || 'Failed to create tag');
+            }
           }}
           onCancel={() => setAdding(false)}
         />
@@ -38,9 +86,19 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {config.tags.map(tag => {
           const routeCount = config.routes.filter(r => r.tags.includes(tag.name)).length;
+          const isExpanded = expanded.has(tag.name);
+          const tagRoutes = getTagRoutes(config.routes, tag.name, tag.route_priority || {});
+
           return (
-            <Card key={tag.name} style={{ padding: '12px 16px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Card key={tag.name} style={{ padding: 0, overflow: 'hidden' }}>
+              {/* Header row */}
+              <div
+                style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  padding: '12px 16px', cursor: routeCount > 0 ? 'pointer' : 'default',
+                }}
+                onClick={() => routeCount > 0 && toggleExpand(tag.name)}
+              >
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   <div style={{
                     width: 4, height: 28, borderRadius: 2,
@@ -58,10 +116,54 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
                     {routeCount} route{routeCount !== 1 ? 's' : ''}
                   </span>
                 </div>
-                {!tag.is_auto && (
-                  <Button variant="danger" onClick={() => handleDelete(tag.name)} style={{ fontSize: 12, padding: '3px 10px' }}>Delete</Button>
-                )}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {routeCount > 0 && (
+                    <span style={{ fontSize: 14, color: 'var(--text-muted)', transition: 'transform 0.2s', transform: isExpanded ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                      ▼
+                    </span>
+                  )}
+                  {!tag.is_auto && (
+                    <Button variant="danger" onClick={(e: React.MouseEvent) => { e.stopPropagation(); handleDelete(tag.name); }} style={{ fontSize: 12, padding: '3px 10px' }}>Delete</Button>
+                  )}
+                </div>
               </div>
+
+              {/* Expandable route priority list */}
+              {isExpanded && tagRoutes.length > 0 && (
+                <div style={{ borderTop: '1px solid var(--border)', padding: '8px 16px 12px' }}>
+                  {tagRoutes.map((r, i) => {
+                    return (
+                      <div key={r.routeIdx} style={{
+                        display: 'flex', alignItems: 'center', gap: 8,
+                        padding: '6px 0',
+                        borderTop: i > 0 ? '1px solid var(--border)' : 'none',
+                      }}>
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)', width: 18, textAlign: 'center' }}>
+                          {i + 1}
+                        </span>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1 }}>
+                          <span style={{ fontSize: 13, fontWeight: 500 }}>{r.route.model}</span>
+                          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                            {config.providers[r.route.provider]?.name || r.route.provider}
+                          </span>
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                          <button
+                            disabled={i === 0}
+                            onClick={() => handlePriorityMove(tag.name, r.routeIdx, 'up')}
+                            style={{ background: 'var(--bg-input)', border: '1px solid var(--border)', color: 'var(--text-secondary)', borderRadius: 3, padding: '0 6px', cursor: i === 0 ? 'default' : 'pointer', fontSize: 10, lineHeight: '16px', opacity: i === 0 ? 0.3 : 1 }}
+                          >▲</button>
+                          <button
+                            disabled={i === tagRoutes.length - 1}
+                            onClick={() => handlePriorityMove(tag.name, r.routeIdx, 'down')}
+                            style={{ background: 'var(--bg-input)', border: '1px solid var(--border)', color: 'var(--text-secondary)', borderRadius: 3, padding: '0 6px', cursor: i === tagRoutes.length - 1 ? 'default' : 'pointer', fontSize: 10, lineHeight: '16px', opacity: i === tagRoutes.length - 1 ? 0.3 : 1 }}
+                          >▼</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </Card>
           );
         })}
@@ -74,6 +176,23 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
       </div>
     </div>
   );
+}
+
+/** Get routes associated with a tag, sorted by route_priority. */
+function getTagRoutes(routes: Route[], tagName: string, tagPriority?: Record<string, number> | null): { routeIdx: number; route: Route }[] {
+  const matched = routes
+    .map((route, idx) => ({ routeIdx: idx, route }))
+    .filter(({ route }) => route.tags.includes(tagName));
+
+  if (tagPriority && Object.keys(tagPriority).length > 0) {
+    matched.sort((a, b) => {
+      const pa = tagPriority[String(a.routeIdx)] ?? Infinity;
+      const pb = tagPriority[String(b.routeIdx)] ?? Infinity;
+      if (pa !== pb) return pa - pb;
+      return a.routeIdx - b.routeIdx;
+    });
+  }
+  return matched;
 }
 
 function TagForm({ onSave, onCancel }: { onSave: (tag: Tag) => void; onCancel: () => void }) {
@@ -91,7 +210,7 @@ function TagForm({ onSave, onCancel }: { onSave: (tag: Tag) => void; onCancel: (
           <input type="color" value={color} onChange={e => setColor(e.target.value)}
             style={{ width: 40, height: 36, padding: 2, cursor: 'pointer', background: 'none', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }} />
         </div>
-        <Button variant="primary" disabled={!name} onClick={() => onSave({ name, color, is_auto: false })}>Save</Button>
+        <Button variant="primary" disabled={!name} onClick={() => onSave({ name, color, is_auto: false, route_priority: {} })}>Save</Button>
         <Button variant="ghost" onClick={onCancel}>Cancel</Button>
       </div>
     </Card>

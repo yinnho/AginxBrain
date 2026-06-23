@@ -13,11 +13,14 @@ export function ProvidersPage({ config, onConfigChange }: { config: AppConfig; o
   const providerList = Object.entries(config.providers);
 
   const handleDelete = async (id: string) => {
-    const newProviders = { ...config.providers };
-    delete newProviders[id];
-    const newConfig = { ...config, providers: newProviders };
-    await api.updateConfig(newConfig);
-    onConfigChange(newConfig);
+    try {
+      await api.deleteProvider(id);
+      const newProviders = { ...config.providers };
+      delete newProviders[id];
+      onConfigChange({ ...config, providers: newProviders });
+    } catch (e: any) {
+      alert(e.message || 'Failed to delete provider');
+    }
   };
 
   const toggleKeyVisibility = (id: string) => {
@@ -31,23 +34,26 @@ export function ProvidersPage({ config, onConfigChange }: { config: AppConfig; o
         <Button variant="primary" onClick={() => setAdding(true)}>+ Add</Button>
       </div>
 
-      {(adding || editing) && (
+      {adding && (
         <ProviderForm
-          initial={editing ? { id: editing, ...config.providers[editing] } : undefined}
+          initial={undefined}
           onSave={async (id, provider) => {
-            const newConfig = { ...config, providers: { ...config.providers, [id]: provider } };
-            await api.updateConfig(newConfig);
-            onConfigChange(newConfig);
-            setAdding(false);
-            setEditing(null);
+            try {
+              await api.createProvider(id, provider);
+              onConfigChange({ ...config, providers: { ...config.providers, [id]: provider } });
+              setAdding(false);
+            } catch (e: any) {
+              alert(e.message || 'Failed to save provider');
+            }
           }}
-          onCancel={() => { setAdding(false); setEditing(null); }}
+          onCancel={() => { setAdding(false); }}
         />
       )}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {providerList.map(([id, p]) => (
-          <Card key={id} style={{ padding: '12px 16px' }}>
+          <div key={id} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <Card style={{ padding: '12px 16px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -75,6 +81,26 @@ export function ProvidersPage({ config, onConfigChange }: { config: AppConfig; o
               </div>
             </div>
           </Card>
+
+          {editing === id && (
+            <ProviderForm
+              initial={{ id, ...p }}
+              onSave={async (newId, provider) => {
+                try {
+                  const updated = await api.updateProvider(newId, provider);
+                  const newProviders = { ...config.providers };
+                  if (newId !== id) delete newProviders[id];
+                  newProviders[newId] = updated;
+                  onConfigChange({ ...config, providers: newProviders });
+                  setEditing(null);
+                } catch (e: any) {
+                  alert(e.message || 'Failed to save provider');
+                }
+              }}
+              onCancel={() => { setEditing(null); }}
+            />
+          )}
+          </div>
         ))}
         {providerList.length === 0 && (
           <div style={{ padding: 48, textAlign: 'center', color: 'var(--text-muted)', border: '1px dashed var(--border)', borderRadius: 'var(--radius-md)' }}>
@@ -116,7 +142,7 @@ function ProviderForm({ initial, onSave, onCancel }: {
         </div>
       </div>
       <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
-        <Button variant="primary" disabled={!valid} onClick={() => onSave(id, { name, base_url: baseUrl, api_key: apiKey, auth_type: authType as any })}>Save</Button>
+        <Button variant="primary" disabled={!valid} onClick={() => onSave(id, { name, base_url: baseUrl, api_key: apiKey, auth_type: authType as any, ws_url: initial?.ws_url })}>Save</Button>
         <Button variant="ghost" onClick={onCancel}>Cancel</Button>
       </div>
     </Card>

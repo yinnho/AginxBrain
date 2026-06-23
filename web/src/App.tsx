@@ -49,7 +49,6 @@ function App() {
   }, [refresh]);
 
   useEffect(() => {
-    api.getStatus().then(setStatus).catch(() => {});
     checkAuth();
   }, [checkAuth]);
 

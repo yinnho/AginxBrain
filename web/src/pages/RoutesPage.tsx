@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { AppConfig, GenerateImageResponse, Route, RouteFormat, TestResult } from '../lib/api';
-import { FORMAT_ENDPOINTS, FORMAT_MODALITIES, MODALITY_LABELS, SUPPORTED_MODALITIES } from '../lib/api';
+import { FORMAT_ENDPOINTS } from '../lib/api';
 import * as api from '../lib/api';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
@@ -20,40 +20,47 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
   const [imageResult, setImageResult] = useState<GenerateImageResponse | null>(null);
 
   const handleDelete = async (index: number) => {
-    const newRoutes = config.routes.filter((_, i) => i !== index);
-    const newConfig = { ...config, routes: newRoutes };
-    await api.updateConfig(newConfig);
-    onConfigChange(newConfig);
+    try {
+      await api.deleteRoute(index);
+      const newRoutes = config.routes.filter((_, i) => i !== index);
+      onConfigChange({ ...config, routes: newRoutes });
+    } catch (e: any) {
+      alert(e.message || 'Failed to delete route');
+    }
   };
 
-  const handleTest = async (index: number, tag: string) => {
+  const handleTest = async (index: number) => {
     setTesting(index);
     try {
-      const result = await api.testRoute(tag);
+      const result = await api.testRouteByIndex(index);
       setTestResults(prev => ({ ...prev, [index]: result }));
     } catch (e: any) {
-      setTestResults(prev => ({ ...prev, [index]: { success: false, tag, provider: '', model: '', format: '', latency_ms: 0, error: e.message, response: null } }));
+      setTestResults(prev => ({ ...prev, [index]: { success: false, tag: '', provider: '', model: '', format: '', latency_ms: 0, error: e.message, response: null } }));
     }
     setTesting(null);
   };
 
   const handleToggleEnabled = async (index: number) => {
-    const newRoutes = config.routes.map((r, i) =>
-      i === index ? { ...r, enabled: !r.enabled } : r
-    );
-    const newConfig = { ...config, routes: newRoutes };
-    await api.updateConfig(newConfig);
-    onConfigChange(newConfig);
+    try {
+      const updated = await api.patchRoute(index, { enabled: !config.routes[index].enabled });
+      const newRoutes = config.routes.map((r, i) => i === index ? updated : r);
+      onConfigChange({ ...config, routes: newRoutes });
+    } catch (e: any) {
+      alert(e.message || 'Failed to toggle route');
+    }
   };
 
   const handleMove = async (index: number, direction: -1 | 1) => {
     const target = index + direction;
     if (target < 0 || target >= config.routes.length) return;
-    const newRoutes = [...config.routes];
-    [newRoutes[index], newRoutes[target]] = [newRoutes[target], newRoutes[index]];
-    const newConfig = { ...config, routes: newRoutes };
-    await api.updateConfig(newConfig);
-    onConfigChange(newConfig);
+    try {
+      await api.moveRoute(index, direction);
+      const newRoutes = [...config.routes];
+      [newRoutes[index], newRoutes[target]] = [newRoutes[target], newRoutes[index]];
+      onConfigChange({ ...config, routes: newRoutes });
+    } catch (e: any) {
+      alert(e.message || 'Failed to move route');
+    }
   };
 
   const handleGenerateImage = async () => {
@@ -82,6 +89,17 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
     setImageLoading(false);
   };
 
+  /** Format badge color based on format type. */
+  const formatColor = (fmt: RouteFormat) => {
+    if (fmt === 'openai') return '#10a37f';
+    if (fmt === 'openai_responses') return '#6366f1';
+    if (fmt.includes('image') || fmt === 'dashscope_chat_image') return '#ec4899';
+    if (fmt.includes('video') || fmt === 'kling') return '#8b5cf6';
+    if (fmt.includes('tts')) return '#f97316';
+    if (fmt.includes('asr')) return '#06B6D4';
+    return '#d97706';
+  };
+
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
@@ -89,31 +107,30 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
         <Button variant="primary" onClick={() => setAdding(true)}>+ Add</Button>
       </div>
 
-      {(adding || editing !== null) && (
+      {adding && (
         <RouteForm
-          initial={editing !== null ? config.routes[editing] : undefined}
+          initial={undefined}
           providers={Object.keys(config.providers)}
           tags={config.tags.map(t => t.name)}
           onSave={async (route) => {
-            const newRoutes = editing !== null
-              ? config.routes.map((r, i) => i === editing ? route : r)
-              : [...config.routes, route];
-            const newConfig = { ...config, routes: newRoutes };
-            await api.updateConfig(newConfig);
-            onConfigChange(newConfig);
-            setAdding(false);
-            setEditing(null);
+            try {
+              await api.createRoute(route);
+              onConfigChange({ ...config, routes: [...config.routes, route] });
+              setAdding(false);
+            } catch (e: any) {
+              alert(e.message || 'Failed to save route');
+            }
           }}
-          onCancel={() => { setAdding(false); setEditing(null); }}
+          onCancel={() => { setAdding(false); }}
         />
       )}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {config.routes.map((route, i) => {
-          const tag = route.tags[0] || '';
           const tr = testResults[i];
           return (
-            <Card key={i} style={{ opacity: route.enabled ? 1 : 0.45, transition: 'opacity 0.2s' }}>
+            <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <Card style={{ opacity: route.enabled ? 1 : 0.45, transition: 'opacity 0.2s' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                 <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
                   {/* Ordering buttons */}
@@ -143,8 +160,7 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
                   <div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <span style={{ fontSize: 15, fontWeight: 600 }}>{route.model}</span>
-                      <Badge color={route.format === 'openai' ? '#10a37f' : route.format === 'openai_responses' ? '#6366f1' : route.format.includes('image') ? '#ec4899' : route.format.includes('video') || route.format === 'kling' ? '#8b5cf6' : route.format.includes('tts') ? '#f97316' : '#d97706'}>{route.format || 'openai'}</Badge>
-                      <Badge color={route.modality === 'chat' ? '#3B82F6' : route.modality === 'image_generation' ? '#ec4899' : route.modality === 'video_generation' ? '#8b5cf6' : route.modality === 'tts' ? '#f97316' : '#64748b'}>{MODALITY_LABELS[route.modality || 'chat'] || route.modality || 'chat'}</Badge>
+                      <Badge color={formatColor(route.format)}>{route.format || 'openai'}</Badge>
                     </div>
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
                       via <span style={{ color: 'var(--text-secondary)' }}>{route.provider}</span>
@@ -179,7 +195,7 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
                   </div>
                   <Button
                     variant={testing === i ? 'secondary' : 'success'}
-                    onClick={() => handleTest(i, tag)}
+                    onClick={() => handleTest(i)}
                     disabled={testing !== null || !route.enabled}
                     style={{ fontSize: 12, padding: '4px 12px' }}
                   >
@@ -221,6 +237,26 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
                 </div>
               )}
             </Card>
+
+            {editing === i && (
+              <RouteForm
+                initial={route}
+                providers={Object.keys(config.providers)}
+                tags={config.tags.map(t => t.name)}
+                onSave={async (newRoute) => {
+                  try {
+                    const updated = await api.updateRoute(i, newRoute);
+                    const newRoutes = config.routes.map((r, idx) => idx === i ? updated : r);
+                    onConfigChange({ ...config, routes: newRoutes });
+                    setEditing(null);
+                  } catch (e: any) {
+                    alert(e.message || 'Failed to save route');
+                  }
+                }}
+                onCancel={() => { setEditing(null); }}
+              />
+            )}
+            </div>
           );
         })}
         {config.routes.length === 0 && (
@@ -246,7 +282,7 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
             {imageLoading ? '⏳ Generating...' : '🎨 Generate'}
           </Button>
           <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-            Uses routes with modality=image_generation and image formats.
+            Uses routes with image formats.
           </span>
         </div>
         {imageResult && (
@@ -307,7 +343,6 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
   const [provider, setProvider] = useState(initial?.provider || providers[0] || '');
   const [selectedTags, setSelectedTags] = useState<string[]>(initial?.tags || []);
   const [format, setFormat] = useState<RouteFormat>(initial?.format || 'openai');
-  const [modality, setModality] = useState(initial?.modality || FORMAT_MODALITIES[initial?.format || 'openai'] || 'chat');
 
   const toggleTag = (tag: string) => {
     setSelectedTags(prev => prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag]);
@@ -316,7 +351,6 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
   const handleFormatChange = (newFormat: RouteFormat) => {
     setFormat(newFormat);
     setEndpoint(FORMAT_ENDPOINTS[newFormat] || '/v1/chat/completions');
-    setModality(FORMAT_MODALITIES[newFormat] || 'chat');
   };
 
   const valid = endpoint && model && provider && selectedTags.length > 0;
@@ -335,15 +369,12 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
           <option value="openai_responses">OpenAI Responses</option>
           <option value="openai_images">OpenAI Images</option>
           <option value="dashscope_image">DashScope Image</option>
+          <option value="dashscope_chat_image">DashScope Chat Image</option>
           <option value="dashscope_video">DashScope Video</option>
           <option value="dashscope_tts">DashScope TTS</option>
+          <option value="dashscope_asr">DashScope ASR</option>
           <option value="kling">Kling</option>
           <option value="minimax_image">MiniMax Image</option>
-        </Select>
-        <Select label="Modality" value={modality} onChange={e => setModality(e.target.value)}>
-          {SUPPORTED_MODALITIES.map(m => (
-            <option key={m} value={m}>{MODALITY_LABELS[m] || m}</option>
-          ))}
         </Select>
         <div style={{ gridColumn: '1 / -1' }}>
           <label style={{ display: 'block', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6, fontWeight: 500 }}>Tags</label>
@@ -362,7 +393,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
         </div>
       </div>
       <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
-        <Button variant="primary" disabled={!valid} onClick={() => onSave({ endpoint, model, provider, tags: selectedTags, format, modality, enabled: initial?.enabled ?? true })}>Save</Button>
+        <Button variant="primary" disabled={!valid} onClick={() => onSave({ endpoint, model, provider, tags: selectedTags, format, enabled: initial?.enabled ?? true })}>Save</Button>
         <Button variant="ghost" onClick={onCancel}>Cancel</Button>
       </div>
     </Card>

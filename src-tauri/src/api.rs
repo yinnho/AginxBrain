@@ -384,6 +384,276 @@ pub async fn set_current_tag(
     Ok(StatusCode::OK)
 }
 
+// ─── Fine-grained config mutations ──────────────────────────────────────
+// Each handler acquires the write lock only for the in-memory mutation + YAML
+// save (microseconds), never during network I/O. This avoids the 30s+ blocks
+// caused by holding a read/write lock across streaming proxy responses.
+
+/// Acquire write lock, mutate config, save to disk.
+async fn mutate_config<F, R>(state: &AppState, f: F) -> Result<R, ApiError>
+where
+    F: FnOnce(&mut AppConfig) -> Result<R, String>,
+{
+    let mut config = state.config.write().await;
+    let result = f(&mut config).map_err(ApiError::Validation)?;
+    save_config(&config).map_err(ApiError::from)?;
+    Ok(result)
+}
+
+// ─── Routes ─────────────────────────────────────────────────────────────
+
+// POST /api/routes
+pub async fn create_route(
+    State(state): State<AppState>,
+    Json(route): Json<crate::config::Route>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let index = mutate_config(&state, |config| {
+        validate_route(config, &route)?;
+        config.routes.push(route);
+        Ok(config.routes.len() - 1)
+    })
+    .await?;
+    Ok(Json(serde_json::json!({ "index": index })))
+}
+
+// PUT /api/routes/:index
+pub async fn update_route(
+    State(state): State<AppState>,
+    Path(index): Path<usize>,
+    Json(route): Json<crate::config::Route>,
+) -> Result<Json<crate::config::Route>, ApiError> {
+    let updated = mutate_config(&state, |config| {
+        validate_route(config, &route)?;
+        let r = config
+            .routes
+            .get_mut(index)
+            .ok_or_else(|| format!("route index {} out of bounds", index))?;
+        *r = route.clone();
+        Ok(route)
+    })
+    .await?;
+    Ok(Json(updated))
+}
+
+// PATCH /api/routes/:index
+#[derive(Deserialize)]
+pub struct PatchRouteRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+pub async fn patch_route(
+    State(state): State<AppState>,
+    Path(index): Path<usize>,
+    Json(patch): Json<PatchRouteRequest>,
+) -> Result<Json<crate::config::Route>, ApiError> {
+    let updated = mutate_config(&state, |config| {
+        let r = config
+            .routes
+            .get_mut(index)
+            .ok_or_else(|| format!("route index {} out of bounds", index))?;
+        if let Some(enabled) = patch.enabled {
+            r.enabled = enabled;
+        }
+        Ok(r.clone())
+    })
+    .await?;
+    Ok(Json(updated))
+}
+
+// DELETE /api/routes/:index
+pub async fn delete_route(
+    State(state): State<AppState>,
+    Path(index): Path<usize>,
+) -> Result<StatusCode, ApiError> {
+    mutate_config(&state, |config| {
+        if index >= config.routes.len() {
+            return Err(format!("route index {} out of bounds", index));
+        }
+        config.routes.remove(index);
+        Ok(())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// POST /api/routes/:index/move
+#[derive(Deserialize)]
+pub struct MoveRouteRequest {
+    pub direction: i32, // -1 = up, +1 = down
+}
+
+pub async fn move_route(
+    State(state): State<AppState>,
+    Path(index): Path<usize>,
+    Json(req): Json<MoveRouteRequest>,
+) -> Result<Json<crate::config::Route>, ApiError> {
+    let moved = mutate_config(&state, |config| {
+        let target = (index as i32) + req.direction;
+        if target < 0 || target as usize >= config.routes.len() {
+            return Err(format!("cannot move route {} in direction {}", index, req.direction));
+        }
+        config.routes.swap(index, target as usize);
+        Ok(config
+            .routes
+            .get(target as usize)
+            .cloned()
+            .ok_or("internal: swap failed")?)
+    })
+    .await?;
+    Ok(Json(moved))
+}
+
+// ─── Providers ───────────────────────────────────────────────────────────
+
+// POST /api/providers
+#[derive(Deserialize)]
+pub struct CreateProviderRequest {
+    pub id: String,
+    pub provider: crate::config::Provider,
+}
+
+pub async fn create_provider(
+    State(state): State<AppState>,
+    Json(req): Json<CreateProviderRequest>,
+) -> Result<Json<crate::config::Provider>, ApiError> {
+    let provider = mutate_config(&state, |config| {
+        if req.id.trim().is_empty() {
+            return Err("provider id cannot be empty".to_string());
+        }
+        validate_provider(&req.provider)?;
+        config.providers.insert(req.id.clone(), req.provider.clone());
+        Ok(req.provider)
+    })
+    .await?;
+    Ok(Json(provider))
+}
+
+// PUT /api/providers/:id
+pub async fn update_provider(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(provider): Json<crate::config::Provider>,
+) -> Result<Json<crate::config::Provider>, ApiError> {
+    let updated = mutate_config(&state, |config| {
+        validate_provider(&provider)?;
+        config.providers.insert(id.clone(), provider.clone());
+        Ok(provider)
+    })
+    .await?;
+    Ok(Json(updated))
+}
+
+// DELETE /api/providers/:id
+pub async fn delete_provider(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    mutate_config(&state, |config| {
+        if config.providers.remove(&id).is_none() {
+            return Err(format!("provider '{}' not found", id));
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Tags ───────────────────────────────────────────────────────────────
+
+// POST /api/tags
+pub async fn create_tag(
+    State(state): State<AppState>,
+    Json(tag): Json<crate::config::Tag>,
+) -> Result<Json<crate::config::Tag>, ApiError> {
+    let tag = mutate_config(&state, |config| {
+        if tag.name.trim().is_empty() {
+            return Err("tag name cannot be empty".to_string());
+        }
+        if config.tags.iter().any(|t| t.name == tag.name) {
+            return Err(format!("tag '{}' already exists", tag.name));
+        }
+        config.tags.push(tag.clone());
+        Ok(tag)
+    })
+    .await?;
+    Ok(Json(tag))
+}
+
+// PATCH /api/tags/:name
+#[derive(Deserialize, Default)]
+pub struct PatchTagRequest {
+    #[serde(default)]
+    pub route_priority: Option<std::collections::HashMap<String, u32>>,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+pub async fn patch_tag(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(patch): Json<PatchTagRequest>,
+) -> Result<Json<crate::config::Tag>, ApiError> {
+    let updated = mutate_config(&state, |config| {
+        let t = config
+            .tags
+            .iter_mut()
+            .find(|t| t.name == name)
+            .ok_or_else(|| format!("tag '{}' not found", name))?;
+        if let Some(rp) = patch.route_priority {
+            t.route_priority = rp;
+        }
+        if let Some(color) = patch.color {
+            t.color = color;
+        }
+        Ok(t.clone())
+    })
+    .await?;
+    Ok(Json(updated))
+}
+
+// DELETE /api/tags/:name
+pub async fn delete_tag(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    mutate_config(&state, |config| {
+        let before = config.tags.len();
+        config.tags.retain(|t| t.name != name);
+        if config.tags.len() == before {
+            return Err(format!("tag '{}' not found", name));
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Validation helpers ──────────────────────────────────────────────────
+
+fn validate_provider(provider: &crate::config::Provider) -> Result<(), String> {
+    if provider.base_url.trim().is_empty() {
+        return Err("provider has empty base_url".to_string());
+    }
+    if provider.api_key.trim().is_empty() {
+        return Err("provider has empty api_key".to_string());
+    }
+    Ok(())
+}
+
+fn validate_route(config: &AppConfig, route: &crate::config::Route) -> Result<(), String> {
+    if route.model.trim().is_empty() {
+        return Err("route has empty model".to_string());
+    }
+    if route.provider.trim().is_empty() {
+        return Err("route has empty provider".to_string());
+    }
+    if !config.providers.contains_key(&route.provider) {
+        return Err(format!("route references unknown provider '{}'", route.provider));
+    }
+    Ok(())
+}
+
 // POST /api/takeover/claude
 pub async fn takeover_claude_handler(
     State(state): State<AppState>,
@@ -474,6 +744,22 @@ pub async fn test_route_handler(
     Json(req): Json<TestRequest>,
 ) -> Json<TestResult> {
     let result = proxy::test_route(&state, &req.tag, &req.prompt).await;
+    Json(result)
+}
+
+// POST /api/test/route
+#[derive(Deserialize)]
+pub struct TestRouteRequest {
+    pub index: usize,
+    #[serde(default = "default_test_prompt")]
+    pub prompt: String,
+}
+
+pub async fn test_route_by_index_handler(
+    State(state): State<AppState>,
+    Json(req): Json<TestRouteRequest>,
+) -> Json<TestResult> {
+    let result = proxy::test_route_by_index(&state, req.index, &req.prompt).await;
     Json(result)
 }
 

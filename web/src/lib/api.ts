@@ -5,6 +5,8 @@ export interface Provider {
   base_url: string;
   api_key: string;
   auth_type: 'bearer' | 'x_api_key' | 'x_goog_api_key';
+  /** Optional WebSocket URL (dashscope TTS/ASR). Preserved on edit if set. */
+  ws_url?: string;
 }
 
 export type RouteFormat =
@@ -15,40 +17,10 @@ export type RouteFormat =
   | 'dashscope_image'
   | 'dashscope_video'
   | 'dashscope_tts'
+  | 'dashscope_asr'
+  | 'dashscope_chat_image'
   | 'kling'
   | 'minimax_image';
-
-export const SUPPORTED_MODALITIES = [
-  'chat',
-  'vision',
-  'image_generation',
-  'video_generation',
-  'tts',
-  'asr',
-  'embedding',
-] as const;
-
-export const MODALITY_LABELS: Record<string, string> = {
-  chat: 'Chat',
-  vision: 'Vision',
-  image_generation: 'Image',
-  video_generation: 'Video',
-  tts: 'TTS',
-  asr: 'ASR',
-  embedding: 'Embedding',
-};
-
-export const FORMAT_MODALITIES: Record<RouteFormat, string> = {
-  openai: 'chat',
-  anthropic: 'chat',
-  openai_responses: 'chat',
-  openai_images: 'image_generation',
-  dashscope_image: 'image_generation',
-  minimax_image: 'image_generation',
-  dashscope_video: 'video_generation',
-  kling: 'video_generation',
-  dashscope_tts: 'tts',
-};
 
 export const FORMAT_ENDPOINTS: Record<RouteFormat, string> = {
   openai: '/v1/chat/completions',
@@ -56,8 +28,10 @@ export const FORMAT_ENDPOINTS: Record<RouteFormat, string> = {
   openai_responses: '/v1/responses',
   openai_images: '/v1/images/generations',
   dashscope_image: '/api/v1/services/aigc/text2image/image-synthesis',
+  dashscope_chat_image: '/chat/completions',
   dashscope_video: '/api/v1/services/aigc/video-generation/video-synthesis',
   dashscope_tts: '/api/v1/services/aigc/text-to-speech/stream',
+  dashscope_asr: '/v1/chat/completions',
   kling: '/v1/videos/text2video',
   minimax_image: '/v1/image_generation',
 };
@@ -69,13 +43,13 @@ export interface Route {
   tags: string[];
   format: RouteFormat;
   enabled: boolean;
-  modality: string;
 }
 
 export interface Tag {
   name: string;
   color: string;
   is_auto: boolean;
+  route_priority: Record<string, number>;
 }
 
 export interface AppConfig {
@@ -333,6 +307,127 @@ export async function setCurrentTag(tag: string): Promise<void> {
   await checkOk(res);
 }
 
+// ─── Fine-grained route CRUD ────────────────────────────────────────────
+
+export async function createRoute(route: Route): Promise<{ index: number }> {
+  const res = await fetch(`${API_BASE}/routes`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify(route),
+  });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function updateRoute(index: number, route: Route): Promise<Route> {
+  const res = await fetch(`${API_BASE}/routes/${index}`, {
+    method: 'PUT',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify(route),
+  });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function patchRoute(index: number, patch: { enabled?: boolean }): Promise<Route> {
+  const res = await fetch(`${API_BASE}/routes/${index}`, {
+    method: 'PATCH',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify(patch),
+  });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function deleteRoute(index: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/routes/${index}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  await checkOk(res);
+}
+
+export async function moveRoute(index: number, direction: -1 | 1): Promise<Route> {
+  const res = await fetch(`${API_BASE}/routes/${index}/move`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify({ direction }),
+  });
+  await checkOk(res);
+  return res.json();
+}
+
+// ─── Fine-grained provider CRUD ─────────────────────────────────────────
+
+export async function createProvider(id: string, provider: Provider): Promise<Provider> {
+  const res = await fetch(`${API_BASE}/providers`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify({ id, provider }),
+  });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function updateProvider(id: string, provider: Provider): Promise<Provider> {
+  const res = await fetch(`${API_BASE}/providers/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify(provider),
+  });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function deleteProvider(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/providers/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  await checkOk(res);
+}
+
+// ─── Fine-grained tag CRUD ──────────────────────────────────────────────
+
+export async function createTag(tag: Tag): Promise<Tag> {
+  const res = await fetch(`${API_BASE}/tags`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify(tag),
+  });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function patchTag(
+  name: string,
+  patch: { route_priority?: Record<string, number>; color?: string }
+): Promise<Tag> {
+  const res = await fetch(`${API_BASE}/tags/${encodeURIComponent(name)}`, {
+    method: 'PATCH',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify(patch),
+  });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function deleteTag(name: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/tags/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  await checkOk(res);
+}
+
 export async function getStatus(): Promise<Status> {
   const res = await fetch(`${API_BASE}/status`, { credentials: 'include' });
   await checkOk(res);
@@ -415,6 +510,17 @@ export async function testRoute(tag: string, prompt?: string): Promise<TestResul
     headers: jsonHeaders(),
     credentials: 'include',
     body: JSON.stringify({ tag, prompt }),
+  });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function testRouteByIndex(index: number, prompt?: string): Promise<TestResult> {
+  const res = await fetch(`${API_BASE}/test/route`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify({ index, prompt }),
   });
   await checkOk(res);
   return res.json();

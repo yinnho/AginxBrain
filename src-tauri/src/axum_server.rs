@@ -1,10 +1,12 @@
 use crate::config::AppState;
+use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::response::Response;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::compression::CompressionLayer;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::{Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
@@ -124,7 +126,18 @@ pub async fn start(state: AppState) -> (String, u16) {
         .route("/usage/summary", axum::routing::get(crate::api::usage_summary))
         .route("/config", axum::routing::get(crate::api::get_config).put(crate::api::update_config))
         .route("/current-tag", axum::routing::put(crate::api::set_current_tag))
+        // Fine-grained route CRUD (replaces bulk PUT /api/config for these ops)
+        .route("/routes", axum::routing::post(crate::api::create_route))
+        .route("/routes/{index}", axum::routing::put(crate::api::update_route).patch(crate::api::patch_route).delete(crate::api::delete_route))
+        .route("/routes/{index}/move", axum::routing::post(crate::api::move_route))
+        // Fine-grained provider CRUD
+        .route("/providers", axum::routing::post(crate::api::create_provider))
+        .route("/providers/{id}", axum::routing::put(crate::api::update_provider).delete(crate::api::delete_provider))
+        // Fine-grained tag CRUD
+        .route("/tags", axum::routing::post(crate::api::create_tag))
+        .route("/tags/{name}", axum::routing::patch(crate::api::patch_tag).delete(crate::api::delete_tag))
         .route("/test", axum::routing::post(crate::api::test_route_handler))
+        .route("/test/route", axum::routing::post(crate::api::test_route_by_index_handler))
         .route("/brain/generate/image", axum::routing::post(crate::api::generate_image_handler))
         .route("/config/export", axum::routing::post(crate::api::export_config))
         .route("/config/import", axum::routing::post(crate::api::import_config))
@@ -170,6 +183,7 @@ pub async fn start(state: AppState) -> (String, u16) {
         // v1 uses 200MB; axum's default is 2MB which causes silent failures.
         .layer(RequestBodyLimitLayer::new(200 * 1024 * 1024))
         .layer(CorsLayer::permissive())
+        .layer(CompressionLayer::new())
         .fallback(fallback_handler)
         .with_state(state);
 
@@ -302,11 +316,10 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
 
         if let Some(content) = Asset::get(file_path) {
             let ct = content.metadata.mimetype();
-            log::info!("[Fallback] GET {} → 200 (embedded, {})", uri.path(), ct);
             return (
                 StatusCode::OK,
                 [("content-type", ct)],
-                content.data.to_vec(),
+                Body::from(content.data.to_vec()),
             )
                 .into_response();
         }
@@ -316,17 +329,15 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
             .is_some();
         if !has_extension {
             if let Some(html) = Asset::get("index.html") {
-                log::info!("[Fallback] GET {} → 200 (SPA fallback)", uri.path());
                 return (
                     StatusCode::OK,
                     [("content-type", "text/html; charset=utf-8")],
-                    html.data.to_vec(),
+                    Body::from(html.data.to_vec()),
                 )
                     .into_response();
             }
         }
 
-        log::warn!("[Fallback] GET {} → 404 (not in embedded assets)", uri.path());
         (
             StatusCode::NOT_FOUND,
             [("content-type", "text/plain")],

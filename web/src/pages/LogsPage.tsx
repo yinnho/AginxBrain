@@ -54,8 +54,24 @@ export function LogsPage() {
 
   useEffect(() => {
     refresh();
-    const interval = setInterval(refresh, 3000);
-    return () => clearInterval(interval);
+    // Only poll when tab is visible, and at a slower interval
+    let interval: ReturnType<typeof setInterval> | null = null;
+    const startPolling = () => {
+      if (!interval) interval = setInterval(refresh, 8000);
+    };
+    const stopPolling = () => {
+      if (interval) { clearInterval(interval); interval = null; }
+    };
+    const handleVisibility = () => {
+      if (document.hidden) stopPolling();
+      else { refresh(); startPolling(); }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    startPolling();
+    return () => {
+      stopPolling();
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, [from, to]);
 
   const totals = useMemo(() => {

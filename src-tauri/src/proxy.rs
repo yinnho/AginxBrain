@@ -1,4 +1,4 @@
-use crate::config::{AppState, Provider, ProviderFormat, Route};
+use crate::config::{AppState, AppConfig, Provider, ProviderFormat, Route};
 use crate::convert;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -159,47 +159,51 @@ async fn parse_body(body: Body) -> Result<Value, ProxyError> {
 // Route selection helpers
 // ---------------------------------------------------------------------------
 
-/// Find all candidate routes for a tag in priority order (array index).
-/// Infer the expected modality from a tag name. If any enabled route carries
-/// this tag, use its modality. Otherwise fall back to a convention mapping
-/// (image → image_generation, tts → tts, audio → audio, vision → vision,
-/// everything else → chat). This prevents cross-modality fallback: a chat
-/// request must never fall back to an image route, and vice versa.
-fn infer_modality_from_tag(tag: &str, routes: &[Route]) -> String {
-    if let Some(route) = routes.iter().find(|r| r.enabled && r.tags.iter().any(|t| t == tag)) {
-        return route.modality.clone();
-    }
-    match tag {
-        "image" => "image_generation".to_string(),
-        "tts" => "tts".to_string(),
-        "vision" => "vision".to_string(),
-        "audio" | "asr" => "audio".to_string(),
-        _ => "chat".to_string(),
-    }
-}
+/// Filters out disabled routes. Three-tier fallback:
+/// 1. Exact tag match → all matching enabled routes
+/// 2. Routes tagged "auto"
+/// 3. All enabled routes as last resort
+/// Modality isolation is handled by tags themselves (e.g. the "image" tag
+/// only has image routes), so no category filtering is needed here.
+fn find_candidate_routes<'a>(
+    routes: &'a [Route],
+    tag: &str,
+    tags: &[crate::config::Tag],
+) -> Vec<(usize, &'a Route)> {
+    let exact: Vec<(usize, &_)> = routes
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.enabled && r.tags.iter().any(|t| t == tag))
+        .collect();
+    let candidates = if !exact.is_empty() {
+        exact
+    } else {
+        let auto: Vec<(usize, &_)> = routes
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.enabled && r.tags.iter().any(|t| t == "auto"))
+            .collect();
+        if !auto.is_empty() {
+            auto
+        } else {
+            routes
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.enabled)
+                .collect()
+        }
+    };
 
-/// Filters out disabled routes. Three-tier fallback, scoped to the expected
-/// modality so that chat requests never fall back to image/TTS routes (and
-/// vice versa):
-/// 1. Exact tag match + modality → all matching enabled routes
-/// 2. Routes tagged "auto" + modality
-/// 3. All enabled routes with matching modality as last resort
-fn find_candidate_routes<'a>(routes: &'a [Route], tag: &str, expected_modality: &str) -> Vec<&'a Route> {
-    let exact: Vec<&Route> = routes
-        .iter()
-        .filter(|r| r.enabled && r.tags.iter().any(|t| t == tag) && r.modality == expected_modality)
-        .collect();
-    if !exact.is_empty() {
-        return exact;
+    // Sort by tag's route_priority if configured
+    let mut sorted = candidates;
+    if let Some(tag_config) = tags.iter().find(|t| t.name == tag) {
+        if !tag_config.route_priority.is_empty() {
+            sorted.sort_by_key(|(idx, _)| {
+                tag_config.route_priority.get(&idx.to_string()).copied().unwrap_or(u32::MAX)
+            });
+        }
     }
-    let auto: Vec<&Route> = routes
-        .iter()
-        .filter(|r| r.enabled && r.tags.iter().any(|t| t == "auto") && r.modality == expected_modality)
-        .collect();
-    if !auto.is_empty() {
-        return auto;
-    }
-    routes.iter().filter(|r| r.enabled && r.modality == expected_modality).collect()
+    sorted
 }
 
 /// Whether a proxy error is retryable (connection-level failure or upstream 5xx).
@@ -341,15 +345,18 @@ async fn handle_proxy(
     );
 
     let start = std::time::Instant::now();
-    let config = state.config.read().await;
+
+    // Read config and immediately drop the lock to avoid blocking admin config writes.
+    // Clone the entire config — it's small (5.8KB) and avoids holding RwLockReadGuard
+    // for the duration of streaming responses (which can be 30+ seconds).
+    let config = state.config.read().await.clone();
 
     // 1. Resolve tag from model, purely from configured tag names
     let tag = resolve_tag_from_model(&request_model, &config.tags)
         .unwrap_or_else(|| config.current_tag.clone());
 
-    // 2. Infer modality from tag + routes, then find candidates scoped to that modality
-    let expected_modality = infer_modality_from_tag(&tag, &config.routes);
-    let candidates = find_candidate_routes(&config.routes, &tag, &expected_modality);
+    // 2. Find candidate routes for this tag (sorted by tag's route_priority)
+    let candidates = find_candidate_routes(&config.routes, &tag, &config.tags);
     if candidates.is_empty() {
         let _ = crate::db::insert_usage_log(
             &state.db,
@@ -359,7 +366,7 @@ async fn handle_proxy(
                 provider: "".into(),
                 model: "".into(),
                 request_model: request_model.clone(),
-                modality: expected_modality.clone(),
+                modality: String::new(),
                 input_tokens: None,
                 output_tokens: None,
                 latency_ms: start.elapsed().as_millis() as i64,
@@ -373,7 +380,7 @@ async fn handle_proxy(
 
     let mut last_error: Option<ProxyError> = None;
 
-    for (attempt, route) in candidates.iter().enumerate() {
+    for (attempt, (_route_idx, route)) in candidates.iter().enumerate() {
         if attempt > 0 {
             log::warn!("[Proxy] {} failover: trying route #{} (provider={}, model={})",
                 tag, attempt + 1, route.provider, route.model);
@@ -399,12 +406,15 @@ async fn handle_proxy(
             continue;
         }
 
-        // 4. Non-chat capabilities (image/tts/audio) are dispatched by modality
+        // 4. Non-chat capabilities (image/tts/audio) are dispatched by format
         //    and early-return. They MUST NOT fall through to the chat fwd_body /
         //    streaming conversion below — their bodies are not chat-shaped.
         if !is_chat_format(provider_format) {
-            match route.modality.as_str() {
-                "image_generation" => {
+            match provider_format {
+                ProviderFormat::OpenaiImages
+                | ProviderFormat::DashscopeImage
+                | ProviderFormat::DashscopeChatImage
+                | ProviderFormat::MinimaxImage => {
                     match handle_image_request(state.clone(), caller_key_id, route, provider, &body, start).await {
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
@@ -414,7 +424,7 @@ async fn handle_proxy(
                         }
                     }
                 }
-                "tts" => {
+                ProviderFormat::DashscopeTts => {
                     match handle_tts_request(state.clone(), caller_key_id, route, provider, &body, start).await {
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
@@ -424,7 +434,7 @@ async fn handle_proxy(
                         }
                     }
                 }
-                "audio" | "asr" => {
+                ProviderFormat::DashscopeAsr => {
                     match handle_asr_request(state.clone(), caller_key_id, route, provider, &body, start).await {
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
@@ -436,7 +446,7 @@ async fn handle_proxy(
                 }
                 other => {
                     last_error = Some(ProxyError::Upstream(format!(
-                        "modality '{}' with non-chat format {:?} is not supported", other, provider_format
+                        "format {:?} is not supported for non-chat dispatch", other
                     )));
                     continue;
                 }
@@ -612,11 +622,11 @@ async fn handle_proxy(
             status.canonical_reason().unwrap_or("?"),
             &err_body[..err_body.len().min(300)]
         );
-        // 5xx server errors → retryable, try next candidate
-        if status_code >= 500 {
+        // 5xx server errors and 429 (rate limit) → retryable, try next candidate
+        if status_code >= 500 || status_code == 429 {
             let err = ProxyError::Upstream(format!("HTTP {}: {}",
                 status_code, &err_body[..err_body.len().min(200)]));
-            log::warn!("[Proxy] upstream 5xx (retryable): {}", err);
+            log::warn!("[Proxy] upstream {} (retryable): {}", status_code, err);
             last_error = Some(err);
             continue;
         }
@@ -632,7 +642,7 @@ async fn handle_proxy(
                 provider: provider.name.clone(),
                 model: route.model.clone(),
                 request_model: request_model.clone(),
-                modality: route.modality.clone(),
+                modality: format!("{:?}", route.format),
                 input_tokens: None,
                 output_tokens: None,
                 latency_ms: start.elapsed().as_millis() as i64,
@@ -662,7 +672,7 @@ async fn handle_proxy(
             provider: provider.name.clone(),
             model: route.model.clone(),
             request_model: request_model.clone(),
-            modality: route.modality.clone(),
+            modality: format!("{:?}", route.format),
             input_tokens: None,
             output_tokens: None,
             latency_ms: start.elapsed().as_millis() as i64,
@@ -993,12 +1003,12 @@ async fn handle_count_tokens(
         .to_string();
     log::info!("[Proxy] count_tokens request: protocol={}, model={}", client_protocol, request_model);
 
-    let config = state.config.read().await;
+    let config = state.config.read().await.clone();
 
     let tag = resolve_tag_from_model(&request_model, &config.tags)
         .unwrap_or_else(|| config.current_tag.clone());
 
-    let candidates = find_candidate_routes(&config.routes, &tag, "chat");
+    let candidates = find_candidate_routes(&config.routes, &tag, &config.tags);
     if candidates.is_empty() {
         let _ = crate::db::insert_usage_log(
             &state.db,
@@ -1022,7 +1032,7 @@ async fn handle_count_tokens(
 
     let mut last_error: Option<ProxyError> = None;
 
-    for (attempt, route) in candidates.iter().enumerate() {
+    for (attempt, (_route_idx, route)) in candidates.iter().enumerate() {
         if attempt > 0 {
             log::warn!("[Proxy] count_tokens {} failover: trying route #{} (provider={}, model={})",
                 tag, attempt + 1, route.provider, route.model);
@@ -1030,10 +1040,10 @@ async fn handle_count_tokens(
 
         if !is_chat_format(&route.format) {
             let err = ProxyError::Upstream(format!(
-                "count_tokens is not supported for route format {:?} (modality={})",
-                route.format, route.modality
+                "count_tokens is not supported for route format {:?}",
+                route.format
             ));
-            log::warn!("[Proxy] count_tokens skipping non-chat route: {}", err);
+            log::warn!("[Proxy] count_tokens skipping route: {}", err);
             last_error = Some(err);
             continue;
         }
@@ -1189,8 +1199,8 @@ fn extract_usage_from_sse_buffer(buf: &[u8], format: &ProviderFormat) -> (Option
                 if let Some(usage) = json.get("usage") {
                     match format {
                         ProviderFormat::Anthropic | ProviderFormat::OpenaiResponses => {
-                            if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
-                                input = Some(v);
+                            if let Some(total) = anthropic_total_input(usage) {
+                                input = Some(total);
                             }
                             if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
                                 output = Some(v);
@@ -1214,13 +1224,34 @@ fn extract_usage_from_sse_buffer(buf: &[u8], format: &ProviderFormat) -> (Option
     (input, output)
 }
 
+/// Sum the total input tokens from an Anthropic-style usage object, including
+/// prompt-cache hits. Providers report only the *uncached* portion in
+/// `input_tokens` when caching is used; the cached portion is in
+/// `cache_creation_input_tokens` / `cache_read_input_tokens`. Without this
+/// sum, cached requests log tiny input token counts (e.g. 2).
+fn anthropic_total_input(usage: &Value) -> Option<i64> {
+    let base = usage.get("input_tokens").and_then(|v| v.as_i64());
+    if base.is_none() {
+        return None;
+    }
+    let cache_create = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    Some(base.unwrap() + cache_create + cache_read)
+}
+
 /// Extract input/output tokens from an upstream response body.
 fn extract_usage_tokens(value: &Value, format: &ProviderFormat) -> (Option<i64>, Option<i64>) {
     match format {
-        ProviderFormat::Anthropic => {
+        ProviderFormat::Anthropic | ProviderFormat::OpenaiResponses => {
             let input = value
-                .pointer("/usage/input_tokens")
-                .and_then(|v| v.as_i64());
+                .pointer("/usage")
+                .and_then(|u| anthropic_total_input(u));
             let output = value
                 .pointer("/usage/output_tokens")
                 .and_then(|v| v.as_i64());
@@ -1232,15 +1263,6 @@ fn extract_usage_tokens(value: &Value, format: &ProviderFormat) -> (Option<i64>,
                 .and_then(|v| v.as_i64());
             let output = value
                 .pointer("/usage/completion_tokens")
-                .and_then(|v| v.as_i64());
-            (input, output)
-        }
-        ProviderFormat::OpenaiResponses => {
-            let input = value
-                .pointer("/usage/input_tokens")
-                .and_then(|v| v.as_i64());
-            let output = value
-                .pointer("/usage/output_tokens")
                 .and_then(|v| v.as_i64());
             (input, output)
         }
@@ -1602,10 +1624,10 @@ pub async fn generate_image(state: &AppState, req: GenerateImageRequest) -> Gene
     let (tag, candidates, providers) = {
         let config = state.config.read().await;
         let tag = req.tag.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| config.current_tag.clone());
-        let candidates: Vec<Route> = find_candidate_routes(&config.routes, &tag, "image_generation")
+        let candidates: Vec<Route> = find_candidate_routes(&config.routes, &tag, &config.tags)
             .into_iter()
-            .filter(|r| is_image_format(&r.format))
-            .cloned()
+            .filter(|(_, r)| is_image_format(&r.format))
+            .map(|(_, r)| r.clone())
             .collect();
         (tag, candidates, config.providers.clone())
     };
@@ -2266,59 +2288,35 @@ pub struct TestResult {
     pub response: Option<Value>,
 }
 
-pub async fn test_route(
+/// Send a test request to a single specific route (no failover).
+/// Returns the TestResult directly — either success or the specific error.
+async fn send_test_to_route(
     state: &AppState,
+    config: &AppConfig,
+    route: &Route,
     tag: &str,
     prompt: &str,
 ) -> TestResult {
-    let config = state.config.read().await;
-
-    // Find candidate routes (same logic as proxy: enabled, priority order, modality-scoped)
-    let expected_modality = infer_modality_from_tag(tag, &config.routes);
-    let candidates = find_candidate_routes(&config.routes, tag, &expected_modality);
-    if candidates.is_empty() {
+    if !is_chat_format(&route.format) {
         return TestResult {
             success: false,
             tag: tag.to_string(),
             provider: String::new(),
-            model: String::new(),
-            format: String::new(),
+            model: route.model.clone(),
+            format: format!("{:?}", route.format),
             latency_ms: 0,
-            error: Some(format!("no enabled route found for tag '{}'", tag)),
+            error: Some(format!(
+                "route format {:?} is not yet supported by the chat test endpoint",
+                route.format
+            )),
             response: None,
         };
     }
 
-    let mut last_result: Option<TestResult> = None;
-
-    for (attempt, route) in candidates.iter().enumerate() {
-        if attempt > 0 {
-            log::warn!("[Test] {} failover: trying route #{} (provider={}, model={})",
-                tag, attempt + 1, route.provider, route.model);
-        }
-
-        if !is_chat_format(&route.format) {
-            let result = TestResult {
-                success: false,
-                tag: tag.to_string(),
-                provider: String::new(),
-                model: route.model.clone(),
-                format: format!("{:?}", route.format),
-                latency_ms: 0,
-                error: Some(format!(
-                    "route format {:?} (modality={}) is not yet supported by the chat test endpoint",
-                    route.format, route.modality
-                )),
-                response: None,
-            };
-            last_result = Some(result);
-            continue;
-        }
-
     let provider = match config.providers.get(&route.provider) {
         Some(p) => p,
         None => {
-            let result = TestResult {
+            return TestResult {
                 success: false,
                 tag: tag.to_string(),
                 provider: String::new(),
@@ -2328,14 +2326,12 @@ pub async fn test_route(
                 error: Some(format!("provider '{}' not found", route.provider)),
                 response: None,
             };
-            last_result = Some(result);
-            continue;
         }
     };
 
     // Validate API key
     if provider.api_key.is_empty() || provider.api_key.starts_with("sk-your-") {
-        let result = TestResult {
+        return TestResult {
             success: false,
             tag: tag.to_string(),
             provider: provider.name.clone(),
@@ -2349,8 +2345,6 @@ pub async fn test_route(
             )),
             response: None,
         };
-        last_result = Some(result);
-        continue;
     }
 
     // Construct a minimal Anthropic Messages request
@@ -2365,14 +2359,12 @@ pub async fn test_route(
     // Convert based on provider format
     let fwd_body = match route.format {
         ProviderFormat::Anthropic => {
-            // Anthropic provider: don't strip thinking, provider supports it
             let mut b = anthropic_body.clone();
             b["model"] = Value::String(route.model.clone());
             normalize_roles(&mut b);
             b
         }
         ProviderFormat::Openai => {
-            // OpenAI Chat: conversion function handles thinking → reasoning_content
             let mut b = anthropic_body.clone();
             normalize_roles(&mut b);
             convert::anthropic_to_openai_request(&b, &route.model)
@@ -2383,7 +2375,21 @@ pub async fn test_route(
             strip_thinking(&mut b);
             convert::anthropic_to_responses_request(&b, &route.model)
         }
-        _ => unreachable!("non-chat formats are filtered before test request conversion"),
+        _ => {
+            return TestResult {
+                success: false,
+                tag: tag.to_string(),
+                provider: String::new(),
+                model: route.model.clone(),
+                format: format!("{:?}", route.format),
+                latency_ms: 0,
+                error: Some(format!(
+                    "route format {:?} is not yet supported by the chat test endpoint",
+                    route.format
+                )),
+                response: None,
+            };
+        }
     };
 
     // Build URL
@@ -2416,7 +2422,7 @@ pub async fn test_route(
     {
         Ok(r) => r,
         Err(e) => {
-            let result = TestResult {
+            return TestResult {
                 success: false,
                 tag: tag.to_string(),
                 provider: provider.name.clone(),
@@ -2426,8 +2432,6 @@ pub async fn test_route(
                 error: Some(format!("connection error: {}", e)),
                 response: None,
             };
-            last_result = Some(result);
-            continue;
         }
     };
 
@@ -2436,7 +2440,7 @@ pub async fn test_route(
     let resp_text = match resp.text().await {
         Ok(t) => t,
         Err(e) => {
-            let result = TestResult {
+            return TestResult {
                 success: false,
                 tag: tag.to_string(),
                 provider: provider.name.clone(),
@@ -2446,30 +2450,12 @@ pub async fn test_route(
                 error: Some(format!("read response error: {}", e)),
                 response: None,
             };
-            last_result = Some(result);
-            continue;
         }
     };
 
     if !status.is_success() {
         let err_preview = &resp_text[..resp_text.len().min(500)];
         log::warn!("[Test] <<< HTTP {}: {}", status, err_preview);
-        // 5xx → retryable, continue to next candidate
-        if status.as_u16() >= 500 {
-            let result = TestResult {
-                success: false,
-                tag: tag.to_string(),
-                provider: provider.name.clone(),
-                model: route.model.clone(),
-                format: format!("{:?}", route.format),
-                latency_ms,
-                error: Some(format!("HTTP {}: {}", status, err_preview)),
-                response: None,
-            };
-            last_result = Some(result);
-            continue;
-        }
-        // 4xx → non-retryable, return immediately
         return TestResult {
             success: false,
             tag: tag.to_string(),
@@ -2502,7 +2488,7 @@ pub async fn test_route(
 
     log::info!("[Test] ✓ success in {}ms", latency_ms);
 
-    return TestResult {
+    TestResult {
         success: true,
         tag: tag.to_string(),
         provider: provider.name.clone(),
@@ -2511,8 +2497,59 @@ pub async fn test_route(
         latency_ms,
         error: None,
         response: Some(response),
-    };
-    } // end of for loop over candidates
+    }
+}
+
+pub async fn test_route(
+    state: &AppState,
+    tag: &str,
+    prompt: &str,
+) -> TestResult {
+    // Clone to release read lock immediately — test sends an HTTP request
+    // that can take seconds, and holding the lock blocks admin config writes.
+    let config = state.config.read().await.clone();
+
+    // Find candidate routes (enabled, sorted by route_priority)
+    let candidates = find_candidate_routes(&config.routes, tag, &config.tags);
+    if candidates.is_empty() {
+        return TestResult {
+            success: false,
+            tag: tag.to_string(),
+            provider: String::new(),
+            model: String::new(),
+            format: String::new(),
+            latency_ms: 0,
+            error: Some(format!("no enabled route found for tag '{}'", tag)),
+            response: None,
+        };
+    }
+
+    let mut last_result: Option<TestResult> = None;
+
+    for (attempt, (_route_idx, route)) in candidates.iter().enumerate() {
+        if attempt > 0 {
+            log::warn!("[Test] {} failover: trying route #{} (provider={}, model={})",
+                tag, attempt + 1, route.provider, route.model);
+        }
+
+        let result = send_test_to_route(state, &config, route, tag, prompt).await;
+
+        if result.success {
+            return result;
+        }
+
+        // For tag-based test with failover: retry on 5xx/429/connection errors
+        let is_retryable = result.error.as_ref().map_or(false, |e| {
+            e.starts_with("HTTP 5") || e.starts_with("HTTP 429") || e.starts_with("connection error")
+        });
+
+        last_result = Some(result);
+
+        if !is_retryable {
+            // 4xx or other non-retryable errors: return immediately
+            return last_result.unwrap();
+        }
+    }
 
     // All candidates failed — return last error
     last_result.unwrap_or_else(|| TestResult {
@@ -2525,6 +2562,40 @@ pub async fn test_route(
         error: Some(format!("all routes failed for tag '{}'", tag)),
         response: None,
     })
+}
+
+/// Test a single specific route by its index in the config (no failover).
+/// Used by the Routes page "Test" button to test the exact route the user clicked.
+pub async fn test_route_by_index(
+    state: &AppState,
+    route_index: usize,
+    prompt: &str,
+) -> TestResult {
+    // Clone to release read lock immediately — test sends an HTTP request
+    // that can take seconds, and holding the lock blocks admin config writes.
+    let config = state.config.read().await.clone();
+
+    let route = match config.routes.get(route_index) {
+        Some(r) => r,
+        None => {
+            return TestResult {
+                success: false,
+                tag: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                format: String::new(),
+                latency_ms: 0,
+                error: Some(format!("route index {} out of bounds ({} routes configured)", route_index, config.routes.len())),
+                response: None,
+            };
+        }
+    };
+
+    // Use first tag as display label, or route model name
+    let tag = route.tags.first().map(|s| s.as_str()).unwrap_or(&route.model);
+    log::info!("[Test-by-index] testing route #{}: {} via {} (format={:?})", route_index, route.model, route.provider, route.format);
+
+    send_test_to_route(state, &config, route, tag, prompt).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2725,10 +2796,10 @@ mod tests {
 
     fn test_tags() -> Vec<crate::config::Tag> {
         vec![
-            crate::config::Tag { name: "opus".into(), color: "#A855F7".into(), is_auto: false },
-            crate::config::Tag { name: "sonnet".into(), color: "#3B82F6".into(), is_auto: false },
-            crate::config::Tag { name: "haiku".into(), color: "#22C55E".into(), is_auto: false },
-            crate::config::Tag { name: "auto".into(), color: "#F59E0B".into(), is_auto: true },
+            crate::config::Tag::new("opus".into(), "#A855F7".into(), false),
+            crate::config::Tag::new("sonnet".into(), "#3B82F6".into(), false),
+            crate::config::Tag::new("haiku".into(), "#22C55E".into(), false),
+            crate::config::Tag::new("auto".into(), "#F59E0B".into(), true),
         ]
     }
 
@@ -2761,8 +2832,8 @@ mod tests {
     #[test]
     fn test_resolve_tag_prefers_longer_match() {
         let tags = vec![
-            crate::config::Tag { name: "gpt".into(), color: "#000".into(), is_auto: false },
-            crate::config::Tag { name: "gpt-5.5".into(), color: "#fff".into(), is_auto: false },
+            crate::config::Tag::new("gpt".into(), "#000".into(), false),
+            crate::config::Tag::new("gpt-5.5".into(), "#fff".into(), false),
         ];
         assert_eq!(resolve_tag_from_model("gpt-5.5", &tags), Some("gpt-5.5".to_string()));
         assert_eq!(resolve_tag_from_model("gpt-4o", &tags), Some("gpt".to_string()));
