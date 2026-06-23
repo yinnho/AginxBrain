@@ -371,8 +371,8 @@ pub async fn update_config(
     Json(new_config): Json<AppConfig>,
 ) -> Result<StatusCode, ApiError> {
     validate_config(&new_config).map_err(ApiError::Validation)?;
-    save_config(&new_config).map_err(ApiError::from)?;
     let mut config = state.config.write().await;
+    save_config(&new_config).map_err(ApiError::from)?;
     *config = new_config;
     Ok(StatusCode::OK)
 }
@@ -388,6 +388,9 @@ pub async fn set_current_tag(
     Json(req): Json<SetTagRequest>,
 ) -> Result<StatusCode, ApiError> {
     let mut config = state.config.write().await;
+    if !config.tags.iter().any(|t| t.name == req.tag) {
+        return Err(ApiError::Validation(format!("tag '{}' does not exist", req.tag)));
+    }
     config.current_tag = req.tag;
     save_config(&config).map_err(ApiError::from)?;
     Ok(StatusCode::OK)
@@ -498,6 +501,9 @@ pub async fn move_route(
     Json(req): Json<MoveRouteRequest>,
 ) -> Result<Json<crate::config::Route>, ApiError> {
     let moved = mutate_config(&state, |config| {
+        if req.direction != -1 && req.direction != 1 {
+            return Err("direction must be -1 or 1".to_string());
+        }
         let target = (index as i32) + req.direction;
         if target < 0 || target as usize >= config.routes.len() {
             return Err(format!("cannot move route {} in direction {}", index, req.direction));
@@ -559,9 +565,13 @@ pub async fn delete_provider(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     mutate_config(&state, |config| {
-        if config.providers.remove(&id).is_none() {
+        if config.providers.get(&id).is_none() {
             return Err(format!("provider '{}' not found", id));
         }
+        if config.routes.iter().any(|r| r.provider == id) {
+            return Err(format!("cannot delete provider '{}': still referenced by routes", id));
+        }
+        config.providers.remove(&id);
         Ok(())
     })
     .await?;
@@ -631,6 +641,10 @@ pub async fn delete_tag(
         config.tags.retain(|t| t.name != name);
         if config.tags.len() == before {
             return Err(format!("tag '{}' not found", name));
+        }
+        // Remove dangling tag references from all routes
+        for route in &mut config.routes {
+            route.tags.retain(|t| t != &name);
         }
         Ok(())
     })
@@ -882,13 +896,12 @@ pub async fn import_config(
 ) -> Result<StatusCode, ApiError> {
     validate_config(&import_config).map_err(ApiError::Validation)?;
 
+    let mut config = state.config.write().await;
     if import_config.management_key == "YOUR_MANAGEMENT_KEY" {
-        let current = state.config.read().await;
-        import_config.management_key = current.management_key.clone();
+        import_config.management_key = config.management_key.clone();
     }
 
     save_config(&import_config).map_err(ApiError::from)?;
-    let mut config = state.config.write().await;
     *config = import_config;
     Ok(StatusCode::OK)
 }

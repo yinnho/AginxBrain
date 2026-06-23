@@ -107,8 +107,8 @@ fn hash_token(token: &str) -> String {
 }
 
 pub async fn list_caller_keys(pool: &SqlitePool) -> Result<Vec<CallerKey>> {
-    let rows: Vec<(i64, String, String, i64, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, name, note, enabled, created_at, token FROM caller_keys ORDER BY created_at DESC",
+    let rows: Vec<(i64, String, String, i64, String)> = sqlx::query_as(
+        "SELECT id, name, note, enabled, created_at FROM caller_keys ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await
@@ -116,13 +116,13 @@ pub async fn list_caller_keys(pool: &SqlitePool) -> Result<Vec<CallerKey>> {
 
     Ok(rows
         .into_iter()
-        .map(|(id, name, note, enabled, created_at, token)| CallerKey {
+        .map(|(id, name, note, enabled, created_at)| CallerKey {
             id,
             name,
             note,
             enabled: enabled != 0,
             created_at,
-            token,
+            token: None,
         })
         .collect())
 }

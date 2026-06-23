@@ -252,6 +252,16 @@ pub fn extract_caller_token(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Mask a secret value for logging: show only the last 4 characters, rest as `***`.
+/// Safe for multi-byte UTF-8.
+fn mask_secret(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= 4 {
+        return "***".to_string();
+    }
+    format!("***{}", chars[chars.len() - 4..].iter().collect::<String>())
+}
+
 /// Middleware that logs every incoming request.
 async fn request_log_middleware(
     req: Request,
@@ -270,19 +280,14 @@ async fn request_log_middleware(
         .headers()
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
+        .map(mask_secret)
+        .unwrap_or_else(|| "-".to_string());
     let auth = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            if s.len() > 20 {
-                format!("{}...", &s[..20])
-            } else {
-                s.to_string()
-            }
-        })
-        .unwrap_or("-".to_string());
+        .map(mask_secret)
+        .unwrap_or_else(|| "-".to_string());
 
     log::info!(
         "[Request] {} {} | content-type={} | x-api-key={} | auth={}",

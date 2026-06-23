@@ -15,6 +15,14 @@ const STREAM_TIMEOUT: u64 = 3600;
 const NON_STREAM_TIMEOUT: u64 = 300;
 const HEALTH_CHECK_TIMEOUT: u64 = 30;
 
+/// Truncate a string to at most `max_chars` characters, safe for multi-byte UTF-8.
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 /// Extract tag from Claude model name by keyword matching.
 /// e.g. "claude-opus-4-8" → "opus", "claude-sonnet-4-6" → "sonnet", "claude-haiku-4-5" → "haiku"
 /// Also handles plain values like "opus", "sonnet", "haiku" (set via ANTHROPIC_DEFAULT_*_MODEL).
@@ -620,12 +628,12 @@ async fn handle_proxy(
             "[Proxy] <<< {} {}: {}",
             status_code,
             status.canonical_reason().unwrap_or("?"),
-            &err_body[..err_body.len().min(300)]
+            truncate_chars(&err_body, 300)
         );
         // 5xx server errors and 429 (rate limit) → retryable, try next candidate
         if status_code >= 500 || status_code == 429 {
             let err = ProxyError::Upstream(format!("HTTP {}: {}",
-                status_code, &err_body[..err_body.len().min(200)]));
+                status_code, truncate_chars(&err_body, 200)));
             log::warn!("[Proxy] upstream {} (retryable): {}", status_code, err);
             last_error = Some(err);
             continue;
@@ -650,7 +658,7 @@ async fn handle_proxy(
                 error_message: Some(format!(
                     "HTTP {}: {}",
                     status_code,
-                    &err_body[..err_body.len().min(200)]
+                    truncate_chars(&err_body, 200)
                 )),
             },
         )
@@ -1155,7 +1163,7 @@ async fn handle_count_tokens(
             "[Proxy] count_tokens <<< {} {}: {}",
             status.as_u16(),
             status.canonical_reason().unwrap_or("?"),
-            &body_str[..body_str.len().min(300)]
+            truncate_chars(&body_str, 300)
         );
     }
 
@@ -2008,7 +2016,7 @@ async fn parse_image_response(resp: reqwest::Response) -> Result<Value, ProxyErr
     let status_code = status.as_u16();
     let text = resp.text().await.map_err(|e| ProxyError::Upstream(format!("failed to read image response body: {}", e)))?;
     if !status.is_success() {
-        return Err(ProxyError::Upstream(format!("HTTP {}: {}", status_code, &text[..text.len().min(500)])));
+        return Err(ProxyError::Upstream(format!("HTTP {}: {}", status_code, truncate_chars(&text, 500))));
     }
     serde_json::from_str(&text).map_err(|e| ProxyError::Upstream(format!("failed to parse image response: {}", e)))
 }
@@ -2339,9 +2347,8 @@ async fn send_test_to_route(
             format: format!("{:?}", route.format),
             latency_ms: 0,
             error: Some(format!(
-                "provider '{}' has no valid API key (key='{}...')",
+                "provider '{}' has no valid API key",
                 route.provider,
-                &provider.api_key[..provider.api_key.len().min(8)]
             )),
             response: None,
         };
@@ -2401,7 +2408,7 @@ async fn send_test_to_route(
     log::info!("[Test] testing route tag={} → {} {} (format={:?})", tag, url, route.model, route.format);
 
     if let Ok(s) = serde_json::to_string(&fwd_body) {
-        let truncated = if s.len() > 500 { format!("{}...(truncated)", &s[..500]) } else { s };
+        let truncated = if s.chars().count() > 500 { format!("{}...(truncated)", truncate_chars(&s, 500)) } else { s };
         log::info!("[Test] forwarding body: {}", truncated);
     }
 
@@ -2454,7 +2461,7 @@ async fn send_test_to_route(
     };
 
     if !status.is_success() {
-        let err_preview = &resp_text[..resp_text.len().min(500)];
+        let err_preview = truncate_chars(&resp_text, 500);
         log::warn!("[Test] <<< HTTP {}: {}", status, err_preview);
         return TestResult {
             success: false,
