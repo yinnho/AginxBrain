@@ -27,11 +27,6 @@ export function ProvidersPage({ config, onConfigChange }: { config: AppConfig; o
     setShowKeys(prev => ({ ...prev, [id]: !prev[id] }));
   };
 
-  const maskKey = (key: string) => {
-    if (key.length <= 8) return '••••••••';
-    return key.slice(0, 4) + '••••' + key.slice(-4);
-  };
-
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
@@ -68,34 +63,16 @@ export function ProvidersPage({ config, onConfigChange }: { config: AppConfig; o
                 <div className="mono" style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {p.base_url}
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.auth_type}</span>
-                  <code style={{
-                    fontSize: 12, color: showKeys[id] ? 'var(--text-primary)' : 'var(--text-muted)',
-                    background: showKeys[id] ? 'rgba(255,255,255,0.05)' : 'transparent',
-                    padding: '1px 6px', borderRadius: 3, wordBreak: 'break-all', maxWidth: 360,
-                    fontFamily: 'monospace', userSelect: showKeys[id] ? 'text' : 'none',
+                  <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    {showKeys[id] ? p.api_key : p.api_key}
+                  </span>
+                  <button onClick={() => toggleKeyVisibility(id)} style={{
+                    fontSize: 11, background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '0 4px',
                   }}>
-                    {showKeys[id] ? p.api_key : maskKey(p.api_key)}
-                  </code>
-                  <button onClick={() => toggleKeyVisibility(id)} title={showKeys[id] ? 'Hide key' : 'Show key'} style={{
-                    fontSize: 12, background: showKeys[id] ? 'rgba(255,255,255,0.08)' : 'var(--bg-input)',
-                    border: '1px solid var(--border)', color: 'var(--text-secondary)',
-                    borderRadius: 3, cursor: 'pointer', padding: '1px 8px', lineHeight: '20px',
-                    fontWeight: 500,
-                  }}>
-                    {showKeys[id] ? '🙈 Hide' : '👁 Show'}
+                    {showKeys[id] ? 'hide' : 'show'}
                   </button>
-                  {showKeys[id] && (
-                    <button onClick={() => navigator.clipboard.writeText(p.api_key)} title="Copy key" style={{
-                      fontSize: 12, background: 'var(--bg-input)',
-                      border: '1px solid var(--border)', color: 'var(--text-secondary)',
-                      borderRadius: 3, cursor: 'pointer', padding: '1px 8px', lineHeight: '20px',
-                      fontWeight: 500,
-                    }}>
-                      📋 Copy
-                    </button>
-                  )}
                 </div>
               </div>
               <div style={{ display: 'flex', gap: 4, marginLeft: 12 }}>
@@ -146,7 +123,6 @@ function ProviderForm({ initial, onSave, onCancel }: {
   const [baseUrl, setBaseUrl] = useState(initial?.base_url || '');
   const [apiKey, setApiKey] = useState(initial?.api_key || '');
   const [authType, setAuthType] = useState(initial?.auth_type || 'bearer');
-  const [showKey, setShowKey] = useState(false);
 
   const valid = id && name && baseUrl && apiKey;
 
@@ -162,19 +138,7 @@ function ProviderForm({ initial, onSave, onCancel }: {
           <option value="x_goog_api_key">x-goog-api-key</option>
         </Select>
         <div style={{ gridColumn: '1 / -1' }}>
-          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
-            <div style={{ flex: 1 }}>
-              <Input label="API Key" value={apiKey} onChange={e => setApiKey(e.target.value)} type={showKey ? 'text' : 'password'} placeholder={initial ? "Leave masked value unchanged to keep existing key" : undefined} />
-            </div>
-            <button onClick={() => setShowKey(!showKey)} title={showKey ? 'Hide key' : 'Show key'} style={{
-              marginBottom: 1, fontSize: 12, background: 'var(--bg-input)',
-              border: '1px solid var(--border)', color: 'var(--text-secondary)',
-              borderRadius: 3, cursor: 'pointer', padding: '7px 10px', lineHeight: '20px',
-              fontWeight: 500, whiteSpace: 'nowrap',
-            }}>
-              {showKey ? '🙈 Hide' : '👁 Show'}
-            </button>
-          </div>
+          <Input label="API Key" value={apiKey} onChange={e => setApiKey(e.target.value)} type="password" placeholder={initial ? "Leave masked value unchanged to keep existing key" : undefined} />
         </div>
       </div>
       <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
