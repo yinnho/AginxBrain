@@ -40,6 +40,9 @@ pub struct AppConfig {
     /// Admin auth is now handled exclusively via session-based login.
     #[serde(default = "default_management_key")]
     pub management_key: String,
+    /// Smart auto-routing configuration.
+    #[serde(default)]
+    pub smart_routing: crate::smart_routing::SmartRoutingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +253,7 @@ impl Default for AppConfig {
             tags: default_tags(),
             current_tag: default_tag(),
             management_key: default_management_key(),
+            smart_routing: Default::default(),
         }
     }
 }
@@ -369,10 +373,12 @@ pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub http_client: reqwest::Client,
     pub db: sqlx::SqlitePool,
+    pub smart_routing_cache: Arc<RwLock<crate::smart_routing::SessionCache>>,
 }
 
 impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self> {
+        let cache_max = config.smart_routing.cache_max_sessions;
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3600))
             .build()
@@ -382,6 +388,9 @@ impl AppState {
             config: Arc::new(RwLock::new(config)),
             http_client,
             db,
+            smart_routing_cache: Arc::new(RwLock::new(
+                crate::smart_routing::SessionCache::new(cache_max),
+            )),
         })
     }
 }

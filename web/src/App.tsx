@@ -33,9 +33,19 @@ function App() {
   }, []);
 
   const refresh = useCallback(async () => {
-    const [c, s] = await Promise.all([api.getConfig(), api.getStatus()]);
-    setConfig(c);
-    setStatus(s);
+    try {
+      const [c, s] = await Promise.all([api.getConfig(), api.getStatus()]);
+      setConfig(c);
+      setStatus(s);
+    } catch (e: any) {
+      // If session expired mid-session, kick back to login
+      if (e?.message?.includes('401')) {
+        setAdmin(null);
+        try { setStatus(await api.getStatus()); } catch { /* server down */ }
+      } else {
+        throw e;
+      }
+    }
   }, []);
 
   const checkAuth = useCallback(async () => {
@@ -45,6 +55,15 @@ function App() {
       await refresh();
     } catch {
       setAdmin(null);
+      // Still need status (for setup_required flag) even when not authenticated,
+      // otherwise the loading guard (!status) keeps the spinner forever.
+      try {
+        const s = await api.getStatus();
+        setStatus(s);
+      } catch {
+        // If even /api/status fails, leave status null — the loading spinner
+        // will show, which is correct (server unreachable).
+      }
     }
   }, [refresh]);
 

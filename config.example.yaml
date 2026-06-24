@@ -165,3 +165,17 @@ tags:
 
 current_tag: auto
 management_key: aginxbrain-local
+
+# Smart auto-routing: when a request arrives with an "auto" tag, inspect the
+# request body for signals (agentic tools, reasoning keywords, code patterns)
+# and dynamically upgrade to a more specific tier (opus/sonnet/haiku).
+smart_routing:
+  enabled: true
+  cache_ttl_secs: 1800      # Session cache TTL (seconds). Upgraded tiers never downgrade.
+  cache_max_sessions: 1024  # Max concurrent sessions in the in-memory cache.
+  signal_tiers:              # Each signal → minimum tier. A request's tier = max of all matched signals.
+    agentic: sonnet          # Tools / tool_use detected → at least sonnet
+    reasoning: opus          # Reasoning keywords ("step by step", "证明", etc.) → opus
+    complex_coding: opus     # Multi-turn edits or complex coding keywords → opus
+    subagent: haiku          # Short system prompt + subtask markers → haiku
+    code_pattern: sonnet     # Code fences (```python, etc.) in user message → sonnet

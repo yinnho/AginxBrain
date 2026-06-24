@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import type { AppConfig, Tag, Route } from '../lib/api';
+import { useState, useEffect } from 'react';
+import type { AppConfig, Tag, Route, SmartRoutingConfig } from '../lib/api';
 import * as api from '../lib/api';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
@@ -9,6 +9,11 @@ import { Input } from '../components/Input';
 export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConfigChange: (c: AppConfig) => void }) {
   const [adding, setAdding] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [smartDraft, setSmartDraft] = useState<SmartRoutingConfig>(config.smart_routing);
+
+  useEffect(() => {
+    setSmartDraft(config.smart_routing);
+  }, [config.smart_routing]);
 
   const toggleExpand = (name: string) => {
     setExpanded(prev => {
@@ -58,6 +63,15 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
       onConfigChange({ ...config, tags: newTags });
     } catch (e: any) {
       alert(e.message || 'Failed to update tag priority');
+    }
+  };
+
+  const handleSmartRoutingSave = async (sr: SmartRoutingConfig) => {
+    try {
+      await api.updateConfig({ ...config, smart_routing: sr });
+      onConfigChange({ ...config, smart_routing: sr });
+    } catch (e: any) {
+      alert(e.message || 'Failed to save smart routing config');
     }
   };
 
@@ -128,10 +142,10 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
                 </div>
               </div>
 
-	              {/* Expandable route priority list */}
-              {isExpanded && tagRoutes.length > 0 && (
+	              {/* Expandable route priority list + smart routing config (auto tag only) */}
+              {isExpanded && (
                 <div style={{ borderTop: '1px solid var(--border)', padding: '8px 16px 12px' }}>
-                  {tagRoutes.map((r, i) => {
+                  {tagRoutes.length > 0 && tagRoutes.map((r, i) => {
                     return (
                       <div key={r.route.id} style={{
                         display: 'flex', alignItems: 'center', gap: 8,
@@ -162,6 +176,98 @@ export function TagsPage({ config, onConfigChange }: { config: AppConfig; onConf
                       </div>
                     );
                   })}
+
+                  {/* Smart Routing config — only for auto tag */}
+                  {tag.is_auto && (
+                    <div style={{ marginTop: 12, borderTop: tagRoutes.length > 0 ? '1px solid var(--border)' : 'none', paddingTop: 12 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)' }}>
+                          🧠 Smart Routing
+                        </span>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer' }}>
+                          <input
+                            type="checkbox"
+                            checked={smartDraft.enabled}
+                            onChange={e => {
+                              const next = { ...smartDraft, enabled: e.target.checked };
+                              setSmartDraft(next);
+                              handleSmartRoutingSave(next);
+                            }}
+                          />
+                          <span style={{ color: smartDraft.enabled ? 'var(--success)' : 'var(--text-muted)' }}>
+                            {smartDraft.enabled ? 'Enabled' : 'Disabled'}
+                          </span>
+                        </label>
+                      </div>
+
+                      {smartDraft.enabled && (
+                        <>
+                          {/* Signal → Tier mapping */}
+                          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
+                            Signal → Tier mapping
+                          </div>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 10 }}>
+                            {Object.entries(smartDraft.signal_tiers).sort(([a], [b]) => a.localeCompare(b)).map(([signal, tier]) => (
+                              <div key={signal} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                <span style={{ fontSize: 12, width: 120, color: 'var(--text-secondary)', fontFamily: 'monospace' }}>{signal}</span>
+                                <select
+                                  value={tier}
+                                  onChange={e => {
+                                    const next = { ...smartDraft, signal_tiers: { ...smartDraft.signal_tiers, [signal]: e.target.value } };
+                                    setSmartDraft(next);
+                                  }}
+                                  style={{
+                                    fontSize: 12, padding: '2px 6px', borderRadius: 'var(--radius-sm)',
+                                    background: 'var(--bg-input)', border: '1px solid var(--border)', color: 'var(--text-primary)',
+                                  }}
+                                >
+                                  <option value="haiku">haiku</option>
+                                  <option value="sonnet">sonnet</option>
+                                  <option value="opus">opus</option>
+                                </select>
+                              </div>
+                            ))}
+                          </div>
+
+                          {/* Advanced settings */}
+                          <details style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                            <summary style={{ cursor: 'pointer', marginBottom: 4 }}>Advanced settings</summary>
+                            <div style={{ display: 'flex', gap: 12, alignItems: 'center', padding: '6px 0' }}>
+                              <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                Cache TTL (s)
+                                <input
+                                  type="number"
+                                  value={smartDraft.cache_ttl_secs}
+                                  onChange={e => setSmartDraft({ ...smartDraft, cache_ttl_secs: Number(e.target.value) })}
+                                  style={{ width: 64, fontSize: 11, padding: '2px 6px', borderRadius: 'var(--radius-sm)', background: 'var(--bg-input)', border: '1px solid var(--border)', color: 'var(--text-primary)' }}
+                                />
+                              </label>
+                              <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                Max sessions
+                                <input
+                                  type="number"
+                                  value={smartDraft.cache_max_sessions}
+                                  onChange={e => setSmartDraft({ ...smartDraft, cache_max_sessions: Number(e.target.value) })}
+                                  style={{ width: 64, fontSize: 11, padding: '2px 6px', borderRadius: 'var(--radius-sm)', background: 'var(--bg-input)', border: '1px solid var(--border)', color: 'var(--text-primary)' }}
+                                />
+                              </label>
+                            </div>
+                          </details>
+
+                          {/* Save button for signal tier / advanced changes */}
+                          <div style={{ marginTop: 8 }}>
+                            <Button
+                              variant="primary"
+                              onClick={() => handleSmartRoutingSave(smartDraft)}
+                              style={{ fontSize: 11, padding: '3px 12px' }}
+                            >
+                              Save Smart Routing
+                            </Button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </Card>

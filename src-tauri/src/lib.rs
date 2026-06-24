@@ -6,6 +6,7 @@ mod dashscope_ws;
 mod db;
 mod models;
 mod proxy;
+mod smart_routing;
 mod takeover;
 
 #[cfg(feature = "desktop")]

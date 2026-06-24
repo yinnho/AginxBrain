@@ -363,6 +363,25 @@ async fn handle_proxy(
     let tag = resolve_tag_from_model(&request_model, &config.tags)
         .unwrap_or_else(|| config.current_tag.clone());
 
+    // 1b. Smart auto routing: if the tag is an "auto" tag, inspect the
+    //     request body to pick a more specific tier.
+    let tag = if config.smart_routing.enabled
+        && config.tags.iter().any(|t| t.name == tag && t.is_auto)
+    {
+        match crate::smart_routing::route(
+            &body, client_protocol, caller_key_id,
+            &config.smart_routing, &state.smart_routing_cache,
+        ).await {
+            Some(smart_tag) => {
+                log::info!("[SmartRouting] auto → {} (caller={:?})", smart_tag, caller_key_id);
+                smart_tag
+            }
+            None => tag,
+        }
+    } else {
+        tag
+    };
+
     // 2. Find candidate routes for this tag (sorted by tag's route_priority)
     let candidates = find_candidate_routes(&config.routes, &tag, &config.tags);
     if candidates.is_empty() {
@@ -1025,6 +1044,25 @@ async fn handle_count_tokens(
 
     let tag = resolve_tag_from_model(&request_model, &config.tags)
         .unwrap_or_else(|| config.current_tag.clone());
+
+    // Smart auto routing: if the tag is an "auto" tag, inspect the
+    // request body to pick a more specific tier.
+    let tag = if config.smart_routing.enabled
+        && config.tags.iter().any(|t| t.name == tag && t.is_auto)
+    {
+        match crate::smart_routing::route(
+            &body, client_protocol, caller_key_id,
+            &config.smart_routing, &state.smart_routing_cache,
+        ).await {
+            Some(smart_tag) => {
+                log::info!("[SmartRouting] count_tokens auto → {} (caller={:?})", smart_tag, caller_key_id);
+                smart_tag
+            }
+            None => tag,
+        }
+    } else {
+        tag
+    };
 
     let candidates = find_candidate_routes(&config.routes, &tag, &config.tags);
     if candidates.is_empty() {

@@ -53,6 +53,13 @@ export interface Tag {
   route_priority: Record<string, number>;
 }
 
+export interface SmartRoutingConfig {
+  enabled: boolean;
+  cache_ttl_secs: number;
+  cache_max_sessions: number;
+  signal_tiers: Record<string, string>;
+}
+
 export interface AppConfig {
   port: number;
   host: string;
@@ -61,6 +68,7 @@ export interface AppConfig {
   tags: Tag[];
   current_tag: string;
   management_key: string;
+  smart_routing: SmartRoutingConfig;
 }
 
 export interface Status {
