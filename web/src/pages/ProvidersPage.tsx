@@ -27,6 +27,11 @@ export function ProvidersPage({ config, onConfigChange }: { config: AppConfig; o
     setShowKeys(prev => ({ ...prev, [id]: !prev[id] }));
   };
 
+  const maskKey = (key: string) => {
+    if (key.length <= 8) return '••••••••';
+    return key.slice(0, 4) + '••••' + key.slice(-4);
+  };
+
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
@@ -63,15 +68,15 @@ export function ProvidersPage({ config, onConfigChange }: { config: AppConfig; o
                 <div className="mono" style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {p.base_url}
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.auth_type}</span>
-                  <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                    {showKeys[id] ? p.api_key : p.api_key}
+                  <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace', userSelect: showKeys[id] ? 'text' : 'none' }}>
+                    {showKeys[id] ? p.api_key : maskKey(p.api_key)}
                   </span>
                   <button onClick={() => toggleKeyVisibility(id)} style={{
-                    fontSize: 11, background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '0 4px',
+                    fontSize: 13, background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '0 4px', lineHeight: 1,
                   }}>
-                    {showKeys[id] ? 'hide' : 'show'}
+                    {showKeys[id] ? '🙈' : '👁️'}
                   </button>
                 </div>
               </div>
