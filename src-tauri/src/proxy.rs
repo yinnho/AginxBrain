@@ -2788,7 +2788,15 @@ impl IntoResponse for ProxyError {
             }
             ProxyError::Upstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
         };
-        let body = serde_json::json!({ "error": msg });
+        // Return error in Anthropic format so Claude Code / Anthropic SDK clients
+        // can parse it correctly. OpenAI clients also tolerate this format.
+        let body = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": msg
+            }
+        });
         (status, axum::Json(body)).into_response()
     }
 }
