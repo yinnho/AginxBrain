@@ -352,9 +352,9 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
   return (
     <Card style={{ marginBottom: 16, background: 'var(--bg-input)' }}>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-        <Input label="Base URL" value={baseUrl} onChange={e => setBaseUrl(e.target.value)} placeholder="https://api.deepseek.com" />
-        <Input label="Model" value={model} onChange={e => setModel(e.target.value)} />
-        <Select label="Provider" value={provider} onChange={e => setProvider(e.target.value)}>
+        <Input label="Base URL" value={baseUrl} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setBaseUrl(e.target.value)} placeholder="https://api.deepseek.com" />
+        <Input label="Model" value={model} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setModel(e.target.value)} />
+        <Select label="Provider" value={provider} onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setProvider(e.target.value)}>
           {providers.map(p => <option key={p} value={p}>{p}</option>)}
         </Select>
         <Select label="Format" value={format} onChange={e => setFormat(e.target.value as RouteFormat)}>

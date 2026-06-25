@@ -291,11 +291,10 @@ pub fn config_path() -> Result<PathBuf> {
 /// on each route and removes them from providers. Returns Some(yaml_string) if
 /// migration was performed, None if the config is already up-to-date.
 fn migrate_v0_config(raw_yaml: &str) -> Option<String> {
-    use serde_json::Value;
-    let mut doc: Value = serde_json::from_str(raw_yaml).ok()?;
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(raw_yaml).ok()?;
 
     // Check if any route still uses `endpoint` (old format marker)
-    let needs_migration = doc.get("routes")?.as_array()?
+    let needs_migration = doc.get("routes")?.as_sequence()?
         .iter().any(|r| r.get("endpoint").is_some());
     if !needs_migration {
         return None;
@@ -304,18 +303,19 @@ fn migrate_v0_config(raw_yaml: &str) -> Option<String> {
     // Extract provider base_urls before mutation (avoids borrow conflict)
     let provider_urls: std::collections::HashMap<String, (String, Option<String>)> = doc
         .get("providers")
-        .and_then(|p| p.as_object())
+        .and_then(|p| p.as_mapping())
         .map(|provs| {
-            provs.iter().map(|(k, v)| {
+            provs.iter().filter_map(|(k, v)| {
+                let key = k.as_str()?.to_string();
                 let base = v.get("base_url").and_then(|b| b.as_str()).unwrap_or("").to_string();
                 let ws = v.get("ws_url").and_then(|b| b.as_str()).map(String::from);
-                (k.clone(), (base, ws))
+                Some((key, (base, ws)))
             }).collect()
         })
         .unwrap_or_default();
 
     // Migrate each route: base_url = provider.base_url, ws_url = provider.ws_url
-    if let Some(routes_arr) = doc.get_mut("routes").and_then(|r| r.as_array_mut()) {
+    if let Some(routes_arr) = doc.get_mut("routes").and_then(|r| r.as_sequence_mut()) {
         for route in routes_arr.iter_mut() {
             let provider_id = route.get("provider").and_then(|v| v.as_str()).unwrap_or("");
             let (prov_base, prov_ws) = provider_urls.get(provider_id)
@@ -323,14 +323,20 @@ fn migrate_v0_config(raw_yaml: &str) -> Option<String> {
                 .unwrap_or_default();
 
             // Set base_url from provider's base_url
-            if let Some(obj) = route.as_object_mut() {
-                obj.insert("base_url".to_string(), Value::String(prov_base));
-                obj.remove("endpoint");
+            if let Some(obj) = route.as_mapping_mut() {
+                obj.insert(
+                    serde_yaml::Value::String("base_url".to_string()),
+                    serde_yaml::Value::String(prov_base),
+                );
+                obj.remove(&serde_yaml::Value::String("endpoint".to_string()));
 
                 // Migrate ws_url from provider (only set if not already present on route)
-                if !obj.contains_key("ws_url") {
+                if !obj.contains_key(&serde_yaml::Value::String("ws_url".to_string())) {
                     if let Some(ws) = &prov_ws {
-                        obj.insert("ws_url".to_string(), Value::String(ws.clone()));
+                        obj.insert(
+                            serde_yaml::Value::String("ws_url".to_string()),
+                            serde_yaml::Value::String(ws.clone()),
+                        );
                     }
                 }
             }
@@ -338,11 +344,11 @@ fn migrate_v0_config(raw_yaml: &str) -> Option<String> {
     }
 
     // Remove base_url and ws_url from providers
-    if let Some(provs) = doc.get_mut("providers").and_then(|p| p.as_object_mut()) {
+    if let Some(provs) = doc.get_mut("providers").and_then(|p| p.as_mapping_mut()) {
         for (_, prov) in provs.iter_mut() {
-            if let Some(obj) = prov.as_object_mut() {
-                obj.remove("base_url");
-                obj.remove("ws_url");
+            if let Some(obj) = prov.as_mapping_mut() {
+                obj.remove(&serde_yaml::Value::String("base_url".to_string()));
+                obj.remove(&serde_yaml::Value::String("ws_url".to_string()));
             }
         }
     }
