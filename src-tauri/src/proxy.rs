@@ -843,8 +843,19 @@ async fn handle_proxy(
                     .body(body)
                     .map_err(|e| ProxyError::Upstream(format!("failed to build streaming response: {}", e)))?)
             }
-            ("anthropic", ProviderFormat::Anthropic)
-            | ("openai", ProviderFormat::Openai)
+            ("anthropic", ProviderFormat::Anthropic) => {
+                // Anthropic passthrough: replace model to match client's requested model name
+                let converted = replace_model_in_anthropic_stream(Box::pin(raw_stream), request_model);
+                let body = Body::from_stream(converted);
+
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .header("cache-control", "no-cache")
+                    .body(body)
+                    .map_err(|e| ProxyError::Upstream(format!("failed to build streaming response: {}", e)))?)
+            }
+            ("openai", ProviderFormat::Openai)
             | ("openai_responses", ProviderFormat::OpenaiResponses) => {
                 // Passthrough: forward raw bytes without JSON parsing
                 let body = Body::from_stream(raw_stream);
