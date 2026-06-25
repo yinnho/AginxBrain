@@ -407,6 +407,8 @@ async fn handle_proxy(
 
     let mut last_error: Option<ProxyError> = None;
     let mut last_modality: String = String::new();
+    // Track how many candidates failed due to rate-limiting (429).
+    let mut rate_limited_count: u32 = 0;
 
     for (attempt, (_route_idx, route)) in candidates.iter().enumerate() {
         if attempt > 0 {
@@ -652,6 +654,7 @@ async fn handle_proxy(
         );
         // 5xx server errors and 429 (rate limit) → retryable, try next candidate
         if status_code >= 500 || status_code == 429 {
+            if status_code == 429 { rate_limited_count += 1; }
             let err = ProxyError::Upstream(format!("HTTP {}: {}",
                 status_code, truncate_chars(&err_body, 200)));
             log::warn!("[Proxy] upstream {} (retryable): {}", status_code, err);
@@ -1029,7 +1032,13 @@ async fn handle_proxy(
     )
     .await;
 
-    Err(ProxyError::Upstream("all providers unavailable, please try again later".into()))
+    // All candidates failed — if they were all rate-limited, return 429 so the
+    // client knows to retry with backoff instead of crashing on an unexpected 502.
+    if rate_limited_count > 0 && rate_limited_count as usize == candidates.len() {
+        Err(ProxyError::RateLimited("all providers rate limited, please retry later".into()))
+    } else {
+        Err(ProxyError::Upstream("all providers unavailable, please try again later".into()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2769,6 +2778,8 @@ pub enum ProxyError {
     NoProvider(String),
     #[error("upstream error: {0}")]
     Upstream(String),
+    #[error("rate limited: {0}")]
+    RateLimited(String),
 }
 
 
@@ -2786,6 +2797,7 @@ impl IntoResponse for ProxyError {
             ProxyError::NoRoute(_) | ProxyError::NoProvider(_) => {
                 (StatusCode::BAD_REQUEST, self.to_string())
             }
+            ProxyError::RateLimited(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             ProxyError::Upstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
         };
         // Return error in Anthropic format so Claude Code / Anthropic SDK clients
