@@ -1328,16 +1328,21 @@ fn extract_usage_tokens(value: &Value, format: &ProviderFormat) -> (Option<i64>,
     }
 }
 
-/// Stream converter that replaces the model field in SSE message_start events.
-/// This prevents the client from updating its model to the provider's model name.
+/// Stream converter for Anthropic passthrough that:
+/// 1. Replaces the model field with the client's requested model name
+/// 2. Tracks open content blocks and ensures they are closed before message_stop
+///    (some providers like Baidu/GLM skip content_block_stop when max_tokens is hit)
 fn replace_model_in_anthropic_stream(
     upstream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
     request_model: String,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let buffer = Arc::new(Mutex::new(String::new()));
+    // Track which content block indices are currently open
+    let open_blocks: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
 
     Box::pin(upstream.flat_map(move |chunk_result| {
         let buffer = buffer.clone();
+        let open_blocks = open_blocks.clone();
         let request_model = request_model.clone();
 
         async_stream::stream! {
@@ -1394,8 +1399,27 @@ fn replace_model_in_anthropic_stream(
                     }
                 };
 
+                // Extract event_type as owned String to avoid borrow conflict with parsed
+                let event_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+
+                // Track content_block_start
+                if event_type == "content_block_start" {
+                    if let Some(idx) = parsed.get("index").and_then(|v| v.as_u64()) {
+                        let mut blocks = open_blocks.lock().await;
+                        blocks.push(idx as u32);
+                    }
+                }
+
+                // Track content_block_stop
+                if event_type == "content_block_stop" {
+                    if let Some(idx) = parsed.get("index").and_then(|v| v.as_u64()) {
+                        let mut blocks = open_blocks.lock().await;
+                        blocks.retain(|&b| b != idx as u32);
+                    }
+                }
+
                 // Replace model in message_start events and message.message
-                if parsed.get("type").and_then(|t| t.as_str()) == Some("message_start") {
+                if event_type == "message_start" {
                     if let Some(msg) = parsed.get_mut("message").and_then(|m| m.as_object_mut()) {
                         msg.insert("model".to_string(), Value::String(request_model.clone()));
                     }
@@ -1406,6 +1430,22 @@ fn replace_model_in_anthropic_stream(
                         if msg.get("model").is_some() {
                             msg.insert("model".to_string(), Value::String(request_model.clone()));
                         }
+                    }
+                }
+
+                // Before message_delta or message_stop, close any open content blocks
+                if event_type == "message_delta" || event_type == "message_stop" {
+                    let mut blocks = open_blocks.lock().await;
+                    if !blocks.is_empty() {
+                        log::warn!("[Stream] closing {} unclosed content block(s) before {}", blocks.len(), event_type);
+                        for &idx in blocks.iter() {
+                            let stop_event = json!({
+                                "type": "content_block_stop",
+                                "index": idx
+                            });
+                            yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", stop_event)));
+                        }
+                        blocks.clear();
                     }
                 }
 
