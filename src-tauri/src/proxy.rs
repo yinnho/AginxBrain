@@ -1401,6 +1401,8 @@ fn extract_usage_tokens(value: &Value, format: &ProviderFormat) -> (Option<i64>,
 /// 1. Replaces the model field with the client's requested model name
 /// 2. Tracks open content blocks and ensures they are closed before message_stop
 ///    (some providers like Baidu/GLM skip content_block_stop when max_tokens is hit)
+/// 3. Buffers `event:` lines so that injected content_block_stop events appear
+///    in the correct position (before the event: + data: pair, not between them)
 fn replace_model_in_anthropic_stream(
     upstream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
     request_model: String,
@@ -1432,6 +1434,14 @@ fn replace_model_in_anthropic_stream(
                 local_buf = std::mem::take(&mut *guard);
             }
 
+            // Buffer for pending `event:` lines. We don't emit them immediately
+            // because we may need to inject content_block_stop events before the
+            // event: + data: pair. Without buffering, the sequence would be:
+            //   event: message_delta      (already emitted)
+            //   event: content_block_stop  (injected — wrong position!)
+            //   data: {...}                 (orphaned from its event: line)
+            let mut pending_event: Option<String> = None;
+
             // Process each line
             while let Some(newline_pos) = local_buf.find('\n') {
                 let line = local_buf[..newline_pos].to_string();
@@ -1440,6 +1450,15 @@ fn replace_model_in_anthropic_stream(
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     yield Ok(Bytes::from("\n"));
+                    continue;
+                }
+
+                // Buffer `event:` lines instead of emitting immediately
+                if let Some(ev) = trimmed.strip_prefix("event: ") {
+                    pending_event = Some(ev.trim().to_string());
+                    continue;
+                } else if let Some(ev) = trimmed.strip_prefix("event:") {
+                    pending_event = Some(ev.trim().to_string());
                     continue;
                 }
 
@@ -1462,7 +1481,10 @@ fn replace_model_in_anthropic_stream(
                 let mut parsed: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => {
-                        // Not valid JSON, pass through
+                        // Not valid JSON, emit buffered event + raw data
+                        if let Some(ev) = pending_event.take() {
+                            yield Ok(Bytes::from(format!("event: {}\n", ev)));
+                        }
                         yield Ok(Bytes::from(format!("data: {}\n\n", data)));
                         continue;
                     }
@@ -1502,7 +1524,11 @@ fn replace_model_in_anthropic_stream(
                     }
                 }
 
-                // Before message_delta or message_stop, close any open content blocks
+                // Before message_delta or message_stop, close any open content blocks.
+                // IMPORTANT: We emit the injected content_block_stop events BEFORE
+                // the buffered event: line, so the SSE sequence is correct:
+                //   (injected) event: content_block_stop + data: {...}
+                //   (original)  event: message_delta     + data: {...}
                 if event_type == "message_delta" || event_type == "message_stop" {
                     let mut blocks = open_blocks.lock().await;
                     if !blocks.is_empty() {
@@ -1518,8 +1544,17 @@ fn replace_model_in_anthropic_stream(
                     }
                 }
 
+                // Now emit the buffered event: line (if any) + the data: line
+                if let Some(ev) = pending_event.take() {
+                    yield Ok(Bytes::from(format!("event: {}\n", ev)));
+                }
                 let serialized = serde_json::to_string(&parsed).unwrap_or_else(|_| data.clone());
                 yield Ok(Bytes::from(format!("data: {}\n\n", serialized)));
+            }
+
+            // Emit any trailing buffered event line
+            if let Some(ev) = pending_event.take() {
+                yield Ok(Bytes::from(format!("event: {}\n", ev)));
             }
 
             // Save remaining buffer
