@@ -1215,6 +1215,25 @@ async fn handle_count_tokens(
             status.canonical_reason().unwrap_or("?"),
             truncate_chars(&body_str, 300)
         );
+        // If the upstream provider doesn't support /count_tokens (404/405/501/502),
+        // fall back to a local estimate instead of erroring out.
+        if matches!(status.as_u16(), 404 | 405 | 500 | 501 | 502 | 503) {
+            log::info!("[Proxy] count_tokens upstream unsupported, falling back to local estimate");
+            let estimated = estimate_tokens(&body);
+            let estimate_json = serde_json::json!({"input_tokens": estimated});
+            return Ok((
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                serde_json::to_vec(&estimate_json).unwrap_or_default(),
+            )
+                .into_response());
+        }
+        last_error = Some(ProxyError::Upstream(format!(
+            "count_tokens upstream error: HTTP {}: {}",
+            status.as_u16(),
+            truncate_chars(&body_str, 200)
+        )));
+        continue;
     }
 
     return Ok((
@@ -1225,7 +1244,48 @@ async fn handle_count_tokens(
         .into_response())
     } // end of for loop over candidates
 
-    Err(last_error.unwrap_or_else(|| ProxyError::NoRoute(tag.clone())))
+    // All candidates failed — fall back to a local estimate so the client
+    // never sees a 502 for count_tokens (which is purely advisory).
+    log::info!("[Proxy] count_tokens: all routes failed, falling back to local estimate");
+    let estimated = estimate_tokens(&body);
+    let estimate_json = serde_json::json!({"input_tokens": estimated});
+    Ok((
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        serde_json::to_vec(&estimate_json).unwrap_or_default(),
+    )
+        .into_response())
+}
+
+/// Rough token estimate: ~4 chars per token for English text. Used as a fallback
+/// when the upstream provider doesn't support /count_tokens. This is advisory only
+/// and used by clients for context-window management.
+fn estimate_tokens(body: &Value) -> u64 {
+    let mut total_chars: usize = 0;
+    // Count system prompt
+    if let Some(s) = body.get("system") {
+        total_chars += match s {
+            Value::String(t) => t.chars().count(),
+            other => other.to_string().chars().count(),
+        };
+    }
+    // Count all message content
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            if let Some(content) = msg.get("content") {
+                total_chars += match content {
+                    Value::String(t) => t.chars().count(),
+                    Value::Array(blocks) => blocks.iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .map(|t| t.chars().count())
+                        .sum(),
+                    other => other.to_string().chars().count(),
+                };
+            }
+        }
+    }
+    // ~4 chars per token, minimum 1
+    ((total_chars as f64) / 4.0).ceil() as u64
 }
 
 // ---------------------------------------------------------------------------

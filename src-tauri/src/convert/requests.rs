@@ -293,18 +293,45 @@ pub fn openai_to_anthropic_request(body: &Value, target_model: &str) -> Value {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             match role {
                 "system" => {
-                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                        system_parts.push(content.to_string());
+                    // System content can be string or array of content parts
+                    let text = extract_text_from_content(msg.get("content").unwrap_or(&Value::Null));
+                    if !text.is_empty() {
+                        system_parts.push(text);
                     }
                     // Don't add system messages to the messages array
                 }
                 "user" => {
-                    // Convert user content from string to content array if tool_result-like
-                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    anthropic_messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": content
-                    }));
+                    // User content can be string or array (multimodal)
+                    let content = msg.get("content").unwrap_or(&Value::Null);
+                    if let Some(s) = content.as_str() {
+                        anthropic_messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": s
+                        }));
+                    } else if let Some(arr) = content.as_array() {
+                        // Convert array content: extract text parts, skip non-text (images etc.)
+                        let text = arr.iter()
+                            .filter_map(|part| {
+                                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                                    Some(t.to_string())
+                                } else if let Some(s) = part.as_str() {
+                                    Some(s.to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        anthropic_messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": text
+                        }));
+                    } else {
+                        anthropic_messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": ""
+                        }));
+                    }
                 }
                 "assistant" => {
                     let mut blocks: Vec<Value> = Vec::new();
