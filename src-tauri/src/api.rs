@@ -332,9 +332,6 @@ fn validate_config(config: &AppConfig) -> Result<(), String> {
     }
 
     for (id, provider) in &config.providers {
-        if provider.base_url.trim().is_empty() {
-            return Err(format!("provider '{}' has empty base_url", id));
-        }
         if provider.api_key.trim().is_empty() {
             return Err(format!("provider '{}' has empty api_key", id));
         }
@@ -344,6 +341,9 @@ fn validate_config(config: &AppConfig) -> Result<(), String> {
     }
 
     for (i, route) in config.routes.iter().enumerate() {
+        if route.base_url.trim().is_empty() {
+            return Err(format!("route #{} has empty base_url", i + 1));
+        }
         if route.model.trim().is_empty() {
             return Err(format!("route #{} has empty model", i + 1));
         }
@@ -714,9 +714,6 @@ pub async fn delete_tag(
 // ─── Validation helpers ──────────────────────────────────────────────────
 
 fn validate_provider(provider: &crate::config::Provider) -> Result<(), String> {
-    if provider.base_url.trim().is_empty() {
-        return Err("provider has empty base_url".to_string());
-    }
     if provider.api_key.trim().is_empty() {
         return Err("provider has empty api_key".to_string());
     }
@@ -727,6 +724,9 @@ fn validate_provider(provider: &crate::config::Provider) -> Result<(), String> {
 }
 
 fn validate_route(config: &AppConfig, route: &crate::config::Route) -> Result<(), String> {
+    if route.base_url.trim().is_empty() {
+        return Err("route has empty base_url".to_string());
+    }
     if route.model.trim().is_empty() {
         return Err("route has empty model".to_string());
     }

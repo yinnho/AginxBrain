@@ -60,9 +60,6 @@ export function ProvidersPage({ config, onConfigChange }: { config: AppConfig; o
                   <span style={{ fontWeight: 600 }}>{p.name}</span>
                   <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>{id}</span>
                 </div>
-                <div className="mono" style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {p.base_url}
-                </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.auth_type}</span>
                   <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
@@ -120,18 +117,16 @@ function ProviderForm({ initial, onSave, onCancel }: {
 }) {
   const [id, setId] = useState(initial?.id || '');
   const [name, setName] = useState(initial?.name || '');
-  const [baseUrl, setBaseUrl] = useState(initial?.base_url || '');
   const [apiKey, setApiKey] = useState(initial?.api_key || '');
   const [authType, setAuthType] = useState(initial?.auth_type || 'bearer');
 
-  const valid = id && name && baseUrl && apiKey;
+  const valid = id && name && apiKey;
 
   return (
     <Card style={{ marginBottom: 16, background: 'var(--bg-input)' }}>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
         <Input label="ID" value={id} onChange={e => setId(e.target.value)} disabled={!!initial} />
         <Input label="Name" value={name} onChange={e => setName(e.target.value)} />
-        <Input label="Base URL" value={baseUrl} onChange={e => setBaseUrl(e.target.value)} placeholder="https://api.deepseek.com" />
         <Select label="Auth Type" value={authType} onChange={e => setAuthType(e.target.value as any)}>
           <option value="bearer">Bearer</option>
           <option value="x_api_key">x-api-key</option>
@@ -142,7 +137,7 @@ function ProviderForm({ initial, onSave, onCancel }: {
         </div>
       </div>
       <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
-        <Button variant="primary" disabled={!valid} onClick={() => onSave(id, { name, base_url: baseUrl, api_key: apiKey, auth_type: authType as any, ws_url: initial?.ws_url })}>Save</Button>
+        <Button variant="primary" disabled={!valid} onClick={() => onSave(id, { name, api_key: apiKey, auth_type: authType as any })}>Save</Button>
         <Button variant="ghost" onClick={onCancel}>Cancel</Button>
       </div>
     </Card>

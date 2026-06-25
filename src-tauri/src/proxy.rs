@@ -588,8 +588,8 @@ async fn handle_proxy(
     // 5. Build URL
     let url = format!(
         "{}{}",
-        provider.base_url.trim_end_matches('/'),
-        route.endpoint
+        route.base_url.trim_end_matches('/'),
+        route.format.path()
     );
     log::info!("[Proxy] forwarding to {} (model={})", url, route.model);
 
@@ -1150,8 +1150,8 @@ async fn handle_count_tokens(
 
     let url = format!(
         "{}{}/count_tokens",
-        provider.base_url.trim_end_matches('/'),
-        route.endpoint
+        route.base_url.trim_end_matches('/'),
+        route.format.path()
     );
     log::info!("[Proxy] count_tokens forwarding to {}", url);
 
@@ -1702,7 +1702,7 @@ pub async fn generate_image(state: &AppState, req: GenerateImageRequest) -> Gene
             continue;
         }
 
-        let url = format!("{}{}", provider.base_url.trim_end_matches('/'), route.endpoint.as_str());
+        let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.format.path());
         let start = std::time::Instant::now();
         let result = match route.format {
             ProviderFormat::OpenaiImages => generate_openai_images(state, provider, route, &url, &prompt, &req).await,
@@ -1828,7 +1828,7 @@ async fn handle_image_request(
         extra: std::collections::HashMap::new(),
     };
 
-    let url = format!("{}{}", provider.base_url.trim_end_matches('/'), route.endpoint.as_str());
+    let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.format.path());
     let images: Vec<GeneratedImage> = match &route.format {
         ProviderFormat::OpenaiImages => generate_openai_images(&state, provider, route, &url, &prompt, &req).await?,
         ProviderFormat::DashscopeImage => generate_dashscope_image(&state, provider, route, &url, &prompt, &req).await?,
@@ -1893,7 +1893,7 @@ async fn handle_tts_request(
     let format = body.get("audio_format").and_then(|v| v.as_str()).unwrap_or("mp3").to_string();
     let sample_rate = body.get("sample_rate").and_then(|v| v.as_u64()).unwrap_or(22050) as u32;
 
-    let ws_url = provider.ws_url.as_deref().unwrap_or("");
+    let ws_url = route.ws_url.as_deref().unwrap_or("");
 
     let audio_bytes = crate::dashscope_ws::tts_via_websocket(
         ws_url,
@@ -1976,7 +1976,7 @@ async fn handle_asr_request(
     let audio_bytes = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes())
         .map_err(|e| ProxyError::Upstream(format!("audio: invalid base64: {}", e)))?;
 
-    let ws_url = provider.ws_url.as_deref().unwrap_or("");
+    let ws_url = route.ws_url.as_deref().unwrap_or("");
     let sample_rate = body.get("sample_rate").and_then(|v| v.as_u64()).unwrap_or(22050) as u32;
 
     let transcription = crate::dashscope_ws::asr_via_websocket(
@@ -2135,7 +2135,7 @@ async fn generate_dashscope_image(
     }
 
     if let Some(task_id) = result.pointer("/output/task_id").and_then(|v| v.as_str()) {
-        return poll_dashscope_image_task(state, provider, task_id).await;
+        return poll_dashscope_image_task(state, provider, task_id, url).await;
     }
 
     Err(ProxyError::Upstream("No images or task_id in DashScope image response".to_string()))
@@ -2145,8 +2145,9 @@ async fn poll_dashscope_image_task(
     state: &AppState,
     provider: &Provider,
     task_id: &str,
+    base_url: &str,
 ) -> Result<Vec<GeneratedImage>, ProxyError> {
-    let poll_url = format!("{}/api/v1/tasks/{}", provider.base_url.trim_end_matches('/'), task_id);
+    let poll_url = format!("{}/api/v1/tasks/{}", base_url.trim_end_matches('/'), task_id);
     let start = std::time::Instant::now();
     loop {
         if start.elapsed() > std::time::Duration::from_secs(120) {
@@ -2442,8 +2443,8 @@ async fn send_test_to_route(
     // Build URL
     let url = format!(
         "{}{}",
-        provider.base_url.trim_end_matches('/'),
-        route.endpoint
+        route.base_url.trim_end_matches('/'),
+        route.format.path()
     );
     log::info!("[Test] testing route tag={} → {} {} (format={:?})", tag, url, route.model, route.format);
 

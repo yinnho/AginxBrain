@@ -48,15 +48,9 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
     pub name: String,
-    pub base_url: String,
     pub api_key: String,
     #[serde(default = "default_auth_type")]
     pub auth_type: AuthType,
-    /// Optional WebSocket endpoint URL. Used by dashscope_tts and dashscope_asr
-    /// formats that require WebSocket instead of HTTP. Defaults to
-    /// wss://dashscope.aliyuncs.com/api-ws/v1/inference if not set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ws_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -116,14 +110,37 @@ fn default_enabled() -> bool {
     true
 }
 
+impl ProviderFormat {
+    /// Return the standard API path for this format (e.g. "/v1/chat/completions" for Openai).
+    pub fn path(&self) -> &'static str {
+        match self {
+            ProviderFormat::Openai | ProviderFormat::DashscopeAsr => "/v1/chat/completions",
+            ProviderFormat::Anthropic => "/v1/messages",
+            ProviderFormat::OpenaiResponses => "/v1/responses",
+            ProviderFormat::OpenaiImages => "/v1/images/generations",
+            ProviderFormat::DashscopeImage => "/api/v1/services/aigc/multimodal-generation/generation",
+            ProviderFormat::DashscopeChatImage => "/chat/completions",
+            ProviderFormat::DashscopeVideo => "/api/v1/services/aigc/video-generation/video-synthesis",
+            ProviderFormat::DashscopeTts => "/api/v1/services/aigc/text-to-speech/stream",
+            ProviderFormat::Kling => "/v1/videos/text2video",
+            ProviderFormat::MinimaxImage => "/v1/image_generation",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
-    /// Stable unique ID (auto-generated UUID). Survives reordering/insertion/deletion.
+    /// Stable unique ID (auto-generated). Survives reordering/insertion/deletion.
     #[serde(default = "generate_route_id")]
     pub id: String,
-    /// Upstream API endpoint path (e.g. "/v1/chat/completions").
-    /// Used to construct the full URL: base_url + endpoint.
-    pub endpoint: String,
+    /// Upstream server base URL (e.g. "https://api.deepseek.com"). The request
+    /// path is derived from `format` via `ProviderFormat::path()`.
+    #[serde(default)]
+    pub base_url: String,
+    /// Optional WebSocket URL. Used by dashscope_tts/dashscope_asr formats that
+    /// require WebSocket instead of HTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_url: Option<String>,
     pub model: String,
     pub provider: String,
     #[serde(default)]
@@ -200,26 +217,25 @@ fn default_auth_type() -> AuthType {
 fn default_providers() -> HashMap<String, Provider> {
     let mut m = HashMap::new();
     let key = "your-key-here".to_string();
-    m.insert("deepseek".into(), Provider { name: "DeepSeek".into(), base_url: "https://api.deepseek.com".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
-    m.insert("deepseek_anthropic".into(), Provider { name: "DeepSeek (Anthropic)".into(), base_url: "https://api.deepseek.com/anthropic".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
-    m.insert("zhipu".into(), Provider { name: "Zhipu GLM".into(), base_url: "https://open.bigmodel.cn/api/anthropic".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
-    m.insert("baidu".into(), Provider { name: "Baidu ERNIE".into(), base_url: "https://qianfan.baidubce.com/anthropic/coding".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
-    m.insert("kimi".into(), Provider { name: "Kimi".into(), base_url: "https://api.kimi.com/coding".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
-    m.insert("dashscope".into(), Provider { name: "Qwen (DashScope)".into(), base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(), api_key: key.clone(), auth_type: AuthType::Bearer, ws_url: None });
-    m.insert("minimax".into(), Provider { name: "MiniMax".into(), base_url: "https://api.minimaxi.com/anthropic".into(), api_key: key, auth_type: AuthType::Bearer, ws_url: None });
+    m.insert("deepseek".into(), Provider { name: "DeepSeek".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
+    m.insert("zhipu".into(), Provider { name: "Zhipu GLM".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
+    m.insert("baidu".into(), Provider { name: "Baidu ERNIE".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
+    m.insert("kimi".into(), Provider { name: "Kimi".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
+    m.insert("dashscope".into(), Provider { name: "Qwen (DashScope)".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
+    m.insert("dashscope_media".into(), Provider { name: "DashScope Media".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
+    m.insert("minimax".into(), Provider { name: "MiniMax".into(), api_key: key, auth_type: AuthType::Bearer });
     m
 }
 
 fn default_routes() -> Vec<Route> {
     vec![
-        Route { id: "r_default_1".into(), endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { id: "r_default_2".into(), endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { id: "r_default_3".into(), endpoint: "/v1/messages".into(), model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, enabled: true },
-        Route { id: "r_default_4".into(), endpoint: "/v1/chat/completions".into(), model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { id: "r_default_5".into(), endpoint: "/v1/messages".into(), model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true },
-        Route { id: "r_default_6".into(), endpoint: "/v1/messages".into(), model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true },
-        // Example: route popular Codex model names directly. Add more tags (gpt-5.4, etc.) as needed.
-        Route { id: "r_default_7".into(), endpoint: "/v1/chat/completions".into(), model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["gpt-5.5".into(), "codex".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { id: "r_default_1".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { id: "r_default_2".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { id: "r_default_3".into(), base_url: "https://open.bigmodel.cn/api/anthropic".into(), ws_url: None, model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, enabled: true },
+        Route { id: "r_default_4".into(), base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(), ws_url: None, model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { id: "r_default_5".into(), base_url: "https://api.kimi.com/coding".into(), ws_url: None, model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true },
+        Route { id: "r_default_6".into(), base_url: "https://api.minimaxi.com/anthropic".into(), ws_url: None, model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true },
+        Route { id: "r_default_7".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["gpt-5.5".into(), "codex".into()], format: ProviderFormat::Openai, enabled: true },
     ]
 }
 
@@ -270,6 +286,70 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(home.join(".aginxbrain").join("config.yaml"))
 }
 
+/// Migrate old config format where providers carried `base_url`/`ws_url` and
+/// routes had `endpoint`. New format puts `base_url` (and optional `ws_url`)
+/// on each route and removes them from providers. Returns Some(yaml_string) if
+/// migration was performed, None if the config is already up-to-date.
+fn migrate_v0_config(raw_yaml: &str) -> Option<String> {
+    use serde_json::Value;
+    let mut doc: Value = serde_json::from_str(raw_yaml).ok()?;
+
+    // Check if any route still uses `endpoint` (old format marker)
+    let needs_migration = doc.get("routes")?.as_array()?
+        .iter().any(|r| r.get("endpoint").is_some());
+    if !needs_migration {
+        return None;
+    }
+
+    // Extract provider base_urls before mutation (avoids borrow conflict)
+    let provider_urls: std::collections::HashMap<String, (String, Option<String>)> = doc
+        .get("providers")
+        .and_then(|p| p.as_object())
+        .map(|provs| {
+            provs.iter().map(|(k, v)| {
+                let base = v.get("base_url").and_then(|b| b.as_str()).unwrap_or("").to_string();
+                let ws = v.get("ws_url").and_then(|b| b.as_str()).map(String::from);
+                (k.clone(), (base, ws))
+            }).collect()
+        })
+        .unwrap_or_default();
+
+    // Migrate each route: base_url = provider.base_url, ws_url = provider.ws_url
+    if let Some(routes_arr) = doc.get_mut("routes").and_then(|r| r.as_array_mut()) {
+        for route in routes_arr.iter_mut() {
+            let provider_id = route.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+            let (prov_base, prov_ws) = provider_urls.get(provider_id)
+                .cloned()
+                .unwrap_or_default();
+
+            // Set base_url from provider's base_url
+            if let Some(obj) = route.as_object_mut() {
+                obj.insert("base_url".to_string(), Value::String(prov_base));
+                obj.remove("endpoint");
+
+                // Migrate ws_url from provider (only set if not already present on route)
+                if !obj.contains_key("ws_url") {
+                    if let Some(ws) = &prov_ws {
+                        obj.insert("ws_url".to_string(), Value::String(ws.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove base_url and ws_url from providers
+    if let Some(provs) = doc.get_mut("providers").and_then(|p| p.as_object_mut()) {
+        for (_, prov) in provs.iter_mut() {
+            if let Some(obj) = prov.as_object_mut() {
+                obj.remove("base_url");
+                obj.remove("ws_url");
+            }
+        }
+    }
+
+    serde_yaml::to_string(&doc).ok()
+}
+
 pub fn load_config() -> Result<AppConfig> {
     let path = config_path()?;
     log::info!("[Config] loading config from {}", path.display());
@@ -284,8 +364,21 @@ pub fn load_config() -> Result<AppConfig> {
     }
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
-    let mut config: AppConfig = serde_yaml::from_str(&content)
-        .with_context(|| format!("parsing {}", path.display()))?;
+
+    // Migrate: old config format (provider.base_url + route.endpoint → route.base_url)
+    let mut config: AppConfig = match migrate_v0_config(&content) {
+        Some(migrated_yaml) => {
+            log::info!("[Config] migrated from v0 format (provider.base_url + route.endpoint → route.base_url)");
+            let c: AppConfig = serde_yaml::from_str(&migrated_yaml)
+                .with_context(|| format!("parsing migrated config from {}", path.display()))?;
+            if let Err(e) = save_config(&c) {
+                log::warn!("[Config] failed to save migrated config: {}", e);
+            }
+            c
+        }
+        None => serde_yaml::from_str(&content)
+            .with_context(|| format!("parsing {}", path.display()))?,
+    };
 
     // Backfill defaults for empty fields (e.g. user upgraded from an older
     // version that had explicit empty arrays).  Serde defaults only apply

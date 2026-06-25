@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import type { AppConfig, GenerateImageResponse, Route, RouteFormat, TestResult } from '../lib/api';
-import { FORMAT_ENDPOINTS } from '../lib/api';
 import * as api from '../lib/api';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
@@ -164,7 +163,7 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
                     </div>
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
                       via <span style={{ color: 'var(--text-secondary)' }}>{route.provider}</span>
-                      <span className="mono" style={{ marginLeft: 8 }}>{route.endpoint}</span>
+                      <span className="mono" style={{ marginLeft: 8 }}>{route.base_url}</span>
                     </div>
                     <div style={{ display: 'flex', gap: 4, marginTop: 8 }}>
                       {route.tags.map(t => {
@@ -338,7 +337,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
   onSave: (route: Route) => void;
   onCancel: () => void;
 }) {
-  const [endpoint, setEndpoint] = useState(initial?.endpoint || '/v1/chat/completions');
+  const [baseUrl, setBaseUrl] = useState(initial?.base_url || 'https://api.deepseek.com');
   const [model, setModel] = useState(initial?.model || '');
   const [provider, setProvider] = useState(initial?.provider || providers[0] || '');
   const [selectedTags, setSelectedTags] = useState<string[]>(initial?.tags || []);
@@ -348,22 +347,17 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
     setSelectedTags(prev => prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag]);
   };
 
-  const handleFormatChange = (newFormat: RouteFormat) => {
-    setFormat(newFormat);
-    setEndpoint(FORMAT_ENDPOINTS[newFormat] || '/v1/chat/completions');
-  };
-
-  const valid = endpoint && model && provider && selectedTags.length > 0;
+  const valid = baseUrl && model && provider && selectedTags.length > 0;
 
   return (
     <Card style={{ marginBottom: 16, background: 'var(--bg-input)' }}>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-        <Input label="Endpoint" value={endpoint} onChange={e => setEndpoint(e.target.value)} />
+        <Input label="Base URL" value={baseUrl} onChange={e => setBaseUrl(e.target.value)} placeholder="https://api.deepseek.com" />
         <Input label="Model" value={model} onChange={e => setModel(e.target.value)} />
         <Select label="Provider" value={provider} onChange={e => setProvider(e.target.value)}>
           {providers.map(p => <option key={p} value={p}>{p}</option>)}
         </Select>
-        <Select label="Format" value={format} onChange={e => handleFormatChange(e.target.value as RouteFormat)}>
+        <Select label="Format" value={format} onChange={e => setFormat(e.target.value as RouteFormat)}>
           <option value="openai">OpenAI</option>
           <option value="anthropic">Anthropic</option>
           <option value="openai_responses">OpenAI Responses</option>
@@ -393,7 +387,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
         </div>
       </div>
       <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
-        <Button variant="primary" disabled={!valid} onClick={() => onSave({ id: initial?.id || '', endpoint, model, provider, tags: selectedTags, format, enabled: initial?.enabled ?? true })}>Save</Button>
+        <Button variant="primary" disabled={!valid} onClick={() => onSave({ id: initial?.id || '', base_url: baseUrl, model, provider, tags: selectedTags, format, enabled: initial?.enabled ?? true })}>Save</Button>
         <Button variant="ghost" onClick={onCancel}>Cancel</Button>
       </div>
     </Card>

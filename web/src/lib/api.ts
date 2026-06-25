@@ -2,11 +2,8 @@ const API_BASE = '/api';
 
 export interface Provider {
   name: string;
-  base_url: string;
   api_key: string;
   auth_type: 'bearer' | 'x_api_key' | 'x_goog_api_key';
-  /** Optional WebSocket URL (dashscope TTS/ASR). Preserved on edit if set. */
-  ws_url?: string;
 }
 
 export type RouteFormat =
@@ -22,23 +19,10 @@ export type RouteFormat =
   | 'kling'
   | 'minimax_image';
 
-export const FORMAT_ENDPOINTS: Record<RouteFormat, string> = {
-  openai: '/v1/chat/completions',
-  anthropic: '/v1/messages',
-  openai_responses: '/v1/responses',
-  openai_images: '/v1/images/generations',
-  dashscope_image: '/api/v1/services/aigc/text2image/image-synthesis',
-  dashscope_chat_image: '/chat/completions',
-  dashscope_video: '/api/v1/services/aigc/video-generation/video-synthesis',
-  dashscope_tts: '/api/v1/services/aigc/text-to-speech/stream',
-  dashscope_asr: '/v1/chat/completions',
-  kling: '/v1/videos/text2video',
-  minimax_image: '/v1/image_generation',
-};
-
 export interface Route {
   id: string;
-  endpoint: string;
+  base_url: string;
+  ws_url?: string;
   model: string;
   provider: string;
   tags: string[];

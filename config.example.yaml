@@ -4,130 +4,101 @@ host: 127.0.0.1
 providers:
   deepseek:
     name: DeepSeek
-    base_url: https://api.deepseek.com
-    api_key: your-deepseek-key
-    auth_type: bearer
-  deepseek_anthropic:
-    name: DeepSeek (Anthropic)
-    base_url: https://api.deepseek.com/anthropic
     api_key: your-deepseek-key
     auth_type: bearer
   zhipu:
     name: Zhipu GLM
-    base_url: https://open.bigmodel.cn/api/anthropic
     api_key: your-zhipu-key
     auth_type: bearer
   baidu:
     name: Baidu ERNIE
-    base_url: https://qianfan.baidubce.com/anthropic/coding
     api_key: your-baidu-key
     auth_type: bearer
   kimi:
     name: Kimi
-    base_url: https://api.kimi.com/coding
     api_key: your-kimi-key
     auth_type: bearer
   dashscope:
     name: Qwen (DashScope)
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     api_key: your-dashscope-key
     auth_type: bearer
-  # DashScope native endpoints (image/TTS) — the compatible-mode base_url
-  # above is for chat; image/TTS use the raw /api/v1/services/... paths.
   dashscope_media:
     name: DashScope Media
-    base_url: https://dashscope.aliyuncs.com
     api_key: your-dashscope-key
     auth_type: bearer
   minimax:
     name: MiniMax
-    base_url: https://api.minimaxi.com/anthropic
     api_key: your-minimax-key
     auth_type: bearer
   groq:
     name: Groq (Whisper ASR)
-    base_url: https://api.groq.com/openai
     api_key: your-groq-key
     auth_type: bearer
 
 routes:
-  - endpoint: /v1/chat/completions
+  - base_url: https://api.deepseek.com
     model: deepseek-v4-pro
     provider: deepseek
     tags: [sonnet, auto]
     format: openai
-    modality: chat
 
-  - endpoint: /v1/chat/completions
+  - base_url: https://api.deepseek.com
     model: deepseek-v4-flash
     provider: deepseek
     tags: [haiku]
     format: openai
-    modality: chat
 
-  - endpoint: /v1/messages
+  - base_url: https://open.bigmodel.cn/api/anthropic
     model: glm-5.1
     provider: zhipu
     tags: [opus]
     format: anthropic
-    modality: chat
 
-  - endpoint: /v1/chat/completions
+  - base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     model: qwen3.7-max
     provider: dashscope
     tags: [sonnet]
     format: openai
-    modality: chat
 
-  - endpoint: /v1/messages
+  - base_url: https://api.kimi.com/coding
     model: K2.6
     provider: kimi
     tags: [sonnet]
     format: anthropic
-    modality: chat
 
-  # Popular client model names can be added as tags without code changes.
-  # When a request arrives with model="gpt-5.5", it resolves directly to the
-  # "gpt-5.5" tag below. If a future model name is not covered, simply add a
-  # new tag and attach it to a route — no restart or redeploy required.
-  - endpoint: /v1/chat/completions
+  - base_url: https://api.deepseek.com
     model: deepseek-v4-pro
     provider: deepseek
     tags: [gpt-5.5, codex]
     format: openai
-    modality: chat
 
   # ─── Multimodal routes ────────────────────────────────────────────────
-  # OpenCarrier sends model="<tag>" to POST /v1/chat/completions; aginxbrain
-  # dispatches by modality (see AGINXBRAIN_MULTIMODAL_SPEC.md). Real API keys
-  # go in config.yaml (config.example.yaml is just a template).
-  - endpoint: /api/v1/services/aigc/text2image/image-synthesis
-    model: wan2.7-image
+  # The request path is derived from the format (e.g. openai → /v1/chat/completions).
+  # base_url is the server root; aginxbrain appends the format's standard path.
+
+  - base_url: https://dashscope.aliyuncs.com
+    model: wan2.7-image-pro
     provider: dashscope_media
     tags: [image]
     format: dashscope_image
-    modality: image_generation
 
-  - endpoint: /api/v1/services/aigc/text-to-speech/stream
+  - base_url: https://dashscope.aliyuncs.com
     model: cosyvoice-v1
     provider: dashscope_media
     tags: [tts]
     format: dashscope_tts
-    modality: tts
 
-  - endpoint: /v1/chat/completions
+  - base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     model: qwen-vision-max
     provider: dashscope
     tags: [vision]
     format: openai
-    modality: vision
 
-  - endpoint: /v1/audio/transcriptions
+  - base_url: https://api.groq.com/openai
     model: whisper-large-v3-turbo
     provider: groq
     tags: [audio]
     format: openai
-    modality: audio
 
 tags:
   - name: opus
@@ -143,14 +114,12 @@ tags:
     color: "#F59E0B"
     is_auto: true
 
-  # Add any client model name as a tag and bind it to a route. No code changes needed.
   - name: gpt-5.5
     color: "#10B981"
 
   - name: codex
     color: "#6366F1"
 
-  # Multimodal tags — model="<tag>" routes to the corresponding capability.
   - name: image
     color: "#10B981"
 
@@ -167,15 +136,14 @@ current_tag: auto
 management_key: aginxbrain-local
 
 # Smart auto-routing: when a request arrives with an "auto" tag, inspect the
-# request body for signals (agentic tools, reasoning keywords, code patterns)
-# and dynamically upgrade to a more specific tier (opus/sonnet/haiku).
+# request body for signals and dynamically upgrade to a more specific tier.
 smart_routing:
   enabled: true
-  cache_ttl_secs: 1800      # Session cache TTL (seconds). Upgraded tiers never downgrade.
-  cache_max_sessions: 1024  # Max concurrent sessions in the in-memory cache.
-  signal_tiers:              # Each signal → minimum tier. A request's tier = max of all matched signals.
-    agentic: sonnet          # Tools / tool_use detected → at least sonnet
-    reasoning: opus          # Reasoning keywords ("step by step", "证明", etc.) → opus
-    complex_coding: opus     # Multi-turn edits or complex coding keywords → opus
-    subagent: haiku          # Short system prompt + subtask markers → haiku
-    code_pattern: sonnet     # Code fences (```python, etc.) in user message → sonnet
+  cache_ttl_secs: 1800
+  cache_max_sessions: 1024
+  signal_tiers:
+    agentic: sonnet
+    reasoning: opus
+    complex_coding: opus
+    subagent: haiku
+    code_pattern: sonnet
