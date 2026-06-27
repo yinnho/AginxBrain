@@ -2273,7 +2273,9 @@ async fn generate_dashscope_image(
         }
     }
 
-    let mut input = json!({ "prompt": prompt });
+    // DashScope multimodal generation API now uses input.messages format:
+    // {"model": "...", "input": {"messages": [{"role": "user", "content": [{"text": prompt}]}]}}
+    let mut input = json!({ "messages": [{"role": "user", "content": [{"text": prompt}]}] });
     if let Some(extra_input) = req.extra.get("input").and_then(|v| v.as_object()) {
         if let Some(obj) = input.as_object_mut() {
             for (k, v) in extra_input {
