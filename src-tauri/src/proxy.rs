@@ -716,46 +716,55 @@ async fn handle_proxy(
 
     // 8. Convert response if needed
     if is_streaming {
-        // ── Tee raw provider stream to background usage extraction ──
-        // This runs BEFORE the match so ALL streaming paths (conversion +
-        // passthrough) capture input/output tokens.
-        let (usage_tx, mut usage_rx) =
+        // ── Drain upstream in background to capture full usage even if client disconnects ──
+        // The upstream response must be fully consumed so the usage tee sees the
+        // message_delta event (which contains the final token counts). Without this,
+        // a client disconnect causes Axum to drop the response body, which stops the
+        // stream converter from polling upstream, and the tee misses the tail of the SSE.
+        let (drain_tx, drain_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
         let db = state.db.clone();
         let log_id = usage_log_id;
         let usage_format = provider_format.clone();
-        tokio::spawn(async move {
-            const MAX_USAGE_BUF: usize = 1024 * 1024; // 1 MB cap for usage extraction
-            let mut buf = Vec::new();
-            let mut capped = false;
-            while let Some(result) = usage_rx.recv().await {
-                if capped { continue; }
-                if let Ok(bytes) = result {
-                    if buf.len() + bytes.len() <= MAX_USAGE_BUF {
-                        buf.extend_from_slice(&bytes);
-                    } else {
-                        buf.extend_from_slice(&bytes[..MAX_USAGE_BUF.saturating_sub(buf.len())]);
-                        capped = true;
-                        log::warn!("[Proxy] usage extraction buffer capped at {} bytes, token stats may be incomplete", MAX_USAGE_BUF);
+        {
+            let db_c = db.clone();
+            let log_id_c = log_id;
+            let usage_format_c = usage_format.clone();
+            let upstream = resp.bytes_stream();
+            tokio::spawn(async move {
+                const MAX_USAGE_BUF: usize = 1024 * 1024; // 1 MB cap for usage extraction
+                let mut buf = Vec::new();
+                let mut capped = false;
+                let mut upstream = Box::pin(upstream);
+                while let Some(result) = upstream.next().await {
+                    if let Ok(ref bytes) = result {
+                        if !capped && buf.len() + bytes.len() <= MAX_USAGE_BUF {
+                            buf.extend_from_slice(bytes);
+                        } else if !capped {
+                            buf.extend_from_slice(&bytes[..MAX_USAGE_BUF.saturating_sub(buf.len())]);
+                            capped = true;
+                            log::warn!("[Proxy] usage extraction buffer capped at {} bytes", MAX_USAGE_BUF);
+                        }
                     }
+                    let _ = drain_tx.send(result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
                 }
-            }
-            let (input, output) = extract_usage_from_sse_buffer(&buf, &usage_format);
-            if let (Some(i), Some(o)) = (input, output) {
-                if let Some(id) = log_id {
-                    let _ = crate::db::update_usage_tokens(&db, id, i, o).await;
+                let (input, output) = extract_usage_from_sse_buffer(&buf, &usage_format_c);
+                if let (Some(i), Some(o)) = (input, output) {
+                    if let Some(id) = log_id_c {
+                        let _ = crate::db::update_usage_tokens(&db_c, id, i, o).await;
+                    }
+                } else if log_id_c.is_some() {
+                    log::warn!("[Proxy] usage extraction incomplete: input={:?}, output={:?} for log_id={:?}, buf_len={}", input, output, log_id_c, buf.len());
                 }
-            } else if log_id.is_some() {
-                log::warn!("[Proxy] usage extraction incomplete: input={:?}, output={:?} for log_id={:?}, buf_len={}", input, output, log_id, buf.len());
-            }
-        });
+            });
+        }
 
-        let raw_stream = resp.bytes_stream().map(move |result| {
-            if let Ok(ref bytes) = result {
-                let _ = usage_tx.send(Ok(bytes.clone()));
+        let mut drain_rx = drain_rx;
+        let raw_stream = async_stream::stream! {
+            while let Some(item) = drain_rx.recv().await {
+                yield item;
             }
-            result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-        });
+        };
 
         match (client_protocol, provider_format) {
             ("anthropic", ProviderFormat::Openai) => {
