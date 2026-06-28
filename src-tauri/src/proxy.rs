@@ -745,6 +745,8 @@ async fn handle_proxy(
                 if let Some(id) = log_id {
                     let _ = crate::db::update_usage_tokens(&db, id, i, o).await;
                 }
+            } else if log_id.is_some() {
+                log::warn!("[Proxy] usage extraction incomplete: input={:?}, output={:?} for log_id={:?}, buf_len={}", input, output, log_id, buf.len());
             }
         });
 
@@ -1310,10 +1312,16 @@ use tokio::sync::Mutex;
 /// Extract input/output tokens from an SSE stream buffer by scanning all data lines.
 /// Works for both Anthropic-format SSE (usage in message_start/message_delta) and
 /// OpenAI-format SSE (usage in the final chunk).
+///
+/// For Anthropic-format streams, some providers (Zhipu GLM, Baidu) report
+/// `output_tokens` that excludes thinking tokens. We estimate output tokens
+/// from the actual content (text_delta + thinking_delta) and use the higher value.
 fn extract_usage_from_sse_buffer(buf: &[u8], format: &ProviderFormat) -> (Option<i64>, Option<i64>) {
     let text = String::from_utf8_lossy(buf);
     let mut input = None;
     let mut output = None;
+    let mut estimated_output_chars: i64 = 0;
+    let mut delta_events = 0u32;
 
     for line in text.lines() {
         let line = line.trim();
@@ -1323,6 +1331,19 @@ fn extract_usage_from_sse_buffer(buf: &[u8], format: &ProviderFormat) -> (Option
                 continue;
             }
             if let Ok(json) = serde_json::from_str::<Value>(data) {
+                // Estimate output from content_block_delta events (covers thinking + text + tool use)
+                if let Some(delta) = json.get("delta") {
+                    delta_events += 1;
+                    if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                        estimated_output_chars += t.len() as i64;
+                    }
+                    if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
+                        estimated_output_chars += t.len() as i64;
+                    }
+                    if let Some(t) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                        estimated_output_chars += t.len() as i64;
+                    }
+                }
                 if let Some(usage) = json.get("usage") {
                     match format {
                         ProviderFormat::Anthropic | ProviderFormat::OpenaiResponses => {
@@ -1345,6 +1366,24 @@ fn extract_usage_from_sse_buffer(buf: &[u8], format: &ProviderFormat) -> (Option
                     }
                 }
             }
+        }
+    }
+
+    // Rough token estimate: ~3 chars per token for mixed CJK/English content (conservative)
+    let estimated_output_tokens = if estimated_output_chars > 0 {
+        estimated_output_chars / 3
+    } else {
+        0
+    };
+    if estimated_output_tokens > 0 || delta_events > 0 {
+        let reported = output.unwrap_or(0);
+        // Use the higher of: provider report, char-based estimate, or delta-count estimate (~1.5 tokens/delta)
+        let delta_estimate = (delta_events as i64 * 3) / 2;
+        let best_estimate = estimated_output_tokens.max(delta_estimate);
+        if best_estimate > reported {
+            log::info!("[Usage] output estimate ({}, from {} chars + {} deltas) > provider report ({}), using estimate",
+                best_estimate, estimated_output_chars, delta_events, reported);
+            output = Some(best_estimate);
         }
     }
 
