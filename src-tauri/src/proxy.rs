@@ -384,6 +384,12 @@ async fn handle_proxy(
 
     // 2. Find candidate routes for this tag (sorted by tag's route_priority)
     let candidates = find_candidate_routes(&config.routes, &tag, &config.tags);
+
+    // Fast/non-reasoning tiers must never return reasoning chains to the client.
+    // Upstream models (glm-5.1, deepseek-v4-flash) reason by default and leak
+    // reasoning_content / thinking blocks into the response, which confuses
+    // apps that use these tiers for classification or simple chat.
+    let strip_reasoning = matches!(tag.as_str(), "fast" | "haiku");
     if candidates.is_empty() {
         let _ = crate::db::insert_usage_log(
             &state.db,
@@ -848,7 +854,13 @@ async fn handle_proxy(
                     Box::pin(raw_stream),
                     request_model.clone(),
                 );
-                let body = Body::from_stream(converted);
+                let boxed: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+                    if strip_reasoning {
+                        strip_reasoning_from_openai_stream(Box::pin(converted))
+                    } else {
+                        Box::pin(converted)
+                    };
+                let body = Body::from_stream(boxed);
 
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -872,7 +884,13 @@ async fn handle_proxy(
             ("openai", ProviderFormat::Openai)
             | ("openai_responses", ProviderFormat::OpenaiResponses) => {
                 // Passthrough: forward raw bytes without JSON parsing
-                let body = Body::from_stream(raw_stream);
+                let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+                    if strip_reasoning && client_protocol == "openai" {
+                        strip_reasoning_from_openai_stream(Box::pin(raw_stream))
+                    } else {
+                        Box::pin(raw_stream)
+                    };
+                let body = Body::from_stream(stream);
 
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -969,7 +987,10 @@ async fn handle_proxy(
             ("openai", ProviderFormat::Anthropic) => {
                 // Convert Anthropic response → OpenAI Chat response
                 let anthropic_resp: Value = parse_upstream_json(&resp_body)?;
-                let openai_resp = convert::anthropic_to_openai_response(&anthropic_resp, &request_model);
+                let mut openai_resp = convert::anthropic_to_openai_response(&anthropic_resp, &request_model);
+                if strip_reasoning {
+                    strip_reasoning_from_openai_response(&mut openai_resp);
+                }
                 let openai_bytes = serde_json::to_vec(&openai_resp).unwrap_or(resp_body.to_vec());
                 return Ok((
                     status_code,
@@ -1011,6 +1032,12 @@ async fn handle_proxy(
                 // to provider's model name (e.g., prevent "glm-5.1" from replacing "claude-opus-4-8")
                 if let Some(obj) = resp_value.as_object_mut() {
                     obj.insert("model".to_string(), Value::String(request_model.clone()));
+                }
+
+                // For fast/non-reasoning tiers, drop reasoning_content that the
+                // upstream model emits even though thinking was never requested.
+                if strip_reasoning && client_protocol == "openai" {
+                    strip_reasoning_from_openai_response(&mut resp_value);
                 }
 
                 let resp_bytes = serde_json::to_vec(&resp_value).unwrap_or(resp_body.to_vec());
@@ -1674,6 +1701,92 @@ fn normalize_roles(value: &mut Value) {
 /// Inject placeholder `thinking` blocks into assistant messages when thinking is enabled.
 /// KIMI's API requires every assistant message to have a thinking block in the content array
 /// when thinking is enabled — even tool-call-only messages that came from earlier turns.
+/// Remove `reasoning_content` from an OpenAI Chat completion response's message(s).
+/// Used for fast/non-reasoning tiers where the client must not receive reasoning
+/// chains (e.g. skill classifiers that read the first field they find).
+fn strip_reasoning_from_openai_response(value: &mut Value) {
+    if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
+        for choice in choices.iter_mut() {
+            if let Some(msg) = choice.get_mut("message").and_then(|m| m.as_object_mut()) {
+                msg.remove("reasoning_content");
+            }
+        }
+    }
+}
+
+/// Remove `reasoning_content` from an OpenAI Chat SSE delta/message object in place.
+/// Returns true if anything was removed (so callers know to re-serialize).
+fn strip_reasoning_from_openai_delta(value: &mut Value) -> bool {
+    let mut removed = false;
+    if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
+        for choice in choices.iter_mut() {
+            for key in &["delta", "message"] {
+                if let Some(obj) = choice.get_mut(*key).and_then(|v| v.as_object_mut()) {
+                    if obj.remove("reasoning_content").is_some() {
+                        removed = true;
+                    }
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// Stream wrapper that strips `reasoning_content` from OpenAI Chat SSE data lines.
+/// Used for fast/non-reasoning tiers so reasoning chains never leak to streaming
+/// clients.
+fn strip_reasoning_from_openai_stream(
+    upstream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
+    let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+    Box::pin(async_stream::stream! {
+        let mut upstream = upstream;
+        while let Some(chunk_result) = upstream.next().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => { yield Err(e); return; }
+            };
+            let text = String::from_utf8_lossy(&chunk);
+            let mut local_buf;
+            {
+                let mut guard = buffer.lock().await;
+                guard.push_str(&text);
+                local_buf = std::mem::take(&mut *guard);
+            }
+            while let Some(newline_pos) = local_buf.find('\n') {
+                let line = local_buf[..newline_pos].to_string();
+                local_buf = local_buf[newline_pos + 1..].to_string();
+                let trimmed = line.trim();
+                let data = if let Some(s) = trimmed.strip_prefix("data: ") {
+                    s.to_string()
+                } else if let Some(s) = trimmed.strip_prefix("data:") {
+                    s.trim().to_string()
+                } else {
+                    yield Ok(Bytes::from(format!("{}\n", line)));
+                    continue;
+                };
+                if data == "[DONE]" {
+                    yield Ok(Bytes::from(format!("{}\n", line)));
+                    continue;
+                }
+                if let Ok(mut value) = serde_json::from_str::<Value>(&data) {
+                    if strip_reasoning_from_openai_delta(&mut value) {
+                        yield Ok(Bytes::from(format!("data: {}\n", value)));
+                    } else {
+                        yield Ok(Bytes::from(format!("{}\n", line)));
+                    }
+                } else {
+                    yield Ok(Bytes::from(format!("{}\n", line)));
+                }
+            }
+            if !local_buf.is_empty() {
+                let mut guard = buffer.lock().await;
+                guard.push_str(&local_buf);
+            }
+        }
+    })
+}
+
 fn inject_reasoning_content(value: &mut Value) {
     // Claude Code sends thinking.type as "enabled" or "adaptive"
     // Both require thinking blocks in all assistant messages for KIMI/文心
