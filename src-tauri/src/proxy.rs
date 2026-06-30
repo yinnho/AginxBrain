@@ -223,6 +223,28 @@ fn is_retryable(err: &ProxyError) -> bool {
     matches!(err, ProxyError::Upstream(_))
 }
 
+/// Detect upstream error bodies that signal the request exceeded the provider's
+/// context window / token limit. These are per-route limits (not malformed
+/// requests), so failover to another route with a larger window may succeed.
+fn is_context_limit_error(err_body: &str) -> bool {
+    let lower = err_body.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "context length",
+        "context window",
+        "maximum context",
+        "context_length_exceeded",
+        "token limit",
+        "tokens limit",
+        "maximum number of tokens",
+        "input.*token.*limit",
+        "exceeds the.*context",
+        "too many tokens",
+        "prompt is too long",
+        "request too large",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 fn is_chat_format(format: &ProviderFormat) -> bool {
     matches!(
         format,
@@ -665,6 +687,19 @@ async fn handle_proxy(
             let err = ProxyError::Upstream(format!("HTTP {}: {}",
                 status_code, truncate_chars(&err_body, 200)));
             log::warn!("[Proxy] upstream {} (retryable): {}", status_code, err);
+            last_error = Some(err);
+            continue;
+        }
+        // 400 "context length / token limit exceeded" is a per-route limit, not a
+        // malformed request — a different route may have a higher context window.
+        // Retry on the next candidate so an oversized request isn't hard-failed
+        // just because the first route's limit is smaller.
+        if status_code == 400 && is_context_limit_error(&err_body) {
+            let err = ProxyError::Upstream(format!(
+                "HTTP 400 context limit: {}",
+                truncate_chars(&err_body, 200)
+            ));
+            log::warn!("[Proxy] {} context-limit 400 (retryable): trying next route", tag);
             last_error = Some(err);
             continue;
         }
@@ -1260,16 +1295,16 @@ async fn handle_count_tokens(
 
     if !status.is_success() {
         let body_str = String::from_utf8_lossy(&resp_body);
-        log::warn!(
-            "[Proxy] count_tokens <<< {} {}: {}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or("?"),
-            truncate_chars(&body_str, 300)
-        );
-        // If the upstream provider doesn't support /count_tokens (404/405/501/502),
-        // fall back to a local estimate instead of erroring out.
+        // Fallback statuses mean the upstream simply doesn't expose /count_tokens
+        // (common for OpenAI-format providers). This is expected and handled by a
+        // local estimate — log at debug, not warn, to avoid log spam on routine
+        // advisory calls. Genuine errors (400/401/403/429/…) still WARN below.
         if matches!(status.as_u16(), 404 | 405 | 500 | 501 | 502 | 503) {
-            log::info!("[Proxy] count_tokens upstream unsupported, falling back to local estimate");
+            log::debug!(
+                "[Proxy] count_tokens <<< {} {} (unsupported, using local estimate)",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("?")
+            );
             let estimated = estimate_tokens(&body);
             let estimate_json = serde_json::json!({"input_tokens": estimated});
             return Ok((
@@ -1279,6 +1314,12 @@ async fn handle_count_tokens(
             )
                 .into_response());
         }
+        log::warn!(
+            "[Proxy] count_tokens <<< {} {}: {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("?"),
+            truncate_chars(&body_str, 300)
+        );
         last_error = Some(ProxyError::Upstream(format!(
             "count_tokens upstream error: HTTP {}: {}",
             status.as_u16(),
@@ -3019,6 +3060,20 @@ impl IntoResponse for ProxyError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_is_context_limit_error_detects_variants() {
+        assert!(is_context_limit_error(
+            "Error code: 400 - {'error': {'message': 'input token limit is 202752'}}"
+        ));
+        assert!(is_context_limit_error(
+            "This model's maximum context length is 8192 tokens."
+        ));
+        assert!(is_context_limit_error("context_length_exceeded"));
+        assert!(is_context_limit_error("Your prompt is too long for this model."));
+        assert!(!is_context_limit_error("Invalid API key"));
+        assert!(!is_context_limit_error("Bad request: missing field model"));
+    }
 
     #[test]
     fn test_last_user_text_string_content() {
