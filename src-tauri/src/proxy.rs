@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const STREAM_TIMEOUT: u64 = 3600;
-const NON_STREAM_TIMEOUT: u64 = 300;
+const NON_STREAM_TIMEOUT: u64 = 120;
 const HEALTH_CHECK_TIMEOUT: u64 = 30;
 
 /// Truncate a string to at most `max_chars` characters, safe for multi-byte UTF-8.
@@ -628,7 +628,7 @@ async fn handle_proxy(
         Err(e) => {
             let err = ProxyError::Upstream(e.to_string());
             if is_retryable(&err) {
-                log::warn!("[Proxy] connection error (retryable): {}", err);
+                log::warn!("[Proxy] {} timeout/connection error (retryable): {}", if is_streaming { "streaming" } else { "non-streaming" }, err);
                 last_error = Some(err);
                 continue;
             }
@@ -897,12 +897,13 @@ async fn handle_proxy(
     } else {
         // Non-streaming
         let status_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK);
+        log::info!("[Proxy] non-streaming response received: status={} latency={}ms", status.as_u16(), start.elapsed().as_millis());
         let resp_body = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
                 let err = ProxyError::Upstream(e.to_string());
                 if is_retryable(&err) {
-                    log::warn!("[Proxy] response body read error (retryable): {}", err);
+                    log::warn!("[Proxy] non-streaming body read error (retryable): {}", err);
                     last_error = Some(err);
                     continue;
                 }
@@ -925,6 +926,8 @@ async fn handle_proxy(
                 }
             }
         }
+
+        log::info!("[Proxy] non-streaming complete: {} bytes, total latency={}ms", resp_body.len(), start.elapsed().as_millis());
 
         match (client_protocol, provider_format) {
             ("anthropic", ProviderFormat::Openai) => {
