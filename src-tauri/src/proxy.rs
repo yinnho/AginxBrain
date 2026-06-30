@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const STREAM_TIMEOUT: u64 = 3600;
-const NON_STREAM_TIMEOUT: u64 = 120;
+const NON_STREAM_TIMEOUT: u64 = 45;
+pub const CONNECT_TIMEOUT: u64 = 10;
 const HEALTH_CHECK_TIMEOUT: u64 = 30;
 
 /// Truncate a string to at most `max_chars` characters, safe for multi-byte UTF-8.

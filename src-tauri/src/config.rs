@@ -479,6 +479,7 @@ impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self> {
         let cache_max = config.smart_routing.cache_max_sessions;
         let http_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(crate::proxy::CONNECT_TIMEOUT))
             .timeout(std::time::Duration::from_secs(3600))
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create HTTP client: {}", e))?;
