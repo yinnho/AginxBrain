@@ -627,14 +627,12 @@ async fn handle_proxy(
     // 6. Build headers
     let mut req_builder = state.http_client.post(&url);
 
-    // DEBUG: log the forwarded body (truncated) to help diagnose validation errors
+    // DEBUG: log the forwarded body (size + truncated preview) to help diagnose
+    // validation and token-count issues.
     if let Ok(s) = serde_json::to_string(&fwd_body) {
-        let truncated = if s.chars().count() > 200 {
-            format!("{}...(truncated)", s.chars().take(200).collect::<String>())
-        } else {
-            s.clone()
-        };
-        log::info!("[Proxy] forwarding body: {}", truncated);
+        let msg_count = fwd_body.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0);
+        let preview: String = s.chars().take(160).collect();
+        log::info!("[Proxy] forwarding body ({} bytes, {} msgs): {}...", s.len(), msg_count, preview);
     }
 
     // Auth
