@@ -21,6 +21,12 @@ const NON_STREAM_TIMEOUT: u64 = 45;
 const NON_STREAM_TIMEOUT_REASONING: u64 = 120;
 pub const CONNECT_TIMEOUT: u64 = 10;
 const HEALTH_CHECK_TIMEOUT: u64 = 30;
+// Same-route retry for transient upstream errors (truncated response body,
+// connection reset mid-read). These are usually instantaneous hiccups, so an
+// immediate retry on the SAME route usually succeeds — keeping the same model
+// instead of jumping to a different provider via cross-route failover.
+const SAME_ROUTE_RETRIES: u32 = 2;
+const SAME_ROUTE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Truncate a string to at most `max_chars` characters, safe for multi-byte UTF-8.
 fn truncate_chars(s: &str, max_chars: usize) -> &str {
@@ -648,18 +654,22 @@ async fn handle_proxy(
     // Forward client headers (hop-by-hop and auth headers are filtered internally)
     req_builder = forward_client_headers(&headers, req_builder);
 
+    // Keep a clone for same-route retry on transient body-read / send errors.
+    let req_clone = req_builder.try_clone();
+    let req_timeout = std::time::Duration::from_secs(
+        if is_streaming {
+            STREAM_TIMEOUT
+        } else if tag == "reasoning" {
+            NON_STREAM_TIMEOUT_REASONING
+        } else {
+            NON_STREAM_TIMEOUT
+        }
+    );
+
     // 7. Send
     let resp = match req_builder
         .json(&fwd_body)
-        .timeout(std::time::Duration::from_secs(
-            if is_streaming {
-                STREAM_TIMEOUT
-            } else if tag == "reasoning" {
-                NON_STREAM_TIMEOUT_REASONING
-            } else {
-                NON_STREAM_TIMEOUT
-            }
-        ))
+        .timeout(req_timeout)
         .send()
         .await
     {
@@ -965,13 +975,54 @@ async fn handle_proxy(
         let resp_body = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                let err = ProxyError::Upstream(e.to_string());
-                if is_retryable(&err) {
-                    log::warn!("[Proxy] non-streaming body read error (retryable): {}", err);
-                    last_error = Some(err);
-                    continue;
+                // Transient truncation (upstream closed mid-body). Retry the SAME
+                // route up to SAME_ROUTE_RETRIES times before cross-route failover
+                // — keeps the same model and usually succeeds on immediate retry.
+                let mut last_err = e.to_string();
+                let mut recovered: Option<bytes::Bytes> = None;
+                if let Some(base) = req_clone.as_ref() {
+                    for attempt in 1..=SAME_ROUTE_RETRIES {
+                        log::warn!(
+                            "[Proxy] non-streaming body read error, same-route retry #{}: {}",
+                            attempt, last_err
+                        );
+                        tokio::time::sleep(SAME_ROUTE_DELAY).await;
+                        let retry = match base.try_clone() {
+                            Some(c) => c.timeout(req_timeout).send().await,
+                            None => break,
+                        };
+                        match retry {
+                            Ok(r) if r.status().is_success() => match r.bytes().await {
+                                Ok(b) => {
+                                    log::info!(
+                                        "[Proxy] same-route retry #{} recovered response ({} bytes)",
+                                        attempt, b.len()
+                                    );
+                                    recovered = Some(b);
+                                    break;
+                                }
+                                Err(e2) => last_err = e2.to_string(),
+                            },
+                            Ok(r) => {
+                                last_err = format!("retry returned status {}", r.status());
+                                break;
+                            }
+                            Err(e2) => last_err = e2.to_string(),
+                        }
+                    }
                 }
-                return Err(err);
+                match recovered {
+                    Some(b) => b,
+                    None => {
+                        let err = ProxyError::Upstream(last_err);
+                        log::warn!(
+                            "[Proxy] non-streaming body read failed after same-route retries, failing over: {}",
+                            err
+                        );
+                        last_error = Some(err);
+                        continue;
+                    }
+                }
             }
         };
 
