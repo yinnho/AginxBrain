@@ -113,8 +113,11 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
           tags={config.tags.map(t => t.name)}
           onSave={async (route) => {
             try {
-              await api.createRoute(route);
-              onConfigChange({ ...config, routes: [...config.routes, route] });
+              const res = await api.createRoute(route);
+              // Use the server-generated id so subsequent route_priority maps
+              // reference the correct key (otherwise it stays "" and the route
+              // never becomes primary).
+              onConfigChange({ ...config, routes: [...config.routes, { ...route, id: res.id }] });
               setAdding(false);
             } catch (e: any) {
               alert(e.message || 'Failed to save route');

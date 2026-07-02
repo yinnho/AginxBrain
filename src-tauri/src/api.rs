@@ -455,17 +455,21 @@ pub async fn create_route(
     State(state): State<AppState>,
     Json(mut route): Json<crate::config::Route>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let index = mutate_config(&state, |config| {
-        // Auto-generate ID if not provided
+    // Return the generated ID alongside the index, so the frontend can use the
+    // real ID when building route_priority maps. Without this, a newly-created
+    // route stays id="" on the client and its priority gets saved under an
+    // empty-string key (orphaned — the route never becomes primary).
+    let (index, id) = mutate_config(&state, |config| {
         if route.id.trim().is_empty() {
             route.id = crate::config::new_route_id();
         }
+        let id = route.id.clone();
         validate_route(config, &route)?;
         config.routes.push(route);
-        Ok(config.routes.len() - 1)
+        Ok((config.routes.len() - 1, id))
     })
     .await?;
-    Ok(Json(serde_json::json!({ "index": index })))
+    Ok(Json(serde_json::json!({ "index": index, "id": id })))
 }
 
 // PUT /api/routes/:index

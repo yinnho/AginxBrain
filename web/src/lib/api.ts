@@ -302,7 +302,7 @@ export async function setCurrentTag(tag: string): Promise<void> {
 
 // ─── Fine-grained route CRUD ────────────────────────────────────────────
 
-export async function createRoute(route: Route): Promise<{ index: number }> {
+export async function createRoute(route: Route): Promise<{ index: number; id: string }> {
   const res = await fetch(`${API_BASE}/routes`, {
     method: 'POST',
     headers: jsonHeaders(),
