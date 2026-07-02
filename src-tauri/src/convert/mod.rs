@@ -440,4 +440,30 @@ mod tests {
         assert_eq!(tool_calls[0]["function"]["name"], "bash");
         assert_eq!(tool_calls[0]["function"]["arguments"], "{\"cmd\":\"ls\"}");
     }
+
+    #[test]
+    fn test_openai_to_responses_user_image() {
+        // Chat-format user content (text + image_url) must become Responses
+        // input_text + input_image, or the Responses API rejects the type names.
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what color?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+                ]
+            }]
+        });
+        let result = openai_to_responses_request(&body, "qwen3.7-plus");
+
+        let input = result["input"].as_array().unwrap();
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "what color?");
+        assert_eq!(content[1]["type"], "input_image");
+        // image_url object flattened to a bare string
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,AAA");
+    }
 }

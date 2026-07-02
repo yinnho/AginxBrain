@@ -811,8 +811,50 @@ pub fn openai_to_responses_request(body: &Value, target_model: &str) -> Value {
                     }));
                 }
                 _ => {
-                    // user or other → user message
-                    input.push(json!({"role": role, "content": content.cloned().unwrap_or(Value::String(String::new()))}));
+                    // user (or other) → user message. OpenAI Chat content blocks
+                    // must be translated to Responses content blocks, or the
+                    // Responses API rejects them ("Invalid content type: text"):
+                    //   text      → input_text
+                    //   image_url → input_image  (image_url object flattened to a string)
+                    let converted = match content {
+                        Some(Value::String(s)) => {
+                            Value::Array(vec![json!({ "type": "input_text", "text": s })])
+                        }
+                        Some(Value::Array(blocks)) => {
+                            let mut parts: Vec<Value> = Vec::new();
+                            for block in blocks {
+                                let t = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                match t {
+                                    "text" | "input_text" => {
+                                        if let Some(txt) = block.get("text").and_then(|v| v.as_str()) {
+                                            parts.push(json!({ "type": "input_text", "text": txt }));
+                                        }
+                                    }
+                                    "image_url" | "input_image" => {
+                                        // Chat: {"image_url": {"url": "..."}}  →  Responses: {"image_url": "..."}
+                                        let url = block.get("image_url").and_then(|v| {
+                                            if let Some(s) = v.as_str() {
+                                                Some(s.to_string())
+                                            } else {
+                                                v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string())
+                                            }
+                                        });
+                                        if let Some(url) = url {
+                                            parts.push(json!({ "type": "input_image", "image_url": url }));
+                                        }
+                                    }
+                                    _ => {
+                                        // Unknown block — pass through best-effort.
+                                        parts.push(block.clone());
+                                    }
+                                }
+                            }
+                            Value::Array(parts)
+                        }
+                        Some(other) => other.clone(),
+                        None => Value::String(String::new()),
+                    };
+                    input.push(json!({ "role": role, "content": converted }));
                 }
             }
         }
