@@ -13,6 +13,12 @@ use serde_json::{json, Value};
 
 const STREAM_TIMEOUT: u64 = 3600;
 const NON_STREAM_TIMEOUT: u64 = 45;
+// Reasoning models (qwen3.7-max, deepseek-v4-pro thinking, etc.) legitimately
+// spend 60-120s "thinking" on heavy payloads before emitting output. The 45s
+// chat timeout cuts them off mid-reasoning and triggers a wasteful failover.
+// Give the `reasoning` tag a longer ceiling; connect_timeout (10s) still bounds
+// genuine connection-level stalls.
+const NON_STREAM_TIMEOUT_REASONING: u64 = 120;
 pub const CONNECT_TIMEOUT: u64 = 10;
 const HEALTH_CHECK_TIMEOUT: u64 = 30;
 
@@ -645,7 +651,15 @@ async fn handle_proxy(
     // 7. Send
     let resp = match req_builder
         .json(&fwd_body)
-        .timeout(std::time::Duration::from_secs(if is_streaming { STREAM_TIMEOUT } else { NON_STREAM_TIMEOUT }))
+        .timeout(std::time::Duration::from_secs(
+            if is_streaming {
+                STREAM_TIMEOUT
+            } else if tag == "reasoning" {
+                NON_STREAM_TIMEOUT_REASONING
+            } else {
+                NON_STREAM_TIMEOUT
+            }
+        ))
         .send()
         .await
     {
