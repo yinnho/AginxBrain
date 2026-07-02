@@ -491,4 +491,31 @@ mod tests {
         assert_eq!(content[1]["type"], "input_image");
         assert_eq!(content[1]["image_url"], "data:image/jpeg;base64,BBB");
     }
+
+    #[test]
+    fn test_openai_to_responses_flattens_tools() {
+        // Chat wraps functions as {"type":"function","function":{...}}; the
+        // Responses API needs the flat form or it rejects the parameter schema.
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "get weather",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        });
+        let result = openai_to_responses_request(&body, "qwen3.7-plus");
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        // flattened: name/parameters at top level, no nested "function"
+        assert_eq!(tools[0]["name"], "get_weather");
+        assert_eq!(tools[0]["description"], "get weather");
+        assert!(tools[0]["parameters"].is_object());
+        assert!(tools[0].get("function").is_none());
+    }
 }

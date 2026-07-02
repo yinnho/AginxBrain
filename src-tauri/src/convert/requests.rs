@@ -877,9 +877,31 @@ pub fn openai_to_responses_request(body: &Value, target_model: &str) -> Value {
         out.insert("stream".into(), s.clone());
     }
 
-    // tools passthrough (already in OpenAI function format)
-    if let Some(tools) = body.get("tools") {
-        out.insert("tools".into(), tools.clone());
+    // tools: Chat wraps each function as {"type":"function","function":{name,...}},
+    // but the Responses API expects the flat form {"type":"function","name":...}.
+    // Passing Chat-format tools through unchanged makes the Responses API reject
+    // the parameter schema (DashScope: "parameters must conform to valid openai-
+    // compatible JSON schema"). Flatten function tools.
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        let converted: Vec<Value> = tools
+            .iter()
+            .map(|tool| {
+                if tool.get("type").and_then(|t| t.as_str()) == Some("function") {
+                    if let Some(func) = tool.get("function") {
+                        let mut flat = serde_json::Map::new();
+                        flat.insert("type".into(), Value::String("function".into()));
+                        for k in ["name", "description", "parameters", "strict"] {
+                            if let Some(v) = func.get(k) {
+                                flat.insert(k.into(), v.clone());
+                            }
+                        }
+                        return Value::Object(flat);
+                    }
+                }
+                tool.clone()
+            })
+            .collect();
+        out.insert("tools".into(), Value::Array(converted));
     }
     if let Some(tc) = body.get("tool_choice") {
         out.insert("tool_choice".into(), tc.clone());
