@@ -980,8 +980,21 @@ async fn handle_proxy(
                 // — keeps the same model and usually succeeds on immediate retry.
                 let mut last_err = e.to_string();
                 let mut recovered: Option<bytes::Bytes> = None;
+                // Only retry if the original response was fast. A slow response
+                // that then truncated signals upstream OVERLOAD (e.g. deepseek
+                // 43s + bad body) — retrying just wastes the remaining time budget
+                // and risks blowing the client's deadline. Fail over instead.
+                let elapsed = start.elapsed();
+                let retry_budget_ok = elapsed < req_timeout / 2;
                 if let Some(base) = req_clone.as_ref() {
                     for attempt in 1..=SAME_ROUTE_RETRIES {
+                        if !retry_budget_ok {
+                            log::warn!(
+                                "[Proxy] non-streaming body read error after slow response ({}ms), skipping same-route retry — failing over",
+                                elapsed.as_millis()
+                            );
+                            break;
+                        }
                         log::warn!(
                             "[Proxy] non-streaming body read error, same-route retry #{}: {}",
                             attempt, last_err
