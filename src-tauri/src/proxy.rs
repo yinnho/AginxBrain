@@ -236,8 +236,6 @@ fn is_context_limit_error(err_body: &str) -> bool {
         "token limit",
         "tokens limit",
         "maximum number of tokens",
-        "input.*token.*limit",
-        "exceeds the.*context",
         "too many tokens",
         "prompt is too long",
         "request too large",
@@ -1181,23 +1179,18 @@ async fn handle_count_tokens(
         return Err(ProxyError::NoRoute(tag.clone()));
     }
 
-    let mut last_error: Option<ProxyError> = None;
-    let mut last_modality: String = String::new();
-
     for (attempt, (_route_idx, route)) in candidates.iter().enumerate() {
         if attempt > 0 {
             log::warn!("[Proxy] count_tokens {} failover: trying route #{} (provider={}, model={})",
                 tag, attempt + 1, route.provider, route.model);
         }
 
-        last_modality = format!("{:?}", route.format);
         if !is_chat_format(&route.format) {
             let err = ProxyError::Upstream(format!(
                 "count_tokens is not supported for route format {:?}",
                 route.format
             ));
             log::warn!("[Proxy] count_tokens skipping route: {}", err);
-            last_error = Some(err);
             continue;
         }
 
@@ -1205,17 +1198,12 @@ async fn handle_count_tokens(
             Some(p) => p,
             None => {
                 log::warn!("[Proxy] count_tokens route references unknown provider '{}', skipping", route.provider);
-                last_error = Some(ProxyError::NoProvider(route.provider.clone()));
                 continue;
             }
         };
 
     if provider.api_key.is_empty() || provider.api_key.starts_with("sk-your-") {
         log::warn!("[Proxy] count_tokens provider '{}' has no valid API key, skipping", route.provider);
-        last_error = Some(ProxyError::NoProvider(format!(
-            "provider '{}' has no valid API key configured",
-            route.provider
-        )));
         continue;
     }
 
@@ -1269,7 +1257,6 @@ async fn handle_count_tokens(
             let err = ProxyError::Upstream(e.to_string());
             if is_retryable(&err) {
                 log::warn!("[Proxy] count_tokens connection error (retryable): {}", err);
-                last_error = Some(err);
                 continue;
             }
             return Err(err);
@@ -1284,7 +1271,6 @@ async fn handle_count_tokens(
             let err = ProxyError::Upstream(e.to_string());
             if is_retryable(&err) {
                 log::warn!("[Proxy] count_tokens body read error (retryable): {}", err);
-                last_error = Some(err);
                 continue;
             }
             return Err(err);
@@ -1318,11 +1304,6 @@ async fn handle_count_tokens(
             status.canonical_reason().unwrap_or("?"),
             truncate_chars(&body_str, 300)
         );
-        last_error = Some(ProxyError::Upstream(format!(
-            "count_tokens upstream error: HTTP {}: {}",
-            status.as_u16(),
-            truncate_chars(&body_str, 200)
-        )));
         continue;
     }
 
@@ -2179,6 +2160,16 @@ async fn handle_image_request(
     let size = body.get("size").and_then(|v| v.as_str()).map(|s| s.to_string());
     let n = body.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
+    let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.format.path());
+    log::info!(
+        "[Proxy] image → {} (model={}, format={:?})",
+        provider.name, route.model, route.format
+    );
+    log::info!(
+        "[Proxy] forwarding image request to {}",
+        url
+    );
+
     let req = GenerateImageRequest {
         tag: None,
         prompt: prompt.clone(),
@@ -2187,7 +2178,6 @@ async fn handle_image_request(
         extra: std::collections::HashMap::new(),
     };
 
-    let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.format.path());
     let images: Vec<GeneratedImage> = match &route.format {
         ProviderFormat::OpenaiImages => generate_openai_images(&state, provider, route, &url, &prompt, &req).await?,
         ProviderFormat::DashscopeImage => generate_dashscope_image(&state, provider, route, &url, &prompt, &req).await?,
@@ -2199,6 +2189,12 @@ async fn handle_image_request(
     if images.is_empty() {
         return Err(ProxyError::Upstream("image provider returned no images".into()));
     }
+
+    log::info!(
+        "[Proxy] image response: {} image(s), latency={}ms",
+        images.len(),
+        start.elapsed().as_millis()
+    );
 
     // Build OpenCarrier format A: output.choices[].message.content[].image
     let content: Vec<Value> = images.iter().map(|img| {
@@ -2393,7 +2389,7 @@ async fn send_image_post(
     }
     let resp = builder
         .json(body)
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(45))
         .send()
         .await
         .map_err(|e| ProxyError::Upstream(e.to_string()))?;
@@ -2403,7 +2399,7 @@ async fn send_image_post(
 async fn send_image_get(state: &AppState, provider: &Provider, url: &str) -> Result<Value, ProxyError> {
     let resp = state.http_client.get(url)
         .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key))
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(|e| ProxyError::Upstream(e.to_string()))?;

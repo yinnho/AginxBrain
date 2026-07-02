@@ -189,6 +189,7 @@ pub struct Tag {
 }
 
 impl Tag {
+    #[cfg(test)]
     pub fn new(name: &str, color: &str, is_auto: bool) -> Self {
         Self { name: name.to_string(), color: color.to_string(), is_auto, route_priority: HashMap::new() }
     }

@@ -1,4 +1,5 @@
 use crate::config::AppState;
+#[cfg(all(not(debug_assertions), feature = "server"))]
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};

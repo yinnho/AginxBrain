@@ -36,15 +36,6 @@ impl Tier {
             Tier::Opus => "opus",
         }
     }
-
-    fn from_str_opt(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "haiku" => Some(Tier::Haiku),
-            "sonnet" => Some(Tier::Sonnet),
-            "opus" => Some(Tier::Opus),
-            _ => None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

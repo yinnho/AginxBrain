@@ -277,13 +277,41 @@ pub fn anthropic_to_openai_response(body: &Value, request_model: &str) -> Value 
 // OpenAI Responses → Anthropic: Non-streaming response conversion
 // ---------------------------------------------------------------------------
 
+/// Extract the concatenated summary text from a Responses API `reasoning` output
+/// item. The item shape is
+/// `{"type": "reasoning", "summary": [{"type": "summary_text", "text": "..."}]}`.
+/// Returns `None` when the item carries no non-empty summary text.
+fn responses_reasoning_text(item: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(summary) = item.get("summary").and_then(|s| s.as_array()) {
+        for s in summary {
+            if let Some(text) = s.get("text").and_then(|t| t.as_str()) {
+                if !text.is_empty() {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(""))
+    }
+}
+
 /// Convert an OpenAI Responses API response to Anthropic Messages response format.
 pub fn responses_to_anthropic_response(body: &Value, request_model: &str) -> Value {
     let mut content: Vec<Value> = Vec::new();
+    let mut reasoning_text: Option<String> = None;
 
     if let Some(output) = body.get("output").and_then(|o| o.as_array()) {
         for item in output {
             match item.get("type").and_then(|t| t.as_str()) {
+                Some("reasoning") => {
+                    if let Some(t) = responses_reasoning_text(item) {
+                        reasoning_text = Some(t);
+                    }
+                }
                 Some("message") => {
                     if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
                         for part in parts {
@@ -320,6 +348,15 @@ pub fn responses_to_anthropic_response(body: &Value, request_model: &str) -> Val
             }
         }
     }
+
+    // Anthropic requires thinking blocks to precede other content blocks.
+    let mut content = if let Some(thinking) = reasoning_text {
+        let mut v = vec![json!({ "type": "thinking", "thinking": thinking })];
+        v.extend(content);
+        v
+    } else {
+        content
+    };
 
     if content.is_empty() {
         content.push(json!({"type": "text", "text": ""}));
@@ -380,10 +417,16 @@ pub fn responses_to_anthropic_response(body: &Value, request_model: &str) -> Val
 pub fn responses_to_openai_response(body: &Value, request_model: &str) -> Value {
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+    let mut reasoning_text: Option<String> = None;
 
     if let Some(output) = body.get("output").and_then(|o| o.as_array()) {
         for item in output {
             match item.get("type").and_then(|t| t.as_str()) {
+                Some("reasoning") => {
+                    if let Some(t) = responses_reasoning_text(item) {
+                        reasoning_text = Some(t);
+                    }
+                }
                 Some("message") => {
                     if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
                         for part in parts {
@@ -431,6 +474,9 @@ pub fn responses_to_openai_response(body: &Value, request_model: &str) -> Value 
     });
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
+    }
+    if let Some(reasoning) = reasoning_text {
+        message["reasoning_content"] = Value::String(reasoning);
     }
 
     json!({
@@ -792,5 +838,59 @@ mod tests {
         // No think block
         let text = "Just a normal response";
         assert!(codex_split_leading_think_block(text).is_none());
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_with_reasoning() {
+        let body = json!({
+            "id": "resp_789",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking it over"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "The answer is 42"}]
+                }
+            ],
+            "status": "completed",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let result = responses_to_anthropic_response(&body, "claude-sonnet-4-6");
+
+        // Thinking block must come before text.
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "thinking it over");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "The answer is 42");
+    }
+
+    #[test]
+    fn test_responses_to_openai_with_reasoning() {
+        let body = json!({
+            "id": "resp_789",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking it over"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "The answer is 42"}]
+                }
+            ],
+            "status": "completed",
+            "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        });
+        let result = responses_to_openai_response(&body, "gpt-4o");
+
+        let message = &result["choices"][0]["message"];
+        assert_eq!(message["content"], "The answer is 42");
+        assert_eq!(message["reasoning_content"], "thinking it over");
     }
 }
