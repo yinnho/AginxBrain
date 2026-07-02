@@ -823,30 +823,27 @@ pub fn openai_to_responses_request(body: &Value, target_model: &str) -> Value {
                         Some(Value::Array(blocks)) => {
                             let mut parts: Vec<Value> = Vec::new();
                             for block in blocks {
-                                let t = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                match t {
-                                    "text" | "input_text" => {
-                                        if let Some(txt) = block.get("text").and_then(|v| v.as_str()) {
-                                            parts.push(json!({ "type": "input_text", "text": txt }));
+                                // Detect by key presence, not just `type`: some
+                                // clients send {"image_url": "..."} or {"text": "..."}
+                                // with no type field, which would otherwise pass
+                                // through and be rejected by the Responses API.
+                                if block.get("image_url").is_some() {
+                                    // Chat: {"image_url": {"url": "..."}}  →  Responses: {"image_url": "..."}
+                                    let url = block.get("image_url").and_then(|v| {
+                                        if let Some(s) = v.as_str() {
+                                            Some(s.to_string())
+                                        } else {
+                                            v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string())
                                         }
+                                    });
+                                    if let Some(url) = url {
+                                        parts.push(json!({ "type": "input_image", "image_url": url }));
                                     }
-                                    "image_url" | "input_image" => {
-                                        // Chat: {"image_url": {"url": "..."}}  →  Responses: {"image_url": "..."}
-                                        let url = block.get("image_url").and_then(|v| {
-                                            if let Some(s) = v.as_str() {
-                                                Some(s.to_string())
-                                            } else {
-                                                v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string())
-                                            }
-                                        });
-                                        if let Some(url) = url {
-                                            parts.push(json!({ "type": "input_image", "image_url": url }));
-                                        }
-                                    }
-                                    _ => {
-                                        // Unknown block — pass through best-effort.
-                                        parts.push(block.clone());
-                                    }
+                                } else if let Some(txt) = block.get("text").and_then(|v| v.as_str()) {
+                                    parts.push(json!({ "type": "input_text", "text": txt }));
+                                } else {
+                                    // Unknown block — pass through best-effort.
+                                    parts.push(block.clone());
                                 }
                             }
                             Value::Array(parts)

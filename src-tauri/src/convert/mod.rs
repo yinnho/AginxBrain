@@ -466,4 +466,29 @@ mod tests {
         // image_url object flattened to a bare string
         assert_eq!(content[1]["image_url"], "data:image/png;base64,AAA");
     }
+
+    #[test]
+    fn test_openai_to_responses_user_image_no_type() {
+        // Some clients send {"image_url": "..."} with NO type field. The
+        // converter must still emit input_image (detected by key presence),
+        // or the Responses API rejects the block.
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"text": "describe this"},
+                    {"image_url": "data:image/jpeg;base64,BBB"}
+                ]
+            }]
+        });
+        let result = openai_to_responses_request(&body, "qwen3.7-plus");
+
+        let content = result["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "describe this");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/jpeg;base64,BBB");
+    }
 }
