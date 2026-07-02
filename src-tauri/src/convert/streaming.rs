@@ -431,6 +431,11 @@ pub fn convert_anthropic_stream_to_openai(
         let mut block_index_to_type: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
         // Track tool calls per tool block
         let mut tool_blocks: std::collections::HashMap<u32, serde_json::Map<String, Value>> = std::collections::HashMap::new();
+        // Anthropic content-block index → OpenAI 0-based tool_calls index.
+        // Anthropic block index counts ALL blocks (text/thinking/tool_use), so a
+        // tool at block index 2 must still be tool_calls[0]. Map them explicitly.
+        let mut tool_index_map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut next_tool_index: u32 = 0;
 
         tokio::pin!(upstream);
 
@@ -508,7 +513,7 @@ pub fn convert_anthropic_stream_to_openai(
                                 let tc_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let mut tc = serde_json::Map::new();
-                                tc.insert("id".to_string(), Value::String(tc_id));
+                                tc.insert("id".to_string(), Value::String(tc_id.clone()));
                                 tc.insert("type".to_string(), Value::String("function".to_string()));
                                 let mut func = serde_json::Map::new();
                                 func.insert("name".to_string(), Value::String(name.clone()));
@@ -516,6 +521,22 @@ pub fn convert_anthropic_stream_to_openai(
                                 tc.insert("function".to_string(), Value::Object(func));
                                 tool_blocks.insert(idx, tc);
                                 open_blocks.insert(idx, String::new());
+
+                                // Assign a 0-based tool index and emit the standard
+                                // OpenAI first tool_call delta (id + name + empty args)
+                                // so clients can identify the call before args stream in.
+                                let t_idx = next_tool_index;
+                                next_tool_index += 1;
+                                tool_index_map.insert(idx, t_idx);
+                                let first_delta = json!([{
+                                    "index": t_idx,
+                                    "id": tc_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": ""}
+                                }]);
+                                let chat_chunk = chat_delta_chunk(&response_id, &model, created, chunk_id, false, "", Some(first_delta));
+                                chunk_id += 1;
+                                yield Ok(chat_chunk);
                             }
                             _ => {}
                         }
@@ -544,7 +565,7 @@ pub fn convert_anthropic_stream_to_openai(
                             }
                             "input_json_delta" => {
                                 if let Some(partial) = delta.get("partial_json").and_then(|v| v.as_str()) {
-                                    // Emit incremental tool argument delta to match OpenAI streaming protocol
+                                    // Accumulate internally (kept for completeness).
                                     if let Some(tc) = tool_blocks.get_mut(&idx) {
                                         if let Some(func) = tc.get_mut("function").and_then(|f| f.as_object_mut()) {
                                             let args = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
@@ -552,14 +573,17 @@ pub fn convert_anthropic_stream_to_openai(
                                             func.insert("arguments".to_string(), Value::String(new_args));
                                         }
                                     }
-                                    // Emit partial arguments as they arrive (streaming protocol)
-                                    let tc_delta = json!([{
-                                        "index": idx,
-                                        "function": {"arguments": partial}
-                                    }]);
-                                    let chat_chunk = chat_delta_chunk(&response_id, &model, created, chunk_id, false, "", Some(tc_delta));
-                                    chunk_id += 1;
-                                    yield Ok(chat_chunk);
+                                    // Emit the incremental arguments delta only (standard OpenAI
+                                    // streaming). Use the mapped 0-based tool index.
+                                    if let Some(&t_idx) = tool_index_map.get(&idx) {
+                                        let tc_delta = json!([{
+                                            "index": t_idx,
+                                            "function": {"arguments": partial}
+                                        }]);
+                                        let chat_chunk = chat_delta_chunk(&response_id, &model, created, chunk_id, false, "", Some(tc_delta));
+                                        chunk_id += 1;
+                                        yield Ok(chat_chunk);
+                                    }
                                 }
                             }
                             _ => {}
@@ -570,19 +594,9 @@ pub fn convert_anthropic_stream_to_openai(
                         let block_type = block_index_to_type.get(&idx).map(|s| s.as_str()).unwrap_or("");
 
                         if block_type == "tool_use" {
-                            // Emit the tool call as a delta chunk (with full accumulated args at stop)
-                            if let Some(tc_map) = tool_blocks.get(&idx) {
-                                let tc_val = Value::Object(tc_map.clone());
-                                let tc_delta = json!([{
-                                    "index": idx,
-                                    "id": tc_val.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                                    "type": tc_val.get("type").and_then(|v| v.as_str()).unwrap_or("function"),
-                                    "function": tc_val.get("function").unwrap_or(&Value::Null)
-                                }]);
-                                let chat_chunk = chat_delta_chunk(&response_id, &model, created, chunk_id, false, "", Some(tc_delta));
-                                chunk_id += 1;
-                                yield Ok(chat_chunk);
-                            }
+                            // Args already streamed incrementally via input_json_delta;
+                            // do NOT re-emit a full-args chunk (it doubles the args for
+                            // clients that accumulate, producing invalid JSON).
                         }
 
                         open_blocks.remove(&idx);
