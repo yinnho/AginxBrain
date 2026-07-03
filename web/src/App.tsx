@@ -3,7 +3,7 @@ import type { AppConfig, Status } from './lib/api';
 import * as api from './lib/api';
 import { LoginPage } from './pages/LoginPage';
 import { LandingPage } from './pages/LandingPage';
-import { LogsPage } from './pages/LogsPage';
+import { DashboardPage } from './pages/DashboardPage';
 import { ApiKeysPage } from './pages/ApiKeysPage';
 import { ProvidersPage } from './pages/ProvidersPage';
 import { RoutesPage } from './pages/RoutesPage';
@@ -171,7 +171,7 @@ function App() {
       </div>
 
       {/* Tab content */}
-      {tab === 'dashboard' && <LogsPage />}
+      {tab === 'dashboard' && <DashboardPage />}
       {tab === 'keys' && <ApiKeysPage />}
       {tab === 'providers' && <ProvidersPage config={config!} onConfigChange={handleConfigChange} />}
       {tab === 'routes' && <RoutesPage config={config!} onConfigChange={handleConfigChange} />}

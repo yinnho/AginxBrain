@@ -120,3 +120,22 @@ pub struct SetCostRateRequest {
     pub input_price_per_1k: f64,
     pub output_price_per_1k: f64,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderHealth {
+    pub provider: String,
+    pub total_requests: i64,
+    pub success_count: i64,
+    pub failure_count: i64,
+    pub success_rate: f64,
+    pub avg_latency_ms: f64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorEntry {
+    pub timestamp: String,
+    pub error_message: String,
+    pub model: String,
+}

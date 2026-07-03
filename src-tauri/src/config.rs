@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use notify::Watcher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -149,7 +150,19 @@ pub struct Route {
     pub format: ProviderFormat,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_tool_mode")]
+    pub tool_mode: ToolMode,
 }
+
+/// How tool definitions should be sent to the upstream provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolMode {
+    Native,
+    ReactXml,
+}
+
+fn default_tool_mode() -> ToolMode { ToolMode::Native }
 
 fn generate_route_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -230,13 +243,13 @@ fn default_providers() -> HashMap<String, Provider> {
 
 fn default_routes() -> Vec<Route> {
     vec![
-        Route { id: "r_default_1".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { id: "r_default_2".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { id: "r_default_3".into(), base_url: "https://open.bigmodel.cn/api/anthropic".into(), ws_url: None, model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, enabled: true },
-        Route { id: "r_default_4".into(), base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(), ws_url: None, model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true },
-        Route { id: "r_default_5".into(), base_url: "https://api.kimi.com/coding".into(), ws_url: None, model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true },
-        Route { id: "r_default_6".into(), base_url: "https://api.minimaxi.com/anthropic".into(), ws_url: None, model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true },
-        Route { id: "r_default_7".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["gpt-5.5".into(), "codex".into()], format: ProviderFormat::Openai, enabled: true },
+        Route { id: "r_default_1".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_2".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_3".into(), base_url: "https://open.bigmodel.cn/api/anthropic".into(), ws_url: None, model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_4".into(), base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(), ws_url: None, model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_5".into(), base_url: "https://api.kimi.com/coding".into(), ws_url: None, model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_6".into(), base_url: "https://api.minimaxi.com/anthropic".into(), ws_url: None, model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_7".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["gpt-5.5".into(), "codex".into()], format: ProviderFormat::Openai, enabled: true, tool_mode: ToolMode::Native },
     ]
 }
 
@@ -468,12 +481,44 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// Per-route circuit breaker: after consecutive failures, the route is
+/// skipped for a cooldown period, then probed once. Keyed by route id.
+#[derive(Debug, Clone, Serialize)]
+pub enum CircuitStatus {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CircuitState {
+    pub status: CircuitStatus,
+    pub consecutive_failures: u32,
+    pub cooldown_remaining_secs: u64,
+    pub last_error: Option<String>,
+    #[serde(skip)]
+    pub opened_at_secs: u64, // Unix timestamp — used internally, computed for API
+}
+
+impl Default for CircuitState {
+    fn default() -> Self {
+        Self {
+            status: CircuitStatus::Closed,
+            consecutive_failures: 0,
+            cooldown_remaining_secs: 0,
+            last_error: None,
+            opened_at_secs: 0,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub http_client: reqwest::Client,
     pub db: sqlx::SqlitePool,
     pub smart_routing_cache: Arc<RwLock<crate::smart_routing::SessionCache>>,
+    pub circuit_breaker: Arc<RwLock<std::collections::HashMap<String, CircuitState>>>,
 }
 
 impl AppState {
@@ -492,8 +537,57 @@ impl AppState {
             smart_routing_cache: Arc::new(RwLock::new(
                 crate::smart_routing::SessionCache::new(cache_max),
             )),
+            circuit_breaker: Arc::new(RwLock::new(std::collections::HashMap::new())),
         })
     }
+}
+
+/// Watch the config file directory for changes and auto-reload.
+pub fn spawn_config_watcher(config: Arc<RwLock<AppConfig>>) {
+    let path = config_path().expect("failed to resolve config path");
+    let dir = path.parent().expect("config path has no parent").to_path_buf();
+    let filename = path.file_name().expect("config path has no filename")
+        .to_str().expect("bad filename").to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+    let mut watcher = notify::recommended_watcher(
+        move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                let ours = event.paths.iter().any(|p| {
+                    p.file_name().and_then(|n| n.to_str()) == Some(&filename)
+                });
+                if ours && (event.kind.is_modify() || event.kind.is_create()) {
+                    let _ = tx.send(());
+                }
+            }
+        },
+    ).expect("failed to create config file watcher");
+
+    watcher.watch(&dir, notify::RecursiveMode::NonRecursive)
+        .expect("failed to watch config directory");
+
+    tokio::spawn(async move {
+        let _watcher = watcher;
+        loop {
+            let Ok(()) = rx.recv() else { return };
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            while rx.try_recv().is_ok() {}
+            match load_config() {
+                Ok(new_config) => {
+                    let mut guard = config.write().await;
+                    if new_config.port != guard.port {
+                        log::warn!("[ConfigHotReload] port changed, restart required");
+                    }
+                    if new_config.host != guard.host {
+                        log::warn!("[ConfigHotReload] host changed, restart required");
+                    }
+                    *guard = new_config;
+                    log::info!("[ConfigHotReload] config reloaded successfully");
+                }
+                Err(e) => log::error!("[ConfigHotReload] {}", e),
+            }
+        }
+    });
 }
 #[cfg(test)]
 mod tests {

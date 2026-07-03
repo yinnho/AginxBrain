@@ -138,6 +138,7 @@ pub fn run_server(port_override: Option<u16>, host_override: Option<String>) {
         }
 
         let state = config::AppState::new(app_config).await.expect("failed to create state");
+        config::spawn_config_watcher(state.config.clone());
         let (host, port) = axum_server::start(state).await;
 
         println!("========================================");

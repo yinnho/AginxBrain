@@ -345,6 +345,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
   const [provider, setProvider] = useState(initial?.provider || providers[0] || '');
   const [selectedTags, setSelectedTags] = useState<string[]>(initial?.tags || []);
   const [format, setFormat] = useState<RouteFormat>(initial?.format || 'openai');
+  const [toolMode, setToolMode] = useState<'native' | 'react_xml'>(initial?.tool_mode || 'native');
 
   const toggleTag = (tag: string) => {
     setSelectedTags(prev => prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag]);
@@ -389,8 +390,16 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
           </div>
         </div>
       </div>
+      <div style={{ marginTop: 12 }}>
+        <span style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>Tool Mode</span>
+        <select value={toolMode} onChange={e => setToolMode(e.target.value as 'native' | 'react_xml')}
+          style={{ background: '#1a1a1a', color: '#ccc', border: '1px solid #333', borderRadius: 4, padding: '6px 10px', fontSize: 13, width: '100%' }}>
+          <option value="native">Native (standard tool calling)</option>
+          <option value="react_xml">ReAct XML (for models without tool calling)</option>
+        </select>
+      </div>
       <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
-        <Button variant="primary" disabled={!valid} onClick={() => onSave({ id: initial?.id || '', base_url: baseUrl, model, provider, tags: selectedTags, format, enabled: initial?.enabled ?? true })}>Save</Button>
+        <Button variant="primary" disabled={!valid} onClick={() => onSave({ id: initial?.id || '', base_url: baseUrl, model, provider, tags: selectedTags, format, enabled: initial?.enabled ?? true, tool_mode: toolMode as 'native' | 'react_xml' })}>Save</Button>
         <Button variant="ghost" onClick={onCancel}>Cancel</Button>
       </div>
     </Card>

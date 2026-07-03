@@ -1,4 +1,4 @@
-use crate::config::{AppState, AppConfig, Provider, ProviderFormat, Route};
+use crate::config::{AppState, AppConfig, CircuitState, CircuitStatus, Provider, ProviderFormat, Route};
 use crate::convert;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -10,6 +10,7 @@ use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::RwLock;
 
 const STREAM_TIMEOUT: u64 = 3600;
 const NON_STREAM_TIMEOUT: u64 = 45;
@@ -27,6 +28,11 @@ const HEALTH_CHECK_TIMEOUT: u64 = 30;
 // instead of jumping to a different provider via cross-route failover.
 const SAME_ROUTE_RETRIES: u32 = 2;
 const SAME_ROUTE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+// Circuit breaker: after consecutive failures on a route, stop trying it for
+// a cooldown period, then probe once (half-open). Prevents hammering a dead
+// provider on every new request.
+const CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
+const CIRCUIT_COOLDOWN_SECS: u64 = 60;
 
 /// Truncate a string to at most `max_chars` characters, safe for multi-byte UTF-8.
 fn truncate_chars(s: &str, max_chars: usize) -> &str {
@@ -233,6 +239,118 @@ fn is_retryable(err: &ProxyError) -> bool {
     // Any upstream error is retryable — try the next route in the failover chain.
     // Only config-level errors (no route, unknown provider) are non-retryable.
     matches!(err, ProxyError::Upstream(_))
+}
+
+async fn check_and_transition_circuit(
+    route_id: &str,
+    circuits: &Arc<RwLock<std::collections::HashMap<String, CircuitState>>>,
+) -> Result<(), String> {
+    let mut guard = circuits.write().await;
+    let state = guard.entry(route_id.to_string()).or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    match state.status {
+        CircuitStatus::Closed => Ok(()),
+        CircuitStatus::HalfOpen => Ok(()),
+        CircuitStatus::Open => {
+            let elapsed = now.saturating_sub(state.opened_at_secs);
+            if elapsed >= CIRCUIT_COOLDOWN_SECS {
+                // Cooldown expired — transition to half-open for one probe
+                state.status = CircuitStatus::HalfOpen;
+                state.cooldown_remaining_secs = 0;
+                log::info!("[CircuitBreaker] {} → half-open (probing)", route_id);
+                Ok(())
+            } else {
+                let remaining = CIRCUIT_COOLDOWN_SECS - elapsed;
+                state.cooldown_remaining_secs = remaining;
+                Err(format!("circuit open ({}s cooldown remaining)", remaining))
+            }
+        }
+    }
+}
+
+/// Check whether a route's circuit breaker allows a request (read-only).
+/// For the full check that also transitions to half-open, see above.
+
+async fn record_circuit_failure(
+    route_id: &str,
+    err: &ProxyError,
+    circuits: &Arc<RwLock<std::collections::HashMap<String, crate::config::CircuitState>>>,
+) {
+    if !is_retryable(err) {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut guard = circuits.write().await;
+    let state = guard.entry(route_id.to_string()).or_default();
+    state.consecutive_failures += 1;
+    state.last_error = Some(err.to_string());
+    state.cooldown_remaining_secs = CIRCUIT_COOLDOWN_SECS;
+    if state.consecutive_failures >= CIRCUIT_FAILURE_THRESHOLD
+        && matches!(
+            state.status,
+            crate::config::CircuitStatus::Closed | crate::config::CircuitStatus::HalfOpen
+        )
+    {
+        state.status = crate::config::CircuitStatus::Open;
+        state.opened_at_secs = now;
+        log::warn!(
+            "[CircuitBreaker] {} → open ({} failures, cooldown {}s)",
+            route_id,
+            state.consecutive_failures,
+            CIRCUIT_COOLDOWN_SECS
+        );
+    }
+}
+
+async fn close_circuit(
+    route_id: &str,
+    circuits: &Arc<RwLock<std::collections::HashMap<String, crate::config::CircuitState>>>,
+) {
+    let mut guard = circuits.write().await;
+    if let Some(state) = guard.get_mut(route_id) {
+        if !matches!(state.status, crate::config::CircuitStatus::Closed) {
+            log::info!("[CircuitBreaker] {} → closed (success)", route_id);
+        }
+        state.status = crate::config::CircuitStatus::Closed;
+        state.consecutive_failures = 0;
+        state.cooldown_remaining_secs = 0;
+        state.last_error = None;
+    }
+}
+
+/// Replace the `tools` array in an Anthropic-format body with XML tool
+/// definitions injected into the system prompt. Used when a route has
+/// `tool_mode: react_xml` for providers that lack native function calling.
+fn inject_react_xml_tools(body: &mut Value) {
+    let tools = match body.get("tools").and_then(|t| t.as_array()) {
+        Some(t) if !t.is_empty() => t.clone(),
+        _ => return,
+    };
+    let xml_defs: Vec<String> = tools.iter().map(|tool| {
+        let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let params = tool.get("input_schema")
+            .map(|p| serde_json::to_string(p).unwrap_or_default())
+            .unwrap_or_default();
+        format!("<tool_definition>\n<tool_name>{name}</tool_name>\n<description>{desc}</description>\n<parameters>{params}</parameters>\n</tool_definition>")
+    }).collect();
+    let xml_section = format!(
+        "\n\nYou have access to the following tools. To use a tool, output a <tool_use> block.\n\n{0}\n\nWhen you need to use a tool, respond with:\n<tool_use>\n<tool_name>tool_name_here</tool_name>\n<parameters>{{\"param\":\"value\"}}</parameters>\n</tool_use>",
+        xml_defs.join("\n")
+    );
+    let current = body.get("system").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    body["system"] = Value::String(format!("{current}{xml_section}"));
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("tools");
+        obj.remove("tool_choice");
+    }
 }
 
 /// Detect upstream error bodies that signal the request exceeded the provider's
@@ -455,6 +573,15 @@ async fn handle_proxy(
                 tag, attempt + 1, route.provider, route.model);
         }
 
+        // Check circuit breaker before hitting this route
+        {
+            if let Err(reason) = check_and_transition_circuit(&route.id, &state.circuit_breaker).await {
+                log::warn!("[Proxy] skipping route {} ({}): {}", route.id, route.provider, reason);
+                last_error = Some(ProxyError::Upstream(format!("route {} circuit open: {}", route.id, reason)));
+                continue;
+            }
+        }
+
         let provider_format = &route.format;
         last_modality = format!("{:?}", route.format);
         let provider = match config.providers.get(&route.provider) {
@@ -542,6 +669,9 @@ async fn handle_proxy(
             normalize_roles(&mut b);
             strip_anthropic_specific_fields(&mut b);
             inject_reasoning_content(&mut b);
+            if route.tool_mode == crate::config::ToolMode::ReactXml {
+                inject_react_xml_tools(&mut b);
+            }
             b
         }
         ("anthropic", ProviderFormat::Openai) => {
@@ -678,6 +808,7 @@ async fn handle_proxy(
             let err = ProxyError::Upstream(e.to_string());
             if is_retryable(&err) {
                 log::warn!("[Proxy] {} timeout/connection error (retryable): {}", if is_streaming { "streaming" } else { "non-streaming" }, err);
+                record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
                 last_error = Some(err);
                 continue;
             }
@@ -707,6 +838,7 @@ async fn handle_proxy(
             let err = ProxyError::Upstream(format!("HTTP {}: {}",
                 status_code, truncate_chars(&err_body, 200)));
             log::warn!("[Proxy] upstream {} (retryable): {}", status_code, err);
+            record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
             last_error = Some(err);
             continue;
         }
@@ -720,6 +852,7 @@ async fn handle_proxy(
                 truncate_chars(&err_body, 200)
             ));
             log::warn!("[Proxy] {} context-limit 400 (retryable): trying next route", tag);
+            record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
             last_error = Some(err);
             continue;
         }
@@ -775,6 +908,9 @@ async fn handle_proxy(
     )
     .await
     .ok();
+
+    // Close the circuit on success — the route is healthy.
+    close_circuit(&route.id, &state.circuit_breaker).await;
 
     // 8. Convert response if needed
     if is_streaming {

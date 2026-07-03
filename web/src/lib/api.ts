@@ -28,6 +28,7 @@ export interface Route {
   tags: string[];
   format: RouteFormat;
   enabled: boolean;
+  tool_mode: 'native' | 'react_xml';
 }
 
 export interface Tag {
@@ -128,6 +129,23 @@ export interface UsageSummary {
   input_tokens: number;
   output_tokens: number;
   estimated_cost: number;
+}
+
+export interface ErrorEntry {
+  timestamp: string;
+  error_message: string;
+  model: string;
+}
+
+export interface ProviderHealth {
+  provider: string;
+  total_requests: number;
+  success_count: number;
+  failure_count: number;
+  success_rate: number;
+  avg_latency_ms: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
 }
 
 function jsonHeaders(): Record<string, string> {
@@ -268,6 +286,12 @@ export async function getMonthlyUsage(
 
 export async function getUsageSummary(): Promise<UsageSummary[]> {
   const res = await fetch(`${API_BASE}/usage/summary`, { credentials: 'include' });
+  await checkOk(res);
+  return res.json();
+}
+
+export async function getProviderHealth(): Promise<ProviderHealth[]> {
+  const res = await fetch(`${API_BASE}/usage/provider-health`, { credentials: 'include' });
   await checkOk(res);
   return res.json();
 }

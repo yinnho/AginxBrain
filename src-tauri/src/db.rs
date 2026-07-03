@@ -442,6 +442,47 @@ pub async fn usage_summary(pool: &SqlitePool) -> Result<Vec<UsageSummary>> {
     Ok(result)
 }
 
+pub async fn provider_health(pool: &SqlitePool) -> Result<Vec<crate::models::ProviderHealth>> {
+    let rows: Vec<(String, i64, i64, i64, f64, i64, i64)> = sqlx::query_as(
+        "SELECT provider,
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success,
+                SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) as failure,
+                AVG(CASE WHEN status = 'success' THEN latency_ms ELSE NULL END) as avg_latency,
+                COALESCE(SUM(input_tokens), 0) as input_tokens,
+                COALESCE(SUM(output_tokens), 0) as output_tokens
+         FROM usage_logs
+         WHERE timestamp >= datetime('now', '-24 hours')
+         GROUP BY provider
+         ORDER BY provider",
+    )
+    .fetch_all(pool)
+    .await
+    .context("querying provider health")?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(provider, total, success, failure, avg_latency, input_tokens, output_tokens)| {
+                crate::models::ProviderHealth {
+                    success_rate: if total > 0 {
+                        (success as f64 / total as f64) * 100.0
+                    } else {
+                        100.0
+                    },
+                    provider,
+                    total_requests: total,
+                    success_count: success,
+                    failure_count: failure,
+                    avg_latency_ms: avg_latency,
+                    total_input_tokens: input_tokens,
+                    total_output_tokens: output_tokens,
+                }
+            },
+        )
+        .collect())
+}
+
 async fn estimate_cost(
     pool: &SqlitePool,
     caller_key_id: Option<i64>,

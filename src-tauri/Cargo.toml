@@ -42,6 +42,7 @@ hex = "0.4"
 base64 = "0.22"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 uuid = { version = "1", features = ["v4"] }
+notify = { version = "7", features = ["macos_kqueue"] }
 
 # Tauri dependencies (desktop only)
 tauri = { version = "2", features = ["tray-icon"], optional = true }

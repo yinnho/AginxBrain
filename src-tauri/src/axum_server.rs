@@ -127,6 +127,8 @@ pub async fn start(state: AppState) -> (String, u16) {
         .route("/usage/daily", axum::routing::get(crate::api::daily_usage))
         .route("/usage/monthly", axum::routing::get(crate::api::monthly_usage))
         .route("/usage/summary", axum::routing::get(crate::api::usage_summary))
+        .route("/usage/provider-health", axum::routing::get(crate::api::provider_health))
+        .route("/circuit-breaker", axum::routing::get(crate::api::get_circuit_breaker))
         .route("/config", axum::routing::get(crate::api::get_config).put(crate::api::update_config))
         .route("/current-tag", axum::routing::put(crate::api::set_current_tag))
         // Fine-grained route CRUD (replaces bulk PUT /api/config for these ops)

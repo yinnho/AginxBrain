@@ -3,7 +3,7 @@ use crate::db;
 use crate::models::{
     AdminLoginRequest, AdminMeResponse, AdminSetupRequest, CallerKey, CostRate,
     CreateCallerKeyRequest, CreateCallerKeyResponse, DailyUsage, MonthlyUsage,
-    SetCostRateRequest, UpdateCallerKeyRequest, UsageSummary,
+    ProviderHealth, SetCostRateRequest, UpdateCallerKeyRequest, UsageSummary,
 };
 use crate::proxy::{self, TestResult};
 use crate::takeover::{
@@ -308,6 +308,19 @@ pub async fn usage_summary(
 ) -> Result<Json<Vec<UsageSummary>>, ApiError> {
     let rows = db::usage_summary(&state.db).await.map_err(ApiError::from)?;
     Ok(Json(rows))
+}
+
+pub async fn provider_health(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ProviderHealth>>, ApiError> {
+    let health = db::provider_health(&state.db).await.map_err(ApiError::from)?;
+    Ok(Json(health))
+}
+
+pub async fn get_circuit_breaker(
+    State(state): State<AppState>,
+) -> Json<std::collections::HashMap<String, crate::config::CircuitState>> {
+    Json(state.circuit_breaker.read().await.clone())
 }
 
 // ─── Config/status/logs ─────────────────────────────────────────────────
