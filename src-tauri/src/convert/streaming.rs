@@ -1535,11 +1535,25 @@ impl CodexChatToResponsesState {
         let args_delta = function.get("arguments").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
         // Update state first, then extract data for events
+        let old_len;
         {
             let state = self.tools.entry(chat_index).or_default();
             if let Some(id) = id_delta { state.call_id = id; }
             if let Some(name) = name_delta { state.name = name; }
-            if !args_delta.is_empty() { state.arguments.push_str(&args_delta); }
+            old_len = state.arguments.len();
+            if !args_delta.is_empty() {
+                // Some providers (DeepSeek, GLM) send the complete arguments
+                // JSON in every tool_call delta instead of streaming it
+                // incrementally.  When the delta string starts with what we
+                // already have, treat it as a replacement rather than
+                // appending — otherwise downstream clients (Codex) receive
+                // duplicated fragments that concatenate into invalid JSON.
+                if state.arguments.is_empty() || args_delta.starts_with(&state.arguments) {
+                    state.arguments = args_delta;
+                } else {
+                    state.arguments.push_str(&args_delta);
+                }
+            }
         }
 
         let mut events = Vec::new();
@@ -1580,12 +1594,17 @@ impl CodexChatToResponsesState {
             let added = state.added;
             let item_id = state.item_id.clone();
             let output_index = state.output_index;
+            // Emit only the NEW bytes beyond what was already accumulated
+            // before this chunk, so downstream clients receive valid
+            // incremental JSON regardless of whether the provider streams
+            // incrementally or sends complete args each time.
+            let new_bytes = &state.arguments[old_len..];
             let _ = state;
 
-            if added && !args_delta.is_empty() {
+            if added && !new_bytes.is_empty() {
                 if let Some(output_index) = output_index {
                     events.push(self.sse_event("response.function_call_arguments.delta", json!({
-                        "item_id": item_id, "output_index": output_index, "delta": args_delta
+                        "item_id": item_id, "output_index": output_index, "delta": new_bytes
                     })));
                 }
             }
