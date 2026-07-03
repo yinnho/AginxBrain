@@ -353,6 +353,83 @@ fn inject_react_xml_tools(body: &mut Value) {
     }
 }
 
+/// Parse `<tool_use>` XML blocks from a text string and return the remaining
+/// plain text together with structured Anthropic `tool_use` content blocks.
+/// Used in the response path when `tool_mode == ReactXml`.
+fn scan_xml_tool_uses(text: &str) -> (String, Vec<Value>) {
+    let mut remaining = String::new();
+    let mut tool_uses: Vec<Value> = Vec::new();
+    let mut pos = 0;
+    while let Some(start) = text[pos..].find("<tool_use>") {
+        let abs_start = pos + start;
+        remaining.push_str(&text[pos..abs_start]);
+        if let Some(end) = text[abs_start..].find("</tool_use>") {
+            let abs_end = abs_start + end + "</tool_use>".len();
+            let block = &text[abs_start + "<tool_use>".len()..abs_start + end];
+            let name = extract_xml_tag(block, "tool_name");
+            let params_str = extract_xml_tag(block, "parameters");
+            let input: Value =
+                serde_json::from_str(params_str.trim()).unwrap_or(json!({}));
+            tool_uses.push(json!({
+                "type": "tool_use",
+                "id": format!("toolu_{:x}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()),
+                "name": name.trim(),
+                "input": input
+            }));
+            pos = abs_end;
+        } else {
+            remaining.push_str(&text[abs_start..]);
+            break;
+        }
+    }
+    remaining.push_str(&text[pos..]);
+    (remaining, tool_uses)
+}
+
+fn extract_xml_tag(xml: &str, tag: &str) -> String {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    if let Some(start) = xml.find(&open) {
+        let after = start + open.len();
+        if let Some(end) = xml[after..].find(&close) {
+            return xml[after..after + end].to_string();
+        }
+    }
+    String::new()
+}
+
+/// Walk the content blocks of an Anthropic response and replace text blocks
+/// that contain `<tool_use>` XML with the parsed structured tool_use blocks.
+fn extract_xml_tool_uses(resp: &mut Value) {
+    let content = match resp.get_mut("content").and_then(|c| c.as_array_mut()) {
+        Some(c) => c,
+        None => return,
+    };
+    let mut new_content: Vec<Value> = Vec::new();
+    for block in content.iter() {
+        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if block_type == "text" {
+            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                let (remaining, tool_uses) = scan_xml_tool_uses(text);
+                if !remaining.is_empty() {
+                    new_content.push(json!({"type": "text", "text": remaining}));
+                }
+                for tu in tool_uses {
+                    new_content.push(tu);
+                }
+            } else {
+                new_content.push(block.clone());
+            }
+        } else {
+            new_content.push(block.clone());
+        }
+    }
+    *content = new_content;
+}
+
 /// Detect upstream error bodies that signal the request exceeded the provider's
 /// context window / token limit. These are per-route limits (not malformed
 /// requests), so failover to another route with a larger window may succeed.
@@ -1284,6 +1361,14 @@ async fn handle_proxy(
                 // upstream model emits even though thinking was never requested.
                 if strip_reasoning && client_protocol == "openai" {
                     strip_reasoning_from_openai_response(&mut resp_value);
+                }
+
+                // ReAct XML: scan text content blocks for <tool_use> and
+                // convert them to structured tool_use content blocks.
+                if route.tool_mode == crate::config::ToolMode::ReactXml
+                    && client_protocol == "anthropic"
+                {
+                    extract_xml_tool_uses(&mut resp_value);
                 }
 
                 let resp_bytes = serde_json::to_vec(&resp_value).unwrap_or(resp_body.to_vec());
