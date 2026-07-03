@@ -4,15 +4,17 @@ import * as api from './lib/api';
 import { LoginPage } from './pages/LoginPage';
 import { LandingPage } from './pages/LandingPage';
 import { DashboardPage } from './pages/DashboardPage';
+import { LogsPage } from './pages/LogsPage';
 import { ApiKeysPage } from './pages/ApiKeysPage';
 import { ProvidersPage } from './pages/ProvidersPage';
 import { RoutesPage } from './pages/RoutesPage';
 import { TagsPage } from './pages/TagsPage';
 
-type Tab = 'dashboard' | 'keys' | 'providers' | 'routes' | 'tags';
+type Tab = 'dashboard' | 'logs' | 'keys' | 'providers' | 'routes' | 'tags';
 
 const tabs: { key: Tab; label: string; icon: string }[] = [
-  { key: 'dashboard', label: 'Dashboard', icon: '📊' },
+  { key: 'dashboard', label: 'Health', icon: '📊' },
+  { key: 'logs', label: 'Logs', icon: '📋' },
   { key: 'keys', label: 'API Keys', icon: '🔑' },
   { key: 'providers', label: 'Providers', icon: '🔌' },
   { key: 'routes', label: 'Routes', icon: '🔀' },
@@ -172,6 +174,7 @@ function App() {
 
       {/* Tab content */}
       {tab === 'dashboard' && <DashboardPage />}
+      {tab === 'logs' && <LogsPage />}
       {tab === 'keys' && <ApiKeysPage />}
       {tab === 'providers' && <ProvidersPage config={config!} onConfigChange={handleConfigChange} />}
       {tab === 'routes' && <RoutesPage config={config!} onConfigChange={handleConfigChange} />}

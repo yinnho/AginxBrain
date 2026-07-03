@@ -861,8 +861,6 @@ async fn handle_proxy(
     // Forward client headers (hop-by-hop and auth headers are filtered internally)
     req_builder = forward_client_headers(&headers, req_builder);
 
-    // Keep a clone for same-route retry on transient body-read / send errors.
-    let req_clone = req_builder.try_clone();
     let req_timeout = std::time::Duration::from_secs(
         if is_streaming {
             STREAM_TIMEOUT
@@ -873,9 +871,11 @@ async fn handle_proxy(
         }
     );
 
-    // 7. Send
-    let resp = match req_builder
-        .json(&fwd_body)
+    // 7. Send. Keep a clone AFTER setting the body so same-route retry
+    //    re-sends the full request (not an empty body).
+    let json_builder = req_builder.json(&fwd_body);
+    let req_clone = json_builder.try_clone();
+    let resp = match json_builder
         .timeout(req_timeout)
         .send()
         .await
@@ -929,7 +929,6 @@ async fn handle_proxy(
                 truncate_chars(&err_body, 200)
             ));
             log::warn!("[Proxy] {} context-limit 400 (retryable): trying next route", tag);
-            record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
             last_error = Some(err);
             continue;
         }
