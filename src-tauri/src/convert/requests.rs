@@ -64,6 +64,7 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
                     let mut text_parts = Vec::new();
                     let mut tool_calls = Vec::new();
                     let mut reasoning_parts = Vec::new();
+                    let mut tool_results = Vec::new();
 
                     if let Some(c) = content {
                         if let Some(arr) = c.as_array() {
@@ -99,6 +100,19 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
                                             }
                                         }));
                                     }
+                                    Some("tool_result") => {
+                                        let tool_call_id = block
+                                            .get("tool_use_id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let result_content =
+                                            extract_text_from_content(block.get("content").unwrap_or(&Value::Null));
+                                        tool_results.push(json!({
+                                            "role": "tool",
+                                            "tool_call_id": tool_call_id,
+                                            "content": result_content
+                                        }));
+                                    }
                                     _ => {}
                                 }
                             }
@@ -127,6 +141,11 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
                         openai_msg["tool_calls"] = Value::Array(tool_calls);
                     }
                     messages.push(openai_msg);
+                    // Tool results extracted from content (e.g. role="tool" →
+                    // "assistant" normalization) go out as separate messages.
+                    for tr in tool_results {
+                        messages.push(tr);
+                    }
                 }
                 "user" => {
                     // Check for tool_result blocks
@@ -198,9 +217,16 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
                     }
                 }
                 _ => {
-                    // Other roles → user
+                    // Other roles → user. Extract text from content blocks to
+                    // avoid forwarding an array to an OpenAI-format provider
+                    // (which requires content to be a string).
                     if let Some(c) = content {
-                        messages.push(json!({"role": "user", "content": c.clone()}));
+                        if c.is_array() {
+                            let text = extract_text_from_content(c);
+                            messages.push(json!({"role": "user", "content": text}));
+                        } else {
+                            messages.push(json!({"role": "user", "content": c.clone()}));
+                        }
                     }
                 }
             }
