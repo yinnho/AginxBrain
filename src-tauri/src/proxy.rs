@@ -1922,6 +1922,21 @@ fn replace_model_in_anthropic_stream(
                     }
                 }
 
+                // Some providers (glm-5.2) omit usage.output_tokens from
+                // message_delta, which causes clients to crash on NoneType
+                // arithmetic (int - None). Default to 0 if missing.
+                if event_type == "message_delta" {
+                    if let Some(obj) = parsed.as_object_mut() {
+                        let usage = obj
+                            .entry("usage".to_string())
+                            .or_insert_with(|| json!({}));
+                        if let Some(u) = usage.as_object_mut() {
+                            u.entry("output_tokens".to_string())
+                                .or_insert_with(|| Value::Number(0.into()));
+                        }
+                    }
+                }
+
                 // Before message_delta or message_stop, close any open content blocks.
                 // IMPORTANT: We emit the injected content_block_stop events BEFORE
                 // the buffered event: line, so the SSE sequence is correct:
