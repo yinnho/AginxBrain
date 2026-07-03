@@ -436,6 +436,8 @@ pub fn convert_anthropic_stream_to_openai(
         // tool at block index 2 must still be tool_calls[0]. Map them explicitly.
         let mut tool_index_map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut next_tool_index: u32 = 0;
+        let mut usage_input_tokens: u64 = 0;
+        let mut usage_output_tokens: u64 = 0;
 
         tokio::pin!(upstream);
 
@@ -492,6 +494,9 @@ pub fn convert_anthropic_stream_to_openai(
                         if let Some(msg) = data.get("message") {
                             response_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("msg_unknown").to_string();
                             model = request_model.clone();
+                            if let Some(u) = msg.get("usage") {
+                                usage_input_tokens = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                            }
                         }
                     }
                     "content_block_start" => {
@@ -609,6 +614,9 @@ pub fn convert_anthropic_stream_to_openai(
                                 stop_reason = reason.to_string();
                             }
                         }
+                        if let Some(u) = data.get("usage") {
+                            usage_output_tokens = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(usage_output_tokens);
+                        }
                     }
                     "message_stop" => {
                         // Map Anthropic stop_reason to OpenAI finish_reason
@@ -621,7 +629,8 @@ pub fn convert_anthropic_stream_to_openai(
                         let final_chunk = json!({
                             "id": response_id, "object": "chat.completion.chunk",
                             "created": created, "model": model,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                            "usage": {"prompt_tokens": usage_input_tokens, "completion_tokens": usage_output_tokens, "total_tokens": usage_input_tokens + usage_output_tokens}
                         });
                         yield Ok(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&final_chunk).unwrap_or_default())));
                         yield Ok(Bytes::from("data: [DONE]\n\n"));
