@@ -543,12 +543,25 @@ impl AppState {
 }
 
 /// Watch the config file directory for changes and auto-reload.
+///
+/// The `notify` watcher lives on a dedicated OS thread, and reloads are
+/// signalled through an **async** channel. This matters: an earlier version
+/// called a blocking `std::sync::mpsc` `recv()` *inside* a `tokio::spawn`
+/// task, which permanently parked a tokio worker thread. On a small host that
+/// starved the runtime — right after a config reload the server would stop
+/// servicing any connection (TCP handshakes still completed in the kernel, but
+/// no request ever ran), connections piled up in CLOSE-WAIT, and the whole
+/// gateway deadlocked while systemd still reported "active".
 pub fn spawn_config_watcher(config: Arc<RwLock<AppConfig>>) {
     let path = config_path().expect("failed to resolve config path");
     let dir = path.parent().expect("config path has no parent").to_path_buf();
     let filename = path.file_name().expect("config path has no filename")
         .to_str().expect("bad filename").to_string();
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+    // Async channel from the (sync) watcher callback to the (async) reload
+    // task. UnboundedSender::send is sync-safe and non-blocking, so it is fine
+    // to call from notify's internal event thread.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     let mut watcher = notify::recommended_watcher(
         move |res: Result<notify::Event, notify::Error>| {
@@ -566,10 +579,24 @@ pub fn spawn_config_watcher(config: Arc<RwLock<AppConfig>>) {
     watcher.watch(&dir, notify::RecursiveMode::NonRecursive)
         .expect("failed to watch config directory");
 
+    // Keep the watcher handle alive for the process lifetime on its own OS
+    // thread. notify runs its own internal event thread; this one just holds
+    // the handle (and never touches a tokio worker).
+    std::thread::Builder::new()
+        .name("aginxbrain-config-watcher".into())
+        .spawn(move || {
+            let _watcher = watcher;
+            std::thread::park();
+        })
+        .expect("failed to spawn config watcher thread");
+
     tokio::spawn(async move {
-        let _watcher = watcher;
         loop {
-            let Ok(()) = rx.recv() else { return };
+            // Async receive — never blocks a worker thread.
+            if rx.recv().await.is_none() {
+                return;
+            }
+            // Debounce: coalesce a burst of events into a single reload.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             while rx.try_recv().is_ok() {}
             match load_config() {
