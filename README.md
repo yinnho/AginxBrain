@@ -20,7 +20,7 @@ Speak Anthropic, OpenAI, or Responses on the client side — any of them on the 
 AginxBrain sits between your AI client (Claude Code, Codex CLI, any OpenAI / Anthropic / Responses SDK) and your model providers, and does four things transparently:
 
 1. **Protocol conversion** — clients speak Anthropic Messages, OpenAI Chat, *or* OpenAI Responses; providers speak any of the three. All **9 combinations**, both directions, **streaming included**.
-2. **Tag-based routing** — call a model by its **tag name** (e.g. `model: "sonnet"`) and AginxBrain maps it to the right provider and model, with multi-candidate failover chains.
+2. **Tag-based routing** — call a model by its **tag name** (e.g. `model: "sonnet"`, `model: "gpt-5.5"`) and AginxBrain maps it to the right provider and model, with multi-candidate failover chains.
 3. **Reliability** — per-route circuit breaker, automatic failover on retryable errors, smart auto-routing that upgrades the tier based on the request, hot-reloaded config.
 4. **Key custody & observability** — providers' real keys live in one place behind per-caller API keys; every request is logged with token usage and estimated cost.
 
@@ -47,24 +47,27 @@ Streaming SSE is fully converted across formats — `thinking`, `text`, `tool_us
 
 ### 🏷️ Tag routing, failover & circuit breaker
 
-Tags are **how you call models**. Instead of hard-coding a provider-specific model name, you use a tag name as the model field — and AginxBrain maps it to the right provider:
+Tags are **model aliases** — you define any name in config, use it as the `model` field in requests, and AginxBrain maps it to the right provider:
 
 ```
 model: "opus"    → Zhipu GLM-5.1
 model: "sonnet"  → DeepSeek v4-pro    ──┐ failover chain
-model: "haiku"   → DeepSeek v4-flash     │ on 429 / timeout / 5xx
+model: "gpt-5.5" → Qwen-3-235b          │ on 429 / timeout / 5xx
+model: "image"   → DashScope wan2.7     │
 model: "auto"    → smart-routing decides ──┘
 ```
 
+A tag is just a name. `opus`, `sonnet`, `haiku` are common choices — but you can name tags anything: `gpt-5.5`, `image`, `tts`, `fast`… each maps to one or more routes.
+
 - Each tag resolves to an ordered list of candidate routes; the next route is tried when the current one fails with a **retryable** error (timeout, 5xx, 429, connection error).
 - **Circuit breaker** — a route that fails **3 times in a row** is opened for a **60s cooldown**, then probed once (half-open) before traffic resumes. Keyed per-route, in-memory only.
-- Unrecognized model names fall back to `current_tag` — no request is ever dropped.
+- If the model name doesn't match any tag, it falls back to `current_tag` — no request is ever dropped. AginxBrain also tries substring matching (e.g. `claude-sonnet-4-6` matches the `sonnet` tag).
 
 ### 🧠 Smart auto-routing
 
-When a request arrives on the `auto` tag, AginxBrain inspects the body and dynamically upgrades the tier:
+When a request hits a tag marked `is_auto: true` (e.g. `auto`), AginxBrain inspects the body and resolves it to a specific tag:
 
-| Signal | Example | Routes to |
+| Signal | Example | Resolves to |
 |---|---|---|
 | `agentic` | request carries `tools` / tool calls | sonnet |
 | `reasoning` | "think step by step" / 推理 markers | opus |
@@ -72,7 +75,9 @@ When a request arrives on the `auto` tag, AginxBrain inspects the body and dynam
 | `code_pattern` | fenced code blocks | sonnet |
 | `subagent` | short system prompt + delegated task | haiku |
 
-A per-session, **upgrade-only** cache (30 min TTL) means once a conversation needs a strong model, it never downgrades. Zero ML, pure string/JSON matching, sub-millisecond overhead. Fully configurable via `signal_tiers` in `config.yaml`.
+The signal-to-tag mapping is fully configurable. Internally, smart routing uses a tier system (haiku < sonnet < opus) to pick the right tag — but the actual tag names come from your config, not from a fixed tier list.
+
+A per-session, **upgrade-only** cache (30 min TTL) means once a conversation needs a stronger model, it never downgrades. Zero ML, pure string/JSON matching, sub-millisecond overhead. Fully configurable via `signal_tiers` in `config.yaml`.
 
 ### 🛡️ Production-grade reliability
 
@@ -333,7 +338,7 @@ Most LLM gateways (One API, OpenRouter, Helicone) expose an **OpenAI-compatible 
 | OpenAI Responses **input** (Codex) | ✅ | partial | ✅ | ✅ | ❌ |
 | **Bidirectional** conversion (Anthropic client ↔ Anthropic provider, etc.) | ✅ | partial | partial | ❌ | ❌ |
 | One-click Claude Code / Codex **takeover** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **Tag-based** routing + auto-tier | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Tag-based** routing (model aliases) + auto-tier | ✅ | ❌ | ❌ | ❌ | ❌ |
 | China providers first-class (DeepSeek, GLM, Kimi, Qwen, ERNIE) | ✅ | partial | partial | ✅ | ✅ |
 | Self-host single binary + embedded admin UI | ✅ Rust | Python | ❌ SaaS | ✅ | ❌ SaaS |
 
