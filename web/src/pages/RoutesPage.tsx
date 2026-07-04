@@ -183,7 +183,9 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
                     </div>
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
                       via <span style={{ color: 'var(--text-secondary)' }}>{route.provider}</span>
-                      <span className="mono" style={{ marginLeft: 8 }}>{route.base_url}<span style={{ color: 'var(--accent)' }}>{route.path || formatDefaultPath(route.format)}</span></span>
+                    </div>
+                    <div style={{ fontSize: 11, marginTop: 2, fontFamily: 'monospace', color: 'var(--accent)' }}>
+                      {route.base_url.replace(/\/+$/, '')}{route.path || formatDefaultPath(route.format)}
                     </div>
                     <div style={{ display: 'flex', gap: 4, marginTop: 8 }}>
                       {route.tags.map(t => {
@@ -396,7 +398,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
           <option value="minimax_image">MiniMax Image</option>
         </Select>
         <Input label="Path" value={path} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPath(e.target.value)} placeholder={formatDefaultPath(format)} />
-        {endpoint && <div style={{ gridColumn: '1 / -1', fontSize: 11, color: 'var(--text-muted)' }}>Endpoint: <code style={{ color: 'var(--accent)' }}>{endpoint}</code></div>}
+        {endpoint && <div style={{ gridColumn: '1 / -1', fontSize: 12, background: 'var(--bg-surface)', padding: '6px 10px', borderRadius: 6, fontFamily: 'monospace' }}>Endpoint: <span style={{ color: 'var(--accent)' }}>{endpoint}</span></div>}
         <div style={{ gridColumn: '1 / -1' }}>
           <label style={{ display: 'block', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6, fontWeight: 500 }}>Tags</label>
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
