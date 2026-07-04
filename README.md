@@ -4,7 +4,7 @@
 
 **Open-source AI gateway · Bidirectional protocol conversion · Tag-based routing**
 
-Speak Anthropic, OpenAI, or Responses on the client side — any of them on the provider side. AginxBrain converts between them, routes by quality tier, and fails over automatically.
+Speak Anthropic, OpenAI, or Responses on the client side — any of them on the provider side. AginxBrain converts between them, routes by tag, and fails over automatically.
 
 [![Version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/yinnho/AginxBrain/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
@@ -20,14 +20,14 @@ Speak Anthropic, OpenAI, or Responses on the client side — any of them on the 
 AginxBrain sits between your AI client (Claude Code, Codex CLI, any OpenAI / Anthropic / Responses SDK) and your model providers, and does four things transparently:
 
 1. **Protocol conversion** — clients speak Anthropic Messages, OpenAI Chat, *or* OpenAI Responses; providers speak any of the three. All **9 combinations**, both directions, **streaming included**.
-2. **Tag-based routing** — route by quality tier (`opus` / `sonnet` / `haiku` / `auto`) instead of hard-coding model names, with multi-candidate failover chains.
+2. **Tag-based routing** — call a model by its **tag name** (e.g. `model: "sonnet"`) and AginxBrain maps it to the right provider and model, with multi-candidate failover chains.
 3. **Reliability** — per-route circuit breaker, automatic failover on retryable errors, smart auto-routing that upgrades the tier based on the request, hot-reloaded config.
 4. **Key custody & observability** — providers' real keys live in one place behind per-caller API keys; every request is logged with token usage and estimated cost.
 
 It runs in two shapes:
 
 - **Server (the gateway)** — a single self-hosted binary. Holds all the keys, runs the proxy, embeds an admin dashboard at `http://host:port/`.
-- **Desktop (the client)** — a thin Tauri app whose only job is to flip your Claude Code / Codex config to point at a server (yours or a hosted one). No local proxy, no keys on disk.
+- **Desktop (the client)** — a thin Tauri app for monitoring calls and one-click Claude Code / Codex takeover. Enter your server URL + API key to log in — no local proxy, no keys on disk.
 
 > AginxBrain 是 [Aginx](https://github.com/yinnho) Agent 互联网生态中的「大脑」层：Agent 只表达需求（对话、生图、语音……），AginxBrain 负责选 provider、转格式、failover、审计。
 
@@ -47,18 +47,18 @@ Streaming SSE is fully converted across formats — `thinking`, `text`, `tool_us
 
 ### 🏷️ Tag routing, failover & circuit breaker
 
-Route by quality tier, not vendor lock-in:
+Tags are **how you call models**. Instead of hard-coding a provider-specific model name, you use a tag name as the model field — and AginxBrain maps it to the right provider:
 
 ```
-opus   → Zhipu GLM-5.1          (strongest)
-sonnet → DeepSeek v4-pro         (balanced)  ──┐ failover chain
-haiku  → DeepSeek v4-flash       (fast)       │ on 429 / timeout / 5xx
-auto   → smart-routing decides   (adaptive)  ──┘
+model: "opus"    → Zhipu GLM-5.1
+model: "sonnet"  → DeepSeek v4-pro    ──┐ failover chain
+model: "haiku"   → DeepSeek v4-flash     │ on 429 / timeout / 5xx
+model: "auto"    → smart-routing decides ──┘
 ```
 
 - Each tag resolves to an ordered list of candidate routes; the next route is tried when the current one fails with a **retryable** error (timeout, 5xx, 429, connection error).
 - **Circuit breaker** — a route that fails **3 times in a row** is opened for a **60s cooldown**, then probed once (half-open) before traffic resumes. Keyed per-route, in-memory only.
-- Unrecognized model names fall back to `auto` — no request is ever dropped.
+- Unrecognized model names fall back to `current_tag` — no request is ever dropped.
 
 ### 🧠 Smart auto-routing
 
@@ -131,7 +131,18 @@ Edit `~/.aginxbrain/config.yaml` and changes (providers, routes, tags, cost rate
 | Build | Mode | What it is |
 |---|---|---|
 | `aginxbrain --server` (`--features server`) | **Gateway** | The proxy + admin dashboard + SQLite. Self-host this. |
-| `aginxbrain` (default `desktop` feature) | **Thin client** | A Tauri window that toggles your Claude/Codex config to point at a gateway. No local proxy. |
+| `aginxbrain` (default `desktop` feature) | **Thin client** | A Tauri app that connects to a remote gateway. Monitor calls, one-click takeover of Claude Code / Codex. No local proxy. |
+
+**Desktop → Server flow:**
+
+```
+Desktop app                Server
+    │                        │
+    ├─ enter server URL ────→│
+    ├─ enter API key ───────→│  (auth as a caller)
+    ├─ monitor calls ───────→│  (usage logs, health, circuit state)
+    └─ takeover Claude/Codex →│  (rewrite local config to point at server)
+```
 
 ```
 aginxbrain/
@@ -196,7 +207,7 @@ cd web-client && pnpm install && pnpm build && cd ..
 cd src-tauri && cargo tauri build
 ```
 
-Launch it, enter your server URL + caller API key, and toggle **Claude Code** or **Codex** — the app rewrites the config and your CLI now flows through your gateway.
+Launch it, enter your server URL + caller API key to log in. You can then monitor all calls through the dashboard, and **takeover** Claude Code or Codex with one click — the app rewrites the local config so your CLI flows through the gateway.
 
 ### Connect a client
 
@@ -314,7 +325,7 @@ smart_routing:           # tune the auto tier
 
 ## Comparison
 
-Most LLM gateways (One API, OpenRouter, Helicone) expose an **OpenAI-compatible input only** — so Claude Code (Anthropic Messages) and Codex (Responses) can't connect unchanged, and they route by exact model name. AginxBrain is **protocol-native in both directions** and **routes by quality tier**:
+Most LLM gateways (One API, OpenRouter, Helicone) expose an **OpenAI-compatible input only** — so Claude Code (Anthropic Messages) and Codex (Responses) can't connect unchanged, and they route by exact model name. AginxBrain is **protocol-native in both directions** and **routes by tag name**:
 
 | | AginxBrain | LiteLLM | Portkey | New / One API | OpenRouter |
 |---|---|---|---|---|---|
@@ -322,7 +333,7 @@ Most LLM gateways (One API, OpenRouter, Helicone) expose an **OpenAI-compatible 
 | OpenAI Responses **input** (Codex) | ✅ | partial | ✅ | ✅ | ❌ |
 | **Bidirectional** conversion (Anthropic client ↔ Anthropic provider, etc.) | ✅ | partial | partial | ❌ | ❌ |
 | One-click Claude Code / Codex **takeover** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **Tag-based** quality routing + auto-tier | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Tag-based** routing + auto-tier | ✅ | ❌ | ❌ | ❌ | ❌ |
 | China providers first-class (DeepSeek, GLM, Kimi, Qwen, ERNIE) | ✅ | partial | partial | ✅ | ✅ |
 | Self-host single binary + embedded admin UI | ✅ Rust | Python | ❌ SaaS | ✅ | ❌ SaaS |
 
