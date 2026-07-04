@@ -148,6 +148,10 @@ pub struct Route {
     pub tags: Vec<String>,
     #[serde(default = "default_format")]
     pub format: ProviderFormat,
+    /// Override the upstream path derived from `format`. When set, this is
+    /// appended to `base_url` instead of `ProviderFormat::path()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default = "default_tool_mode")]
@@ -243,13 +247,13 @@ fn default_providers() -> HashMap<String, Provider> {
 
 fn default_routes() -> Vec<Route> {
     vec![
-        Route { id: "r_default_1".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, enabled: true, tool_mode: ToolMode::Native },
-        Route { id: "r_default_2".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, enabled: true, tool_mode: ToolMode::Native },
-        Route { id: "r_default_3".into(), base_url: "https://open.bigmodel.cn/api/anthropic".into(), ws_url: None, model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, enabled: true, tool_mode: ToolMode::Native },
-        Route { id: "r_default_4".into(), base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(), ws_url: None, model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, enabled: true, tool_mode: ToolMode::Native },
-        Route { id: "r_default_5".into(), base_url: "https://api.kimi.com/coding".into(), ws_url: None, model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, enabled: true, tool_mode: ToolMode::Native },
-        Route { id: "r_default_6".into(), base_url: "https://api.minimaxi.com/anthropic".into(), ws_url: None, model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, enabled: true, tool_mode: ToolMode::Native },
-        Route { id: "r_default_7".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["gpt-5.5".into(), "codex".into()], format: ProviderFormat::Openai, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_1".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["sonnet".into(), "auto".into()], format: ProviderFormat::Openai, path: None, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_2".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-flash".into(), provider: "deepseek".into(), tags: vec!["haiku".into()], format: ProviderFormat::Openai, path: None, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_3".into(), base_url: "https://open.bigmodel.cn/api/anthropic".into(), ws_url: None, model: "glm-5.1".into(), provider: "zhipu".into(), tags: vec!["opus".into()], format: ProviderFormat::Anthropic, path: None, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_4".into(), base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(), ws_url: None, model: "qwen3.7-max".into(), provider: "dashscope".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Openai, path: None, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_5".into(), base_url: "https://api.kimi.com/coding".into(), ws_url: None, model: "K2.6".into(), provider: "kimi".into(), tags: vec!["sonnet".into()], format: ProviderFormat::Anthropic, path: None, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_6".into(), base_url: "https://api.minimaxi.com/anthropic".into(), ws_url: None, model: "MiniMax-M3".into(), provider: "minimax".into(), tags: vec!["haiku".into()], format: ProviderFormat::Anthropic, path: None, enabled: true, tool_mode: ToolMode::Native },
+        Route { id: "r_default_7".into(), base_url: "https://api.deepseek.com".into(), ws_url: None, model: "deepseek-v4-pro".into(), provider: "deepseek".into(), tags: vec!["gpt-5.5".into(), "codex".into()], format: ProviderFormat::Openai, path: None, enabled: true, tool_mode: ToolMode::Native },
     ]
 }
 

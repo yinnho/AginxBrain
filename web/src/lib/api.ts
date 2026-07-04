@@ -29,6 +29,7 @@ export interface Route {
   format: RouteFormat;
   enabled: boolean;
   tool_mode: 'native' | 'react_xml';
+  path?: string;
 }
 
 export interface Tag {
