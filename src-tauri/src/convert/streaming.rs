@@ -2085,7 +2085,14 @@ impl CodexAnthropicToResponsesState {
             }
             "content_block_stop" => {
                 events.extend(self.close_current());
-                events.extend(self.close_tool_call_item());
+                // Only close the tool call if we are actually in the ToolCall
+                // phase — content_block_stop fires for EVERY block (text,
+                // thinking, tool_use).  Closing the tool on a text block's
+                // stop emits a function_call_arguments.done with empty args
+                // and discards the real input_json_delta events that follow.
+                if self.phase == AnthropicPhase::ToolCall {
+                    events.extend(self.close_tool_call_item());
+                }
                 self.phase = AnthropicPhase::Idle;
             }
             "message_delta" => {
@@ -2100,7 +2107,9 @@ impl CodexAnthropicToResponsesState {
             }
             "message_stop" => {
                 events.extend(self.close_current());
-                events.extend(self.close_tool_call_item());
+                if self.current_tool.is_some() {
+                    events.extend(self.close_tool_call_item());
+                }
             }
             _ => {}
         }
