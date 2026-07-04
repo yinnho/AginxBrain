@@ -221,7 +221,7 @@ Once a server is running, point any client at it with a caller API key:
 ```bash
 # Claude Code  (Anthropic Messages → your server)
 export ANTHROPIC_BASE_URL=http://localhost:8083/anthropic
-export ANTHROPIC_AUTH_TOKEN=agk-xxxxxxxx          # a caller key from the dashboard
+export ANTHROPIC_API_KEY=agk-xxxxxxxx          # a caller key from the dashboard
 
 # Any OpenAI client  (OpenAI Chat → your server)
 openai --base-url http://localhost:8083/v1 --api-key agk-xxxxxxxx
