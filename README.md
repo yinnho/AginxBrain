@@ -216,15 +216,17 @@ Launch it, enter your server URL + caller API key to log in. You can then monito
 
 ### Connect a client
 
-Once a server is running, point any client at it with a caller API key:
+The easiest way is **one-click takeover** from the desktop client or the admin UI — it automatically rewrites your Claude Code / Codex config to point at the gateway. No manual setup needed.
+
+To connect manually (e.g. custom SDK integrations), use your server URL and a caller API key from the dashboard:
 
 ```bash
-# Claude Code  (Anthropic Messages → your server)
-export ANTHROPIC_BASE_URL=http://localhost:8083/anthropic
-export ANTHROPIC_API_KEY=agk-xxxxxxxx          # a caller key from the dashboard
+# Claude Code
+export ANTHROPIC_BASE_URL=https://brain.aginx.net/anthropic
+export ANTHROPIC_API_KEY=agk-xxxxxxxx
 
-# Any OpenAI client  (OpenAI Chat → your server)
-openai --base-url http://localhost:8083/v1 --api-key agk-xxxxxxxx
+# Any OpenAI client
+openai --base-url https://brain.aginx.net/v1 --api-key agk-xxxxxxxx
 ```
 
 ---
