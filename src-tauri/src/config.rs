@@ -108,7 +108,7 @@ fn default_format() -> ProviderFormat {
 }
 
 fn default_path() -> String {
-    ProviderFormat::Openai.path().to_string()
+    String::new()
 }
 
 fn default_enabled() -> bool {
@@ -155,12 +155,25 @@ pub struct Route {
     /// Upstream path appended to `base_url`. Auto-filled from `format` when
     /// creating a route, but can be edited for providers with non-standard
     /// paths (e.g. Baidu uses `/chat/completions` instead of `/v1/chat/completions`).
+    /// When empty, the default path for the route's `format` is used.
     #[serde(default = "default_path")]
     pub path: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default = "default_tool_mode")]
     pub tool_mode: ToolMode,
+}
+
+impl Route {
+    /// Returns the effective upstream path: the user-specified `path` if non-empty,
+    /// otherwise the default path for this route's `format`.
+    pub fn effective_path(&self) -> &str {
+        if self.path.is_empty() {
+            self.format.path()
+        } else {
+            &self.path
+        }
+    }
 }
 
 /// How tool definitions should be sent to the upstream provider.

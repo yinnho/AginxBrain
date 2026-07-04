@@ -837,7 +837,7 @@ async fn handle_proxy(
     let url = format!(
         "{}{}",
         route.base_url.trim_end_matches('/'),
-        &route.path
+        route.effective_path()
     );
     log::info!("[Proxy] forwarding to {} (model={})", url, route.model);
 
@@ -1532,7 +1532,7 @@ async fn handle_count_tokens(
     let url = format!(
         "{}{}/count_tokens",
         route.base_url.trim_end_matches('/'),
-        &route.path
+        route.effective_path()
     );
     log::info!("[Proxy] count_tokens forwarding to {}", url);
 
@@ -3113,7 +3113,7 @@ async fn send_test_to_route(
     let url = format!(
         "{}{}",
         route.base_url.trim_end_matches('/'),
-        &route.path
+        route.effective_path()
     );
     log::info!("[Test] testing route tag={} → {} {} (format={:?})", tag, url, route.model, route.format);
 
