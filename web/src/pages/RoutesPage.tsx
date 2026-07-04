@@ -346,6 +346,21 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
   const [selectedTags, setSelectedTags] = useState<string[]>(initial?.tags || []);
   const [format, setFormat] = useState<RouteFormat>(initial?.format || 'openai');
   const [toolMode, setToolMode] = useState<'native' | 'react_xml'>(initial?.tool_mode || 'native');
+  const [path, setPath] = useState(initial?.path || '');
+
+  const FORMAT_DEFAULT_PATHS: Record<RouteFormat, string> = {
+    openai: '/v1/chat/completions',
+    anthropic: '/v1/messages',
+    openai_responses: '/v1/responses',
+    openai_images: '/v1/images/generations',
+    dashscope_image: '/api/v1/services/aigc/multimodal-generation/generation',
+    dashscope_chat_image: '/chat/completions',
+    dashscope_video: '/api/v1/services/aigc/video-generation/video-synthesis',
+    dashscope_tts: '/api/v1/services/aigc/text-to-speech/stream',
+    dashscope_asr: '/v1/chat/completions',
+    kling: '/v1/videos/text2video',
+    minimax_image: '/v1/image_generation',
+  };
 
   const toggleTag = (tag: string) => {
     setSelectedTags(prev => prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag]);
@@ -361,7 +376,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
         <Select label="Provider" value={provider} onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setProvider(e.target.value)}>
           {providers.map(p => <option key={p} value={p}>{p}</option>)}
         </Select>
-        <Select label="Format" value={format} onChange={e => setFormat(e.target.value as RouteFormat)}>
+        <Select label="Format" value={format} onChange={e => { const f = e.target.value as RouteFormat; setFormat(f); setPath(FORMAT_DEFAULT_PATHS[f]); }}>
           <option value="openai">OpenAI</option>
           <option value="anthropic">Anthropic</option>
           <option value="openai_responses">OpenAI Responses</option>
@@ -374,6 +389,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
           <option value="kling">Kling</option>
           <option value="minimax_image">MiniMax Image</option>
         </Select>
+        <Input label="Path" value={path} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPath(e.target.value)} placeholder="/v1/chat/completions" />
         <div style={{ gridColumn: '1 / -1' }}>
           <label style={{ display: 'block', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6, fontWeight: 500 }}>Tags</label>
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
@@ -399,7 +415,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
         </select>
       </div>
       <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
-        <Button variant="primary" disabled={!valid} onClick={() => onSave({ id: initial?.id || '', base_url: baseUrl, model, provider, tags: selectedTags, format, enabled: initial?.enabled ?? true, tool_mode: toolMode as 'native' | 'react_xml' })}>Save</Button>
+        <Button variant="primary" disabled={!valid} onClick={() => onSave({ id: initial?.id || '', base_url: baseUrl, model, provider, tags: selectedTags, format, enabled: initial?.enabled ?? true, tool_mode: toolMode as 'native' | 'react_xml', path })}>Save</Button>
         <Button variant="ghost" onClick={onCancel}>Cancel</Button>
       </div>
     </Card>

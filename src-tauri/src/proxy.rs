@@ -837,7 +837,7 @@ async fn handle_proxy(
     let url = format!(
         "{}{}",
         route.base_url.trim_end_matches('/'),
-        route.path.as_deref().unwrap_or_else(|| route.format.path())
+        &route.path
     );
     log::info!("[Proxy] forwarding to {} (model={})", url, route.model);
 
@@ -1532,7 +1532,7 @@ async fn handle_count_tokens(
     let url = format!(
         "{}{}/count_tokens",
         route.base_url.trim_end_matches('/'),
-        route.path.as_deref().unwrap_or_else(|| route.format.path())
+        &route.path
     );
     log::info!("[Proxy] count_tokens forwarding to {}", url);
 
@@ -2355,7 +2355,7 @@ pub async fn generate_image(state: &AppState, req: GenerateImageRequest) -> Gene
             continue;
         }
 
-        let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.path.as_deref().unwrap_or_else(|| route.format.path()));
+        let url = format!("{}{}", route.base_url.trim_end_matches('/'), &route.path);
         let start = std::time::Instant::now();
         let result = match route.format {
             ProviderFormat::DashscopeImage => generate_dashscope_image(state, provider, route, &url, &prompt, &req).await,
@@ -2472,7 +2472,7 @@ async fn handle_image_request(
     let size = body.get("size").and_then(|v| v.as_str()).map(|s| s.to_string());
     let n = body.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
-    let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.path.as_deref().unwrap_or_else(|| route.format.path()));
+    let url = format!("{}{}", route.base_url.trim_end_matches('/'), &route.path);
     log::info!(
         "[Proxy] image → {} (model={}, format={:?})",
         provider.name, route.model, route.format
@@ -3113,7 +3113,7 @@ async fn send_test_to_route(
     let url = format!(
         "{}{}",
         route.base_url.trim_end_matches('/'),
-        route.path.as_deref().unwrap_or_else(|| route.format.path())
+        &route.path
     );
     log::info!("[Test] testing route tag={} → {} {} (format={:?})", tag, url, route.model, route.format);
 
