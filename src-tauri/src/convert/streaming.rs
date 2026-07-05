@@ -42,14 +42,60 @@ fn codex_chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
 struct StreamState {
     started: bool,
     finished: bool,
-    block_index: u32,
-    thinking_block_open: bool,
-    text_block_open: bool,
-    tool_blocks_open: Vec<bool>,
+    /// Next available Anthropic content block index. Assigned when a block
+    /// is opened (content_block_start), ensuring every block gets a unique
+    /// index even when multiple blocks are open simultaneously (parallel
+    /// tool calls, thinking+text interleaving, etc.).
+    next_block_index: u32,
+    /// Currently open thinking block: Some(index) if open, None otherwise.
+    thinking_block: Option<u32>,
+    /// Currently open text block: Some(index) if open, None otherwise.
+    text_block: Option<u32>,
+    /// Currently open tool blocks: indexed by OpenAI tool_calls index,
+    /// value is Some(anthropic_block_index) if open.
+    tool_blocks: Vec<Option<u32>>,
     msg_id: String,
     model: String,
     usage_input_tokens: u64,
     usage_output_tokens: u64,
+}
+
+impl StreamState {
+    /// Allocate the next Anthropic content block index.
+    fn alloc_index(&mut self) -> u32 {
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        idx
+    }
+
+    /// Close all open tool blocks. Returns the closed block indices.
+    fn close_all_tools(&mut self) -> Vec<u32> {
+        let mut result = Vec::new();
+        for slot in self.tool_blocks.iter_mut() {
+            if let Some(idx) = slot.take() {
+                result.push(idx);
+            }
+        }
+        result
+    }
+
+    /// Close all open blocks (thinking, text, tools). Returns all closed
+    /// block indices in order: thinking, text, then tools.
+    fn close_all_blocks(&mut self) -> Vec<u32> {
+        let mut indices = Vec::new();
+        if let Some(idx) = self.thinking_block.take() {
+            indices.push(idx);
+        }
+        if let Some(idx) = self.text_block.take() {
+            indices.push(idx);
+        }
+        for slot in self.tool_blocks.iter_mut() {
+            if let Some(idx) = slot.take() {
+                indices.push(idx);
+            }
+        }
+        indices
+    }
 }
 
 /// Convert an OpenAI SSE byte stream into Anthropic SSE events.
@@ -60,10 +106,10 @@ pub fn convert_openai_stream_to_anthropic(
     let state = Arc::new(Mutex::new(StreamState {
         started: false,
         finished: false,
-        block_index: 0,
-        thinking_block_open: false,
-        text_block_open: false,
-        tool_blocks_open: Vec::new(),
+        next_block_index: 0,
+        thinking_block: None,
+        text_block: None,
+        tool_blocks: Vec::new(),
         msg_id: format!("msg_{:x}", std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -111,24 +157,11 @@ pub fn convert_openai_stream_to_anthropic(
                         continue;
                     }
                     // Close any open blocks and finish
-                    log::info!("[Stream] [DONE] received, closing blocks (thinking={}, text={}, blk_idx={})",
-                        st.thinking_block_open, st.text_block_open, st.block_index);
-                    if st.thinking_block_open {
-                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                        st.thinking_block_open = false;
-                        st.block_index += 1;
-                    }
-                    if st.text_block_open {
-                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                        st.text_block_open = false;
-                        st.block_index += 1;
-                    }
-                    let tool_count = st.tool_blocks_open.len();
-                    for i in 0..tool_count {
-                        if st.tool_blocks_open[i] {
-                            yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                            st.block_index += 1;
-                        }
+                    log::info!("[Stream] [DONE] received, closing blocks (thinking={:?}, text={:?}, next_idx={})",
+                        st.thinking_block, st.text_block, st.next_block_index);
+                    let closed = st.close_all_blocks();
+                    for idx in closed {
+                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", idx)));
                     }
 
                     // message_delta + message_stop
@@ -201,62 +234,71 @@ pub fn convert_openai_stream_to_anthropic(
                         let has_reasoning = delta.and_then(|d| d.get("reasoning_content")).is_some();
                         let has_content = delta.and_then(|d| d.get("content")).map(|c| !c.is_null()).unwrap_or(false);
                         let has_tool_calls = delta.and_then(|d| d.get("tool_calls")).is_some();
-                        log::debug!("[Stream] delta: reasoning={} content={} tools={} finish={:?} blk_idx={} thinking_open={} text_open={}",
+                        log::debug!("[Stream] delta: reasoning={} content={} tools={} finish={:?} next_idx={} thinking={:?} text={:?}",
                                 has_reasoning, has_content, has_tool_calls, finish_reason,
-                                st.block_index, st.thinking_block_open, st.text_block_open);
+                                st.next_block_index, st.thinking_block, st.text_block);
 
                         // Handle reasoning_content -> thinking block
                         if let Some(reasoning) = delta.and_then(|d| d.get("reasoning_content")).and_then(|r| r.as_str()) {
                             if !reasoning.is_empty() {
-                                if !st.thinking_block_open {
+                                if st.thinking_block.is_none() {
+                                    let idx = st.alloc_index();
                                     let start = json!({
                                         "type": "content_block_start",
-                                        "index": st.block_index,
+                                        "index": idx,
                                         "content_block": {"type": "thinking", "thinking": ""}
                                     });
                                     yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", start)));
-                                    st.thinking_block_open = true;
+                                    st.thinking_block = Some(idx);
                                 }
 
+                                let idx = st.thinking_block.unwrap();
                                 let delta_event = json!({
                                     "type": "content_block_delta",
-                                    "index": st.block_index,
+                                    "index": idx,
                                     "delta": {"type": "thinking_delta", "thinking": reasoning}
                                 });
                                 yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", delta_event)));
+                            } else if let Some(idx) = st.thinking_block.take() {
+                                // Empty reasoning_content string ("") signals end of thinking
+                                // phase (DashScope/qwen3.7-max, DeepSeek send this before
+                                // switching to content). Close the thinking block so the next
+                                // text block gets a fresh index — otherwise Claude Code sees
+                                // a delta for a block it already considers closed/missing.
+                                yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", idx)));
                             }
-                        } else if st.thinking_block_open {
-                            // reasoning_content went away -> close thinking block
-                            yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                            st.thinking_block_open = false;
-                            st.block_index += 1;
+                        } else if let Some(idx) = st.thinking_block.take() {
+                            // reasoning_content key absent/null -> close thinking block
+                            yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", idx)));
                         }
 
                         // Handle text content
                         if let Some(content) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
                             if !content.is_empty() {
-                                if !st.text_block_open {
+                                if st.text_block.is_none() {
+                                    // Close thinking block if still open (safety net)
+                                    if let Some(idx) = st.thinking_block.take() {
+                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", idx)));
+                                    }
                                     // Close any open tool blocks before opening text block
-                                    for i in 0..st.tool_blocks_open.len() {
-                                        if st.tool_blocks_open[i] {
-                                            yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                                            st.tool_blocks_open[i] = false;
-                                            st.block_index += 1;
-                                        }
+                                    for idx in st.close_all_tools() {
+                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", idx)));
                                     }
                                     // Open text block
+                                    let idx = st.alloc_index();
                                     let start = json!({
                                         "type": "content_block_start",
-                                        "index": st.block_index,
+                                        "index": idx,
                                         "content_block": {"type": "text", "text": ""}
                                     });
                                     yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", start)));
-                                    st.text_block_open = true;
+                                    st.text_block = Some(idx);
                                 }
 
+                                let idx = st.text_block.unwrap();
                                 let delta_event = json!({
                                     "type": "content_block_delta",
-                                    "index": st.block_index,
+                                    "index": idx,
                                     "delta": {"type": "text_delta", "text": content}
                                 });
                                 yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", delta_event)));
@@ -269,44 +311,29 @@ pub fn convert_openai_stream_to_anthropic(
                                 let tc_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
 
                                 // Ensure we have enough slots
-                                while st.tool_blocks_open.len() <= tc_index {
-                                    // Close thinking block if open
-                                    if st.thinking_block_open {
-                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                                        st.thinking_block_open = false;
-                                        st.block_index += 1;
-                                    }
-                                    // Close text block if open
-                                    if st.text_block_open {
-                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                                        st.text_block_open = false;
-                                        st.block_index += 1;
-                                    }
-                                    st.tool_blocks_open.push(false);
+                                while st.tool_blocks.len() <= tc_index {
+                                    st.tool_blocks.push(None);
                                 }
 
                                 // Open tool block if not yet open
-                                if !st.tool_blocks_open[tc_index] {
+                                if st.tool_blocks[tc_index].is_none() {
                                     // Close thinking block first if open
-                                    if st.thinking_block_open {
-                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                                        st.thinking_block_open = false;
-                                        st.block_index += 1;
+                                    if let Some(idx) = st.thinking_block.take() {
+                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", idx)));
                                     }
                                     // Close text block first if open
-                                    if st.text_block_open {
-                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                                        st.text_block_open = false;
-                                        st.block_index += 1;
+                                    if let Some(idx) = st.text_block.take() {
+                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", idx)));
                                     }
                                     let tool_name = tc.get("function")
                                         .and_then(|f| f.get("name"))
                                         .and_then(|n| n.as_str())
                                         .unwrap_or("");
                                     let tool_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                                    let idx = st.alloc_index();
                                     let tool_start = json!({
                                         "type": "content_block_start",
-                                        "index": st.block_index,
+                                        "index": idx,
                                         "content_block": {
                                             "type": "tool_use",
                                             "id": tool_id,
@@ -315,15 +342,16 @@ pub fn convert_openai_stream_to_anthropic(
                                         }
                                     });
                                     yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", tool_start)));
-                                    st.tool_blocks_open[tc_index] = true;
+                                    st.tool_blocks[tc_index] = Some(idx);
                                 }
 
-                                // Tool arguments delta
+                                // Tool arguments delta — use the block's assigned index
+                                let block_idx = st.tool_blocks[tc_index].unwrap();
                                 if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()) {
                                     if !args.is_empty() {
                                         let args_delta = json!({
                                             "type": "content_block_delta",
-                                            "index": st.block_index,
+                                            "index": block_idx,
                                             "delta": {
                                                 "type": "input_json_delta",
                                                 "partial_json": args
@@ -338,8 +366,8 @@ pub fn convert_openai_stream_to_anthropic(
                         // Handle finish_reason
                         if let Some(reason) = finish_reason {
                             if !reason.is_empty() && reason != "null" && !st.finished {
-                                log::info!("[Stream] finish_reason={}, closing blocks (thinking={}, text={}, blk_idx={})",
-                                    reason, st.thinking_block_open, st.text_block_open, st.block_index);
+                                log::info!("[Stream] finish_reason={}, closing blocks (thinking={:?}, text={:?}, next_idx={})",
+                                    reason, st.thinking_block, st.text_block, st.next_block_index);
                                 let stop_reason = match reason {
                                     "stop" => "end_turn",
                                     "tool_calls" => "tool_use",
@@ -348,30 +376,14 @@ pub fn convert_openai_stream_to_anthropic(
                                 };
 
                                 // Close any open content blocks
-                                if st.thinking_block_open {
-                                    yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                                    st.thinking_block_open = false;
-                                    st.block_index += 1;
-                                }
-                                if st.text_block_open {
-                                    yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                                    st.text_block_open = false;
-                                    st.block_index += 1;
-                                }
-                                let tool_count = st.tool_blocks_open.len();
-                                let mut has_open_tool = false;
-                                for i in 0..tool_count {
-                                    if st.tool_blocks_open[i] {
-                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", st.block_index)));
-                                        st.tool_blocks_open[i] = false;
-                                        has_open_tool = true;
-                                        st.block_index += 1;
-                                    }
+                                let had_tool = st.tool_blocks.iter().any(|t| t.is_some());
+                                for idx in st.close_all_blocks() {
+                                    yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", idx)));
                                 }
 
                                 // If finish_reason is "tool_calls" but no tool blocks were actually
                                 // created, fall back to "end_turn" to avoid confusing the client
-                                let stop_reason = if stop_reason == "tool_use" && !has_open_tool {
+                                let stop_reason = if stop_reason == "tool_use" && !had_tool {
                                     log::info!("[Stream] finish_reason was tool_calls but no tool blocks found, using end_turn");
                                     "end_turn"
                                 } else {
@@ -2155,5 +2167,524 @@ impl CodexAnthropicToResponsesState {
             "id": self.response_id, "object": "response", "status": "failed",
             "error": {"message": message}
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use serde_json::json;
+
+    /// Helper: build an SSE byte stream from a list of OpenAI Chat chunk JSON values.
+    fn make_openai_sse_stream(chunks: Vec<Value>) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
+        let mut sse_data = String::new();
+        for chunk in &chunks {
+            sse_data.push_str(&format!("data: {}\n\n", serde_json::to_string(chunk).unwrap()));
+        }
+        sse_data.push_str("data: [DONE]\n\n");
+        let bytes = Bytes::from(sse_data);
+        let stream = futures::stream::once(async move { Ok(bytes) });
+        Box::pin(stream)
+    }
+
+    /// Collect all output bytes from an Anthropic SSE stream into a string.
+    async fn collect_stream(stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>) -> String {
+        let mut output = String::new();
+        let mut stream = std::pin::pin!(stream);
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(bytes) => output.push_str(&String::from_utf8_lossy(&bytes)),
+                Err(e) => panic!("Stream error: {}", e),
+            }
+        }
+        output
+    }
+
+    /// Extract all content block events (start/delta/stop) with their indices.
+    fn extract_block_events(sse_output: &str) -> Vec<(String, u32)> {
+        let mut events = Vec::new();
+        for line in sse_output.lines() {
+            let data = if let Some(s) = line.strip_prefix("data: ") {
+                s
+            } else if let Some(s) = line.strip_prefix("data:") {
+                s.trim()
+            } else {
+                continue;
+            };
+            if data == "[DONE]" || data.is_empty() {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<Value>(data) {
+                let event_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if event_type.starts_with("content_block_") {
+                    let index = parsed.get("index").and_then(|i| i.as_u64()).unwrap_or(u32::MAX as u64) as u32;
+                    events.push((event_type.to_string(), index));
+                }
+            }
+        }
+        events
+    }
+
+    /// Regression test for qwen3.7-max streaming pattern:
+    /// 1. reasoning_content with actual text (thinking phase)
+    /// 2. reasoning_content with empty string "" (signals end of thinking)
+    /// 3. content with actual text (response phase)
+    ///
+    /// Without the fix, the empty reasoning_content would NOT close the thinking
+    /// block, causing the text block to open at the same index → "Content block
+    /// not found" in Claude Code.
+    #[tokio::test]
+    async fn test_qwen37_max_empty_reasoning_content_closes_thinking_block() {
+        let chunks = vec![
+            // First chunk: reasoning content
+            json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "reasoning_content": "Let me think about this..."
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            // Second chunk: empty reasoning_content signals end of thinking
+            json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "reasoning_content": ""
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            // Third chunk: actual content
+            json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "The answer is 42"
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            // Final chunk
+            json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20}
+            }),
+        ];
+
+        let stream = make_openai_sse_stream(chunks);
+        let result = convert_openai_stream_to_anthropic(stream, "claude-sonnet-4-6".to_string());
+        let output = collect_stream(result).await;
+        let block_events = extract_block_events(&output);
+
+        // Expected sequence:
+        //   content_block_start  index=0  (thinking)
+        //   content_block_delta  index=0  (thinking)
+        //   content_block_stop   index=0  (closed by empty reasoning_content)
+        //   content_block_start  index=1  (text)
+        //   content_block_delta  index=1  (text)
+        //   content_block_stop   index=1  (closed by finish)
+        assert!(block_events.len() >= 6, "Expected at least 6 block events, got {}: {:?}", block_events.len(), block_events);
+
+        // Verify thinking block uses index 0
+        assert_eq!(block_events[0], ("content_block_start".to_string(), 0), "First block should start at index 0");
+        assert_eq!(block_events[1], ("content_block_delta".to_string(), 0), "First delta should be at index 0");
+        assert_eq!(block_events[2], ("content_block_stop".to_string(), 0), "Thinking block should stop at index 0");
+
+        // Verify text block uses index 1 (NOT index 0 — that would be the bug)
+        assert_eq!(block_events[3], ("content_block_start".to_string(), 1), "Text block should start at index 1, not 0 (thinking was closed)");
+        assert_eq!(block_events[4], ("content_block_delta".to_string(), 1), "Text delta should be at index 1");
+        assert_eq!(block_events[5], ("content_block_stop".to_string(), 1), "Text block should stop at index 1");
+    }
+
+    /// Test that when reasoning_content disappears (no key at all) the thinking
+    /// block is also properly closed. This was the existing behavior before the
+    /// fix — ensure it still works.
+    #[tokio::test]
+    async fn test_reasoning_content_disappearing_closes_thinking_block() {
+        let chunks = vec![
+            json!({
+                "id": "chatcmpl-456",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "reasoning_content": "Hmm..." },
+                    "finish_reason": null
+                }]
+            }),
+            // No reasoning_content key at all — thinking block should close
+            json!({
+                "id": "chatcmpl-456",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "Done thinking." },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "id": "chatcmpl-456",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 10}
+            }),
+        ];
+
+        let stream = make_openai_sse_stream(chunks);
+        let result = convert_openai_stream_to_anthropic(stream, "claude-sonnet-4-6".to_string());
+        let output = collect_stream(result).await;
+        let block_events = extract_block_events(&output);
+
+        // Thinking block at index 0, text block at index 1
+        assert!(block_events.len() >= 6, "Expected at least 6 block events, got {}: {:?}", block_events.len(), block_events);
+        assert_eq!(block_events[0], ("content_block_start".to_string(), 0));
+        assert_eq!(block_events[2], ("content_block_stop".to_string(), 0));
+        assert_eq!(block_events[3], ("content_block_start".to_string(), 1));
+    }
+
+    /// Test the safety net: if for any reason the thinking block is NOT closed
+    /// by the reasoning_content handler, opening a text block should close it
+    /// first. This is defense-in-depth.
+    #[tokio::test]
+    async fn test_safety_net_closes_thinking_before_text() {
+        // Construct a scenario where reasoning and content appear in the same delta
+        // (edge case that some providers might emit)
+        let chunks = vec![
+            json!({
+                "id": "chatcmpl-789",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "reasoning_content": "Thinking..." },
+                    "finish_reason": null
+                }]
+            }),
+            // Content arrives while thinking block is still open
+            // (reasoning_content key is absent, so the existing else-if closes it)
+            json!({
+                "id": "chatcmpl-789",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "Answer" },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "id": "chatcmpl-789",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 5}
+            }),
+        ];
+
+        let stream = make_openai_sse_stream(chunks);
+        let result = convert_openai_stream_to_anthropic(stream, "claude-sonnet-4-6".to_string());
+        let output = collect_stream(result).await;
+        let block_events = extract_block_events(&output);
+
+        // Verify no index collision: thinking=0, text=1
+        let starts: Vec<u32> = block_events.iter()
+            .filter(|(t, _)| t == "content_block_start")
+            .map(|(_, i)| *i)
+            .collect();
+        assert_eq!(starts, vec![0, 1], "Block indices should be [0, 1] with no collision");
+    }
+
+    /// Regression test for deepseek-v4-flash parallel tool calls:
+    /// Multiple tool_calls with different indices in the same delta must
+    /// each get a unique Anthropic content block index. The old code used
+    /// a single block_index that only incremented on close, causing
+    /// both tools to share index 0 → "Content block not found".
+    #[tokio::test]
+    async fn test_deepseek_parallel_tool_calls_unique_indices() {
+        let chunks = vec![
+            // First tool call announced
+            json!({
+                "id": "chatcmpl-abc",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_read",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": ""}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            // Second tool call announced in a separate delta (DeepSeek pattern)
+            json!({
+                "id": "chatcmpl-abc",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 1,
+                            "id": "call_write",
+                            "type": "function",
+                            "function": {"name": "write_file", "arguments": ""}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            // Args for first tool
+            json!({
+                "id": "chatcmpl-abc",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": "{\"path\":\"a.txt\"}"}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            // Args for second tool
+            json!({
+                "id": "chatcmpl-abc",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 1,
+                            "function": {"arguments": "{\"path\":\"b.txt\"}"}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            // Finish
+            json!({
+                "id": "chatcmpl-abc",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 30}
+            }),
+        ];
+
+        let stream = make_openai_sse_stream(chunks);
+        let result = convert_openai_stream_to_anthropic(stream, "claude-sonnet-4-6".to_string());
+        let output = collect_stream(result).await;
+        let block_events = extract_block_events(&output);
+
+        // Extract content_block_start events — each should have a unique index
+        let starts: Vec<u32> = block_events.iter()
+            .filter(|(t, _)| t == "content_block_start")
+            .map(|(_, i)| *i)
+            .collect();
+
+        // Both tools should get unique indices: [0, 1]
+        assert_eq!(starts.len(), 2, "Should have 2 tool_use blocks, got starts: {:?}", starts);
+        assert_ne!(starts[0], starts[1], "Tool blocks must have different indices, both got {}", starts[0]);
+        assert_eq!(starts[0], 0, "First tool should be at index 0");
+        assert_eq!(starts[1], 1, "Second tool should be at index 1");
+
+        // Verify deltas use the correct per-block indices
+        let deltas: Vec<(String, u32)> = block_events.iter()
+            .filter(|(t, _)| t == "content_block_delta")
+            .cloned()
+            .collect();
+        // Args delta for tool 0 should use index 0, args delta for tool 1 should use index 1
+        let tool0_deltas: Vec<u32> = deltas.iter()
+            .filter(|(t, idx)| *t == "content_block_delta" && *idx == 0)
+            .map(|(_, idx)| *idx)
+            .collect();
+        let tool1_deltas: Vec<u32> = deltas.iter()
+            .filter(|(t, idx)| *t == "content_block_delta" && *idx == 1)
+            .map(|(_, idx)| *idx)
+            .collect();
+        assert!(!tool0_deltas.is_empty(), "Tool 0 should have delta events at its index");
+        assert!(!tool1_deltas.is_empty(), "Tool 1 should have delta events at its index");
+
+        // Verify stops use correct indices
+        let stops: Vec<u32> = block_events.iter()
+            .filter(|(t, _)| t == "content_block_stop")
+            .map(|(_, i)| *i)
+            .collect();
+        assert_eq!(stops, vec![0, 1], "Stop events should close indices [0, 1]");
+    }
+
+    /// Test reasoning + tool calls (DeepSeek thinking mode with tool use).
+    /// DeepSeek-v4-pro sends reasoning_content, then tool_calls.
+    /// The thinking block must be closed before the tool block opens.
+    #[tokio::test]
+    async fn test_deepseek_reasoning_then_tool_calls() {
+        let chunks = vec![
+            json!({
+                "id": "chatcmpl-def",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "reasoning_content": "I need to read the file first..."
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            // Empty reasoning signals end of thinking (DeepSeek pattern)
+            json!({
+                "id": "chatcmpl-def",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "reasoning_content": ""
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            // Tool call
+            json!({
+                "id": "chatcmpl-def",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_read",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{\"path\":\"x.rs\"}"}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "id": "chatcmpl-def",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 15}
+            }),
+        ];
+
+        let stream = make_openai_sse_stream(chunks);
+        let result = convert_openai_stream_to_anthropic(stream, "claude-sonnet-4-6".to_string());
+        let output = collect_stream(result).await;
+        let block_events = extract_block_events(&output);
+
+        let starts: Vec<u32> = block_events.iter()
+            .filter(|(t, _)| t == "content_block_start")
+            .map(|(_, i)| *i)
+            .collect();
+        let stops: Vec<u32> = block_events.iter()
+            .filter(|(t, _)| t == "content_block_stop")
+            .map(|(_, i)| *i)
+            .collect();
+
+        // thinking=0, tool=1 — sequential unique indices
+        assert_eq!(starts, vec![0, 1], "Blocks should open at [0, 1]");
+        assert_eq!(stops, vec![0, 1], "Blocks should close at [0, 1]");
+    }
+
+    /// Test the full DeepSeek-v4-flash scenario: reasoning → content → tool_calls
+    /// This exercises the complete state machine with all three block types.
+    #[tokio::test]
+    async fn test_deepseek_flash_reasoning_content_tools() {
+        let chunks = vec![
+            json!({
+                "id": "chatcmpl-ghi",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "reasoning_content": "Analyzing..." },
+                    "finish_reason": null
+                }]
+            }),
+            // reasoning disappears (DeepSeek-v4-flash sometimes omits empty string)
+            json!({
+                "id": "chatcmpl-ghi",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "I'll help with that." },
+                    "finish_reason": null
+                }]
+            }),
+            // Tool call after text
+            json!({
+                "id": "chatcmpl-ghi",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "id": "chatcmpl-ghi",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 25}
+            }),
+        ];
+
+        let stream = make_openai_sse_stream(chunks);
+        let result = convert_openai_stream_to_anthropic(stream, "claude-sonnet-4-6".to_string());
+        let output = collect_stream(result).await;
+        let block_events = extract_block_events(&output);
+
+        let starts: Vec<u32> = block_events.iter()
+            .filter(|(t, _)| t == "content_block_start")
+            .map(|(_, i)| *i)
+            .collect();
+
+        // thinking=0, text=1, tool=2 — three blocks with sequential unique indices
+        assert_eq!(starts.len(), 3, "Should have 3 blocks (thinking, text, tool)");
+        assert_eq!(starts, vec![0, 1, 2], "All blocks should have sequential unique indices");
     }
 }
