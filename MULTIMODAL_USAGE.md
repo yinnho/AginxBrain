@@ -1,0 +1,247 @@
+# AginxBrain 多模态使用指南（TTS / ASR / Video）
+
+本文档说明如何通过 AginxBrain 调用**语音合成（TTS）**、**语音识别（ASR）**、**视频生成（Video）**三项能力。
+
+> 文档中所有示例的当前后端：
+> - TTS：阿里 DashScope `cosyvoice-v2`（WebSocket）
+> - ASR：阿里 DashScope `paraformer-realtime-v2`（WebSocket）
+> - Video：阿里 DashScope `wanx2.1-t2v-turbo`（异步任务）
+
+---
+
+## 0. 通用约定
+
+| 项 | 值 |
+|----|----|
+| 服务地址 | `https://brain.aginx.net`（本地为 `http://127.0.0.1:8083`） |
+| 鉴权 | `Authorization: Bearer <caller_key>`（在管理后台创建的调用密钥） |
+| 统一入口 | `POST /v1/chat/completions`（OpenAI Chat 格式） |
+| 模型名 | 用**标签名**当 model：`tts` / `audio` / `video`（AginxBrain 内部解析到具体后端模型） |
+
+三项能力**都复用 OpenAI Chat 接口**——把要处理的"内容"放在 `messages` 里，靠 `model` 字段区分走哪条管道：
+
+```bash
+curl https://brain.aginx.net/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "<tts|audio|video>", "messages": [...] }'
+```
+
+`$KEY` 是你的 caller key。下文每节给出完整示例。
+
+---
+
+## 1. TTS —— 语音合成（文字 → 语音）
+
+把要合成的文字放在最后一条 `user` 消息里。
+
+**请求**
+```bash
+curl -X POST https://brain.aginx.net/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "tts",
+    "messages": [
+      { "role": "user", "content": "你好，这是一段语音合成测试。" }
+    ],
+    "voice": "longxiaochun_v2",
+    "audio_format": "mp3",
+    "sample_rate": 22050
+  }'
+```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `voice` | 音色（见下表） | `longxiaochun_v2` |
+| `audio_format` | 输出格式：`mp3` / `wav` / `pcm` | `mp3` |
+| `sample_rate` | 采样率 | `22050` |
+
+`voice` 用 CosyVoice 的音色 ID，命名大致是 `long<名>_v2`。默认 `longxiaochun_v2`（女声·温柔）已内置可用。常用还包括 `longcheng_v2`（男声）、`longhua_v2`（男声）、`longwan_v2`（女声）等；**完整音色列表以 DashScope CosyVoice 文档为准**（含男/女声、方言、情感音色）。
+
+> 也支持声音克隆音色（在 DashScope 控制台训练后用克隆音色 ID）。传一个不存在的音色 ID 会在合成阶段报错。
+
+**响应**
+```json
+{
+  "code": "Success",
+  "output": { "audio": "/audio/1784281502796_xxx.mp3" }
+}
+```
+
+**获取音频文件**：返回的是相对路径，直接 GET 同一个域名（**此接口免鉴权**）：
+```bash
+curl -o result.mp3 https://brain.aginx.net/audio/1784281502796_xxx.mp3
+```
+
+---
+
+## 2. ASR —— 语音识别（语音 → 文字）
+
+把音频以 base64 放在 `messages` 的 `input_audio` 内容块里（OpenAI 的 audio block 格式）。
+
+**请求**
+```bash
+# 把音频转成 data URL 再发
+AUDIO=$(base64 -i voice.mp3 | tr -d '\n')
+
+curl -X POST https://brain.aginx.net/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "audio",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "请转写这���音频" },
+          {
+            "type": "input_audio",
+            "input_audio": {
+              "data": "data:audio/mp3;base64,'"${AUDIO}"'",
+              "format": "mp3"
+            }
+          }
+        ]
+      }
+    ],
+    "sample_rate": 22050
+  }'
+```
+
+| 字段 | 说明 |
+|------|------|
+| `input_audio.data` | base64 音频。推荐用 **data URL**：`data:audio/<fmt>;base64,<...>`；也可只放裸 base64 |
+| `input_audio.format` | `mp3` / `wav` / `pcm` 等（用 data URL 时可省略，自动从 mime 推断） |
+| `sample_rate` | 采样率，默认 `22050` |
+
+**响应**（标准 OpenAI Chat 格式，转写文字在 `message.content`）
+```json
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "你好，这是一段语音合成测试。"
+      }
+    }
+  ]
+}
+```
+
+> 支持 TTS→ASR 互测：把 TTS 产出的 mp3 再喂给 ASR，应能还原文字。
+
+---
+
+## 3. Video —— 视频生成（文字 → 视频，异步）
+
+视频生成耗时较长（turbo ~30–60s），因此是**真异步**：提交立刻返回 `task_id`，**客户端轮询**直到完成。
+
+### 3.1 提交任务
+
+把视频描述（prompt）放在最后一条 `user` 消息里。
+
+```bash
+curl -X POST https://brain.aginx.net/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "video",
+    "messages": [
+      { "role": "user", "content": "一只金毛在阳光下的公园草地上奔跑，慢动作" }
+    ],
+    "size": "1280*720",
+    "duration": 5
+  }'
+```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `size` | 分辨率，如 `1280*720`、`960*960`、`1080*1920` | `1280*720` |
+| `duration` | 时长（秒） | `5` |
+
+**响应**（**立刻返回**，通常 < 1s）
+```json
+{
+  "code": "Success",
+  "task_id": "c3f9065c-091b-4d34-9b97-dde5faa10bcb",
+  "task_status": "PENDING",
+  "tag": "video"
+}
+```
+
+### 3.2 轮询结果
+
+用返回的 `task_id` 轮询（建议每 5s 一次）。路径里的 `video` 就是上面返回的 `tag`。
+
+```bash
+curl https://brain.aginx.net/v1/tasks/video/$TASK_ID \
+  -H "Authorization: Bearer $KEY"
+```
+
+**响应**（DashScope 任务格式）
+```json
+{
+  "output": {
+    "task_id": "c3f9065c-...",
+    "task_status": "RUNNING",
+    "video_url": null
+  },
+  "request_id": "..."
+}
+```
+
+`task_status` 取值：
+
+| 状态 | 含义 | 处理 |
+|------|------|------|
+| `PENDING` / `RUNNING` | 生成中 | 继续轮询 |
+| `SUCCEEDED` | 完成 | 取 `output.video_url` |
+| `FAILED` | 失败 | 看 `output.message` |
+
+**完成时的响应**
+```json
+{
+  "output": {
+    "task_id": "c3f9065c-...",
+    "task_status": "SUCCEEDED",
+    "video_url": "https://dashscope-result-xxx.aliyuncs.com/.../c3f9065c-....mp4?Expires=...&Signature=...",
+    "actual_prompt": "...(模型重写后的 prompt)..."
+  }
+}
+```
+
+> `video_url` 是阿里云 OSS 临时链接，**有过期时间**（`Expires`），拿到后尽快下载。
+
+### 3.3 轮询示例脚本
+
+```bash
+TASK="<提交得到的 task_id>"
+while true; do
+  R=$(curl -s https://brain.aginx.net/v1/tasks/video/$TASK -H "Authorization: Bearer $KEY")
+  S=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['output']['task_status'])")
+  echo "status=$S"
+  [ "$S" = "SUCCEEDED" ] && { echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['output']['video_url'])"; break; }
+  [ "$S" = "FAILED" ] && { echo "$R"; break; }
+  sleep 5
+done
+```
+
+---
+
+## 4. 速查表
+
+| 能力 | model | 入口 | 输入 | 返回 |
+|------|-------|------|------|------|
+| TTS | `tts` | POST `/v1/chat/completions` | messages 里的文字 | `/audio/{file}` 路径（再 GET 取音频） |
+| ASR | `audio` | POST `/v1/chat/completions` | messages 里 base64 音频 | OpenAI 格式，转写文字在 `message.content` |
+| Video | `video` | POST `/v1/chat/completions` | messages 里的 prompt | `task_id`（再轮询） |
+| Video 轮询 | — | GET `/v1/tasks/video/{task_id}` | — | `task_status` + `video_url` |
+
+## 5. 注意事项
+
+- **鉴权**：除 `GET /audio/{file}`（TTS 音频下载）外，所有接口都需要 caller key。
+- **视频是异步**：务必用 提交 + 轮询 的两步流程，不要在一个请求里阻塞等待——视频生成耗时不可控。
+- **OSS 链接过期**：TTS/Video 返回的下载链接都有 `Expires`，拿到后请及时下载。
+- **模型/音色配置**：以上后端模型、音色都在服务器 `~/.aginxbrain/config.yaml` 的 routes/providers 里配置；换模型改配置即可，不用改代码。
