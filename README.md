@@ -97,6 +97,8 @@ A per-session, **upgrade-only** cache (30 min TTL) means once a conversation nee
 
 Image generation (DashScope `wan2.7`, MiniMax, OpenAI images), TTS & ASR (DashScope WebSocket, Whisper), vision, and video synthesis — all behind the same tag-routing surface, dispatched by the route's `format`.
 
+> 📖 Usage guide: **[MULTIMODAL_USAGE.md](./MULTIMODAL_USAGE.md)** — TTS, ASR, and video with copy-paste curl examples.
+
 ### 🔌 One-click client takeover
 
 The desktop client (or the admin UI) rewrites your real client config for you, with one-click restore:
@@ -344,7 +346,7 @@ Most LLM gateways (One API, OpenRouter, Helicone) expose an **OpenAI-compatible 
 | China providers first-class (DeepSeek, GLM, Kimi, Qwen, ERNIE) | ✅ | partial | partial | ✅ | ✅ |
 | Self-host single binary + embedded admin UI | ✅ Rust | Python | ❌ SaaS | ✅ | ❌ SaaS |
 
-Full breakdown: **[COMPARISON.md](./COMPARISON.md)** · 中文省钱攻略: **[ARTICLE.md](./ARTICLE.md)**
+Full breakdown: **[COMPARISON.md](./COMPARISON.md)** · 中文省钱攻略: **[ARTICLE.md](./ARTICLE.md)** · 多模态使用: **[MULTIMODAL_USAGE.md](./MULTIMODAL_USAGE.md)**
 
 ---
 
