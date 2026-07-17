@@ -123,7 +123,7 @@ impl ProviderFormat {
             ProviderFormat::Anthropic => "/v1/messages",
             ProviderFormat::OpenaiResponses => "/v1/responses",
             ProviderFormat::OpenaiImages => "/v1/images/generations",
-            ProviderFormat::DashscopeImage => "/api/v1/services/aigc/multimodal-generation/generation",
+            ProviderFormat::DashscopeImage => "/api/v1/services/aigc/image-generation/generation",
             ProviderFormat::DashscopeChatImage => "/chat/completions",
             ProviderFormat::DashscopeVideo => "/api/v1/services/aigc/video-generation/video-synthesis",
             ProviderFormat::DashscopeTts => "/api/v1/services/aigc/text-to-speech/stream",
@@ -549,6 +549,11 @@ impl AppState {
         let http_client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(crate::proxy::CONNECT_TIMEOUT))
             .timeout(std::time::Duration::from_secs(3600))
+            // Force HTTP/1.1. Some upstreams (e.g. Alibaba MaaS dedicated endpoints)
+            // negotiate h2 via ALPN and then reject reqwest's h2 body framing
+            // (returns "EmptyModel" as if the body never arrived). Pinning to h1
+            // matches what works and avoids the h2 body-framing mismatch.
+            .http1_only()
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create HTTP client: {}", e))?;
         let db = crate::db::init_db().await?;

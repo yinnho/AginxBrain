@@ -2355,7 +2355,7 @@ pub async fn generate_image(state: &AppState, req: GenerateImageRequest) -> Gene
             continue;
         }
 
-        let url = format!("{}{}", route.base_url.trim_end_matches('/'), &route.path);
+        let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.effective_path());
         let start = std::time::Instant::now();
         let result = match route.format {
             ProviderFormat::DashscopeImage => generate_dashscope_image(state, provider, route, &url, &prompt, &req).await,
@@ -2472,7 +2472,7 @@ async fn handle_image_request(
     let size = body.get("size").and_then(|v| v.as_str()).map(|s| s.to_string());
     let n = body.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
-    let url = format!("{}{}", route.base_url.trim_end_matches('/'), &route.path);
+    let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.effective_path());
     log::info!(
         "[Proxy] image → {} (model={}, format={:?})",
         provider.name, route.model, route.format
@@ -2693,8 +2693,8 @@ async fn send_image_post(
     body: &Value,
     extra_headers: &[(&str, &str)],
 ) -> Result<Value, ProxyError> {
-    let mut builder = state.http_client.post(url)
-        .header("content-type", "application/json")
+    let mut builder = state.http_client
+        .post(url)
         .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key));
     for (k, v) in extra_headers {
         builder = builder.header(*k, *v);
@@ -2796,7 +2796,9 @@ async fn generate_dashscope_image(
         }
     }
     let body = json!({ "model": route.model, "input": input, "parameters": parameters });
-    let result = send_image_post(state, provider, url, &body, &[]).await?;
+    // image-generation/generation requires async mode (sync returns 403).
+    // Returns task_id → poll_dashscope_image_task resolves it.
+    let result = send_image_post(state, provider, url, &body, &[("X-DashScope-Async", "enable")]).await?;
     if let Some(images) = parse_dashscope_images(&result) {
         if !images.is_empty() {
             return Ok(images);
@@ -2804,7 +2806,9 @@ async fn generate_dashscope_image(
     }
 
     if let Some(task_id) = result.pointer("/output/task_id").and_then(|v| v.as_str()) {
-        return poll_dashscope_image_task(state, provider, task_id, url).await;
+        // Poll against the provider origin (route.base_url), NOT the full POST
+        // url — otherwise the generation path gets prepended to /api/v1/tasks/{id}.
+        return poll_dashscope_image_task(state, provider, task_id, &route.base_url).await;
     }
 
     Err(ProxyError::Upstream("No images or task_id in DashScope image response".to_string()))
