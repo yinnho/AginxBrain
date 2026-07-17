@@ -1,7 +1,7 @@
 use crate::config::{AppState, AppConfig, CircuitState, CircuitStatus, Provider, ProviderFormat, Route};
 use crate::convert;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -165,6 +165,50 @@ pub async fn handle_openai_responses(
     let caller_key_id = parts.extensions.get::<i64>().copied();
     let body = parse_body(body).await?;
     handle_proxy("openai_responses", state, headers, caller_key_id, axum::Json(body)).await
+}
+
+/// Poll a DashScope async task by tag and task ID. After POSTing a video (or
+/// future async image) generation, the client polls GET /v1/tasks/{tag}/{task_id}
+/// for completion. AginxBrain proxies the GET to the upstream provider's
+/// /api/v1/tasks/{task_id} endpoint.
+pub async fn handle_task_poll(
+    State(state): State<AppState>,
+    Path((tag, task_id)): Path<(String, String)>,
+    _request: Request,
+) -> Result<Response, ProxyError> {
+    let (task_url, provider) = {
+        let config = state.config.read().await;
+        let candidates = find_candidate_routes(&config.routes, &tag, &config.tags);
+        let (_, route) = candidates
+            .first()
+            .ok_or_else(|| ProxyError::Upstream(format!("no route found for tag '{}'", tag)))?;
+        let provider = config
+            .providers
+            .get(&route.provider)
+            .cloned()
+            .ok_or_else(|| ProxyError::Upstream(format!("provider '{}' not found", route.provider)))?;
+        if provider.api_key.is_empty() {
+            return Err(ProxyError::Upstream(format!(
+                "provider '{}' has no API key configured",
+                route.provider
+            )));
+        }
+        let task_url = format!(
+            "{}/api/v1/tasks/{}",
+            route.base_url.trim_end_matches('/'),
+            task_id
+        );
+        (task_url, provider)
+    };
+
+    log::info!(
+        "[Proxy] task poll: tag={} task_id={} url={}",
+        tag,
+        task_id,
+        task_url
+    );
+    let result = send_image_get(&state, &provider, &task_url).await?;
+    Ok(Json(result).into_response())
 }
 
 /// Parse request body as JSON, accepting any content-type.
@@ -2574,12 +2618,32 @@ async fn handle_video_request(
         "[Proxy] video → {} (model={}, format={:?})",
         provider.name, route.model, route.format
     );
-    log::info!("[Proxy] forwarding video request to {}", url);
+    log::info!("[Proxy] submitting video task to {}", url);
 
-    let video_url = generate_dashscope_video(&state, provider, route, &url, &prompt, &size, duration).await?;
+    // Submit the async task (sync returns 403). Return the task_id immediately;
+    // the client polls GET /v1/tasks/{tag}/{task_id} for completion. This keeps
+    // the HTTP connection short and avoids timeouts on slow video generation.
+    let parameters = json!({ "size": size, "duration": duration });
+    let input = json!({ "prompt": prompt });
+    let submit_body = json!({ "model": route.model, "input": input, "parameters": parameters });
+    let result =
+        send_image_post(&state, provider, &url, &submit_body, &[("X-DashScope-Async", "enable")])
+            .await?;
+    let task_id = result
+        .pointer("/output/task_id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| ProxyError::Upstream("No task_id in DashScope video response".to_string()))?;
+    let task_status = result
+        .pointer("/output/task_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("PENDING");
+    let tag = route.tags.first().cloned().unwrap_or_else(|| "video".to_string());
 
     log::info!(
-        "[Proxy] video response: latency={}ms",
+        "[Proxy] video task submitted: task_id={} status={} latency={}ms",
+        task_id,
+        task_status,
         start.elapsed().as_millis()
     );
 
@@ -2587,7 +2651,7 @@ async fn handle_video_request(
         &state.db,
         crate::db::UsageInsert {
             caller_key_id,
-            tag: route.tags.first().cloned().unwrap_or_default(),
+            tag: tag.clone(),
             provider: provider.name.clone(),
             model: route.model.clone(),
             request_model: route.model.clone(),
@@ -2595,17 +2659,16 @@ async fn handle_video_request(
             input_tokens: None,
             output_tokens: None,
             latency_ms: start.elapsed().as_millis() as i64,
-            status: "success".into(),
+            status: "submitted".into(),
             error_message: None,
         },
     ).await;
 
-    // OpenCarrier-style: expose the URL both at top level and as a content block.
+    // Truly async — return the task ID immediately. The client polls.
     let resp = json!({
-        "output": {
-            "video_url": video_url.clone(),
-            "choices": [{ "message": { "content": [{ "type": "video", "video": video_url }] } }]
-        },
+        "task_id": task_id,
+        "task_status": task_status,
+        "tag": tag,
         "code": "Success"
     });
     Ok(Json(resp).into_response())
@@ -2904,65 +2967,6 @@ async fn poll_dashscope_image_task(
             }
             "FAILED" | "Failed" => {
                 let msg = result.pointer("/output/message").and_then(|v| v.as_str()).unwrap_or("Unknown DashScope task error");
-                return Err(ProxyError::Upstream(msg.to_string()));
-            }
-            _ => continue,
-        }
-    }
-}
-
-/// Generate video via DashScope video-synthesis (async task). Mirrors
-/// generate_dashscope_image, but the result is a single `video_url` rather
-/// than a list of images.
-async fn generate_dashscope_video(
-    state: &AppState,
-    provider: &Provider,
-    route: &Route,
-    url: &str,
-    prompt: &str,
-    size: &str,
-    duration: u64,
-) -> Result<String, ProxyError> {
-    let parameters = json!({ "size": size, "duration": duration });
-    let input = json!({ "prompt": prompt });
-    let body = json!({ "model": route.model, "input": input, "parameters": parameters });
-    // video-synthesis is async-only (sync returns 403).
-    let result = send_image_post(state, provider, url, &body, &[("X-DashScope-Async", "enable")]).await?;
-    if let Some(task_id) = result.pointer("/output/task_id").and_then(|v| v.as_str()) {
-        return poll_dashscope_video_task(state, provider, task_id, &route.base_url).await;
-    }
-    if let Some(video_url) = result.pointer("/output/video_url").and_then(|v| v.as_str()) {
-        return Ok(video_url.to_string());
-    }
-    Err(ProxyError::Upstream("No task_id or video_url in DashScope video response".to_string()))
-}
-
-async fn poll_dashscope_video_task(
-    state: &AppState,
-    provider: &Provider,
-    task_id: &str,
-    base_url: &str,
-) -> Result<String, ProxyError> {
-    let poll_url = format!("{}/api/v1/tasks/{}", base_url.trim_end_matches('/'), task_id);
-    let start = std::time::Instant::now();
-    loop {
-        // Video synthesis is slower than image; allow up to 5 minutes.
-        if start.elapsed() > std::time::Duration::from_secs(300) {
-            return Err(ProxyError::Upstream("DashScope video task polling timed out".to_string()));
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let result = send_image_get(state, provider, &poll_url).await?;
-        let status = result.pointer("/output/task_status").and_then(|v| v.as_str()).unwrap_or("");
-        match status {
-            "SUCCEEDED" | "Success" => {
-                return result
-                    .pointer("/output/video_url")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .ok_or_else(|| ProxyError::Upstream("DashScope video task completed without video_url".to_string()));
-            }
-            "FAILED" | "Failed" => {
-                let msg = result.pointer("/output/message").and_then(|v| v.as_str()).unwrap_or("Unknown DashScope video task error");
                 return Err(ProxyError::Upstream(msg.to_string()));
             }
             _ => continue,
