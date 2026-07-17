@@ -718,6 +718,16 @@ async fn handle_proxy(
                         }
                     }
                 }
+                ProviderFormat::DashscopeVideo => {
+                    match handle_video_request(state.clone(), caller_key_id, route, provider, &body, start).await {
+                        Ok(resp) => return Ok(resp),
+                        Err(e) => {
+                            log::warn!("[Proxy] video route failed: {}", e);
+                            if is_retryable(&e) { last_error = Some(e); continue; }
+                            return Err(e);
+                        }
+                    }
+                }
                 other => {
                     last_error = Some(ProxyError::Upstream(format!(
                         "format {:?} is not supported for non-chat dispatch", other
@@ -2544,6 +2554,63 @@ async fn handle_image_request(
     Ok(Json(resp).into_response())
 }
 
+/// Video generation (text-to-video): send the prompt to DashScope
+/// video-synthesis (async task), poll for completion, return the video URL.
+async fn handle_video_request(
+    state: AppState,
+    caller_key_id: Option<i64>,
+    route: &Route,
+    provider: &Provider,
+    body: &Value,
+    start: std::time::Instant,
+) -> Result<Response, ProxyError> {
+    let prompt = last_user_text(body)
+        .ok_or_else(|| ProxyError::Upstream("video: no text prompt found in messages".into()))?;
+    let size = body.get("size").and_then(|v| v.as_str()).unwrap_or("1280*720").to_string();
+    let duration = body.get("duration").and_then(|v| v.as_u64()).unwrap_or(5);
+
+    let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.effective_path());
+    log::info!(
+        "[Proxy] video → {} (model={}, format={:?})",
+        provider.name, route.model, route.format
+    );
+    log::info!("[Proxy] forwarding video request to {}", url);
+
+    let video_url = generate_dashscope_video(&state, provider, route, &url, &prompt, &size, duration).await?;
+
+    log::info!(
+        "[Proxy] video response: latency={}ms",
+        start.elapsed().as_millis()
+    );
+
+    let _ = crate::db::insert_usage_log(
+        &state.db,
+        crate::db::UsageInsert {
+            caller_key_id,
+            tag: route.tags.first().cloned().unwrap_or_default(),
+            provider: provider.name.clone(),
+            model: route.model.clone(),
+            request_model: route.model.clone(),
+            modality: "video_generation".into(),
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: start.elapsed().as_millis() as i64,
+            status: "success".into(),
+            error_message: None,
+        },
+    ).await;
+
+    // OpenCarrier-style: expose the URL both at top level and as a content block.
+    let resp = json!({
+        "output": {
+            "video_url": video_url.clone(),
+            "choices": [{ "message": { "content": [{ "type": "video", "video": video_url }] } }]
+        },
+        "code": "Success"
+    });
+    Ok(Json(resp).into_response())
+}
+
 /// TTS: call DashScope text-to-speech, save audio bytes to disk, return a
 /// relative URL that OpenCarrier downloads via the public /audio/ route.
 async fn handle_tts_request(
@@ -2837,6 +2904,65 @@ async fn poll_dashscope_image_task(
             }
             "FAILED" | "Failed" => {
                 let msg = result.pointer("/output/message").and_then(|v| v.as_str()).unwrap_or("Unknown DashScope task error");
+                return Err(ProxyError::Upstream(msg.to_string()));
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Generate video via DashScope video-synthesis (async task). Mirrors
+/// generate_dashscope_image, but the result is a single `video_url` rather
+/// than a list of images.
+async fn generate_dashscope_video(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    url: &str,
+    prompt: &str,
+    size: &str,
+    duration: u64,
+) -> Result<String, ProxyError> {
+    let parameters = json!({ "size": size, "duration": duration });
+    let input = json!({ "prompt": prompt });
+    let body = json!({ "model": route.model, "input": input, "parameters": parameters });
+    // video-synthesis is async-only (sync returns 403).
+    let result = send_image_post(state, provider, url, &body, &[("X-DashScope-Async", "enable")]).await?;
+    if let Some(task_id) = result.pointer("/output/task_id").and_then(|v| v.as_str()) {
+        return poll_dashscope_video_task(state, provider, task_id, &route.base_url).await;
+    }
+    if let Some(video_url) = result.pointer("/output/video_url").and_then(|v| v.as_str()) {
+        return Ok(video_url.to_string());
+    }
+    Err(ProxyError::Upstream("No task_id or video_url in DashScope video response".to_string()))
+}
+
+async fn poll_dashscope_video_task(
+    state: &AppState,
+    provider: &Provider,
+    task_id: &str,
+    base_url: &str,
+) -> Result<String, ProxyError> {
+    let poll_url = format!("{}/api/v1/tasks/{}", base_url.trim_end_matches('/'), task_id);
+    let start = std::time::Instant::now();
+    loop {
+        // Video synthesis is slower than image; allow up to 5 minutes.
+        if start.elapsed() > std::time::Duration::from_secs(300) {
+            return Err(ProxyError::Upstream("DashScope video task polling timed out".to_string()));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let result = send_image_get(state, provider, &poll_url).await?;
+        let status = result.pointer("/output/task_status").and_then(|v| v.as_str()).unwrap_or("");
+        match status {
+            "SUCCEEDED" | "Success" => {
+                return result
+                    .pointer("/output/video_url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .ok_or_else(|| ProxyError::Upstream("DashScope video task completed without video_url".to_string()));
+            }
+            "FAILED" | "Failed" => {
+                let msg = result.pointer("/output/message").and_then(|v| v.as_str()).unwrap_or("Unknown DashScope video task error");
                 return Err(ProxyError::Upstream(msg.to_string()));
             }
             _ => continue,
