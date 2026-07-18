@@ -887,6 +887,14 @@ async fn handle_proxy(
         }
     }
 
+    // 4d. For Anthropic format, sanitise content block types the provider
+    //     doesn't recognise (e.g. server_tool_use from OpenAI Agents SDK).
+    //     Anthropic only accepts: text, thinking, image, document, tool_use,
+    //     tool_result. Unknown types are remapped where possible, dropped if not.
+    if matches!(provider_format, ProviderFormat::Anthropic) {
+        sanitize_anthropic_blocks(&mut fwd_body);
+    }
+
     // 5. Build URL
     let url = format!(
         "{}{}",
@@ -2298,6 +2306,42 @@ fn strip_anthropic_specific_fields(value: &mut Value) {
         // beta/extended fields are provider-specific
         obj.remove("anthropic_beta");
         obj.remove("anthropic_version");
+    }
+}
+
+/// Remove or convert content blocks with types that Anthropic providers don't
+/// accept (only `text`, `thinking`, `image`, `document`, `tool_use`, and
+/// `tool_result` are valid). Unknown types are either mapped to a supported
+/// type or dropped.
+///
+/// Some clients (e.g. OpenAI Agents SDK) emit `server_tool_use` blocks, which
+/// share the same shape as `tool_use` (`id`/`name`/`input`) but use a
+/// different type string. We map those to `tool_use`.
+fn sanitize_anthropic_blocks(value: &mut Value) {
+    const VALID_TYPES: &[&str] = &["text", "thinking", "image", "document", "tool_use", "tool_result"];
+
+    if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages.iter_mut() {
+            if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                // First remap known non-standard types that have the same shape
+                for block in content.iter_mut() {
+                    if let Some(obj) = block.as_object_mut() {
+                        if obj.get("type").and_then(|t| t.as_str()) == Some("server_tool_use") {
+                            obj.insert("type".to_string(), Value::String("tool_use".to_string()));
+                        }
+                    }
+                }
+                // Then drop anything still not in the allow-list
+                content.retain(|block| {
+                    let t = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if t.is_empty() || VALID_TYPES.contains(&t) {
+                        return true;
+                    }
+                    log::warn!("[Proxy] dropping unrecognised Anthropic content block type: {t}");
+                    false
+                });
+            }
+        }
     }
 }
 
