@@ -620,6 +620,29 @@ fn body_has_image_content(body: &Value) -> bool {
     false
 }
 
+/// Inject the qwen-doc-turbo PPT `skill` parameter and force `stream: true` on
+/// an already protocol-converted request body. qwen-doc-turbo only emits slide
+/// HTML (in `reasoning_content`) when `skill` is present at the top level and
+/// the request streams. The client may override `template_id` by sending it as
+/// a top-level field; the override field is stripped so it isn't forwarded to
+/// the provider as a (invalid) Chat param.
+fn inject_ppt_skill(body: &mut Value) {
+    let template_id = body
+        .get("template_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("news_01")
+        .to_string();
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("template_id");
+        obj.remove("mode");
+        obj.insert(
+            "skill".to_string(),
+            json!([{ "type": "ppt", "mode": "general", "template_id": template_id }]),
+        );
+        obj.insert("stream".to_string(), Value::Bool(true));
+    }
+}
+
 async fn handle_proxy(
     client_protocol: &str,
     State(state): State<AppState>,
@@ -639,7 +662,7 @@ async fn handle_proxy(
         .and_then(|m| m.as_array())
         .map(|a| a.len())
         .unwrap_or(0);
-    let is_streaming = body
+    let mut is_streaming = body
         .as_object()
         .and_then(|o| o.get("stream"))
         .and_then(|v| v.as_bool())
@@ -913,6 +936,16 @@ async fn handle_proxy(
                 obj.insert("thinking".to_string(), json!({"type": "enabled", "budget_tokens": 10000}));
             }
         }
+    }
+
+    // 4d. PPT tag: qwen-doc-turbo emits slide HTML as streaming chunks in
+    //     `reasoning_content`, but only when the top-level `skill` parameter is
+    //     present and `stream: true`. Inject a default skill (the client may
+    //     override template_id by sending it in the body) and force streaming so
+    //     slides come back regardless of what the client requested.
+    if tag == "ppt" {
+        inject_ppt_skill(&mut fwd_body);
+        is_streaming = true;
     }
 
     // 4d. For Anthropic format, sanitise content block types the provider
@@ -3847,6 +3880,37 @@ mod tests {
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["thinking"], "real reasoning");
+    }
+
+    #[test]
+    fn test_inject_ppt_skill_defaults() {
+        let mut body = json!({
+            "model": "ppt",
+            "messages": [{"role": "user", "content": "make a 5-slide deck about cats"}]
+        });
+        inject_ppt_skill(&mut body);
+        assert_eq!(body["stream"], true);
+        let skill = body["skill"].as_array().unwrap();
+        assert_eq!(skill.len(), 1);
+        assert_eq!(skill[0]["type"], "ppt");
+        assert_eq!(skill[0]["mode"], "general");
+        assert_eq!(skill[0]["template_id"], "news_01");
+        // override fields must not leak to the provider
+        assert!(body.get("template_id").is_none());
+        assert!(body.get("mode").is_none());
+    }
+
+    #[test]
+    fn test_inject_ppt_skill_template_override() {
+        let mut body = json!({
+            "model": "ppt",
+            "template_id": "science_01",
+            "messages": [{"role": "user", "content": "make a deck"}]
+        });
+        inject_ppt_skill(&mut body);
+        assert_eq!(body["skill"][0]["template_id"], "science_01");
+        assert_eq!(body["stream"], true);
+        assert!(body.get("template_id").is_none());
     }
 
     #[test]
