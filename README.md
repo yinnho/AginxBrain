@@ -95,7 +95,7 @@ A per-session, **upgrade-only** cache (30 min TTL) means once a conversation nee
 
 ### 🎨 Multimodal
 
-Image generation (DashScope `wan2.7`, MiniMax, OpenAI images), TTS & ASR (DashScope WebSocket, Whisper), vision, and video synthesis — all behind the same tag-routing surface, dispatched by the route's `format`.
+Image generation (DashScope `wan2.7`, MiniMax, OpenAI images), TTS & ASR (DashScope WebSocket, Whisper), vision, video synthesis, and PPT generation (qwen-doc-turbo) — all behind the same tag-routing surface, dispatched by the route's `format`.
 
 > 📖 Usage guide: **[MULTIMODAL_USAGE.md](./MULTIMODAL_USAGE.md)** — TTS, ASR, and video with copy-paste curl examples.
 

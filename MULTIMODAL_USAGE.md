@@ -1,11 +1,12 @@
-# AginxBrain 多模态使用指南（TTS / ASR / Video）
+# AginxBrain 多模态使用指南（TTS / ASR / Video / PPT）
 
-本文档说明如何通过 AginxBrain 调用**语音合成（TTS）**、**语音识别（ASR）**、**视频生成（Video）**三项能力。
+本文档说明如何通过 AginxBrain 调用**语音合成（TTS）**、**语音识别（ASR）**、**视频生成（Video）**、**PPT 生成**四项能力。
 
 > 文档中所有示例的当前后端：
 > - TTS：阿里 DashScope `cosyvoice-v2`（WebSocket）
 > - ASR：阿里 DashScope `paraformer-realtime-v2`（WebSocket）
 > - Video：阿里 DashScope `wanx2.1-t2v-turbo`（异步任务）
+> - PPT：阿里 DashScope `qwen-doc-turbo`（流式，模板模式）
 
 ---
 
@@ -16,15 +17,15 @@
 | 服务地址 | `https://brain.aginx.net`（本地为 `http://127.0.0.1:8083`） |
 | 鉴权 | `Authorization: Bearer <caller_key>`（在管理后台创建的调用密钥） |
 | 统一入口 | `POST /v1/chat/completions`（OpenAI Chat 格式） |
-| 模型名 | 用**标签名**当 model：`tts` / `audio` / `video`（AginxBrain 内部解析到具体后端模型） |
+| 模型名 | 用**标签名**当 model：`tts` / `audio` / `video` / `ppt`（AginxBrain 内部解析到具体后端模型） |
 
-三项能力**都复用 OpenAI Chat 接口**——把要处理的"内容"放在 `messages` 里，靠 `model` 字段区分走哪条管道：
+四项能力**都复用 OpenAI Chat 接口**——把要处理的"内容"放在 `messages` 里，靠 `model` 字段区分走哪条管道：
 
 ```bash
 curl https://brain.aginx.net/v1/chat/completions \
   -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" \
-  -d '{ "model": "<tts|audio|video>", "messages": [...] }'
+  -d '{ "model": "<tts|audio|video|ppt>", "messages": [...] }'
 ```
 
 `$KEY` 是你的 caller key。下文每节给出完整示例。
@@ -230,7 +231,77 @@ done
 
 ---
 
-## 4. 速查表
+## 4. PPT -- 幻灯片生成（文档 -> PPT，流式）
+
+基于一份文档内容生成可下载的 `.pptx`。后端是 qwen-doc-turbo 的 **模板模式**（`mode: general`）：模型先出大纲、再逐页生成 HTML，最后给出 `.pptx` 下载链接。
+
+### 4.1 关键约定
+
+- **必须流式**：`stream: true`。非流式调用 qwen-doc-turbo 会直接报错（`skill is only supported in stream mode`）。AginxBrain 会对 `ppt` 标签强制 `stream: true`，客户端按 SSE 读取即可。
+- **文档内容必须放在 `system` 消息里**：模板模式只认 system message 里的文档内容。结构固定为三条消息：
+  1. `system`：角色设定（如 `you are a helpful assistant.`）
+  2. `system`：**文档正文**（PPT 的素材来源）
+  3. `user`：生成指令（如 `生成一个5页的ppt`）
+- **`skill` 参数由 AginxBrain 自动注入**，客户端不用传。可选传 `template_id` 覆盖默认模板。
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `template_id` | 模板：`news_01` / `summary_01` / `internet_01` / `thesis_01` | `news_01` |
+
+### 4.2 请求
+
+```bash
+curl -N -X POST https://brain.aginx.net/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ppt",
+    "stream": true,
+    "template_id": "news_01",
+    "messages": [
+      {"role": "system", "content": "you are a helpful assistant."},
+      {"role": "system", "content": "人工智能（AI）是计算机科学的一个分支……（这里放完整文档内容）"},
+      {"role": "user", "content": "生成一个5页的ppt"}
+    ]
+  }'
+```
+
+> `-N` 关闭 curl 缓冲，实时看到流式输出。文档内容单条消息限制约 9000 Token；更长请先用文件上传接口拿 `file-id`，再以 `system` 消息传 `fileid://{FILE_ID}`（创意模式才支持 file_id，模板模式用纯文本 system 消息）。
+
+### 4.3 流式响应（三阶段）
+
+每个 SSE chunk 是标准 OpenAI Chat 流式格式，关键看两个字段：
+
+| 阶段 | 所在字段 | 内容 |
+|------|----------|------|
+| 1. 大纲 | `delta.reasoning_content` | PPT 大纲（页数、每页要点、版式规划） |
+| 2. 页面 HTML | `delta.reasoning_content` | 逐页的完整 `<html>` 文档（960×540 slide，含内联 CSS） |
+| 3. 最终 PPT 文件 | `delta.content` | `.pptx` 下载链接（最后几个 chunk） |
+
+示例 chunk（页面 HTML 阶段）：
+```
+data: {"choices":[{"delta":{"reasoning_content":"<!DOCTYPE html>...一整页 slide 的 HTML..."},"finish_reason":null}]}
+```
+
+最后给出下载链接：
+```
+data: {"choices":[{"delta":{"content":"http://zhiwen-tob-prod.oss-cn-hangzhou.aliyuncs.com/ppt/.../result.pptx?Expires=...&Signature=..."},"finish_reason":"stop"}]}
+data: [DONE]
+```
+
+### 4.4 下载 .pptx
+
+`content` 里的链接是阿里云 OSS 临时链接，**有过期时间**（`Expires`），拿到后用 **GET** 下载（HEAD 会被 OSS 签名拒绝返回 403）：
+
+```bash
+curl -o result.pptx "http://zhiwen-tob-prod.oss-cn-hangzhou.aliyuncs.com/ppt/.../result.pptx?Expires=...&Signature=..."
+```
+
+> 链接 http/https 均可。生成的是真正的 `.pptx`（PowerPoint 可直接打开）。
+
+---
+
+## 5. 速查表
 
 | 能力 | model | 入口 | 输入 | 返回 |
 |------|-------|------|------|------|
@@ -238,10 +309,12 @@ done
 | ASR | `audio` | POST `/v1/chat/completions` | messages 里 base64 音频 | OpenAI 格式，转写文字在 `message.content` |
 | Video | `video` | POST `/v1/chat/completions` | messages 里的 prompt | `task_id`（再轮询） |
 | Video 轮询 | — | GET `/v1/tasks/video/{task_id}` | — | `task_status` + `video_url` |
+| PPT | `ppt` | POST `/v1/chat/completions` | system 消息放文档，user 消息放指令 | 流式：`reasoning_content`=大纲+各页 HTML，`content`=`.pptx` 下载链接 |
 
-## 5. 注意事项
+## 6. 注意事项
 
 - **鉴权**：除 `GET /audio/{file}`（TTS 音频下载）外，所有接口都需要 caller key。
 - **视频是异步**：务必用 提交 + 轮询 的两步流程，不要在一个请求里阻塞等待——视频生成耗时不可控。
-- **OSS 链接过期**：TTS/Video 返回的下载链接都有 `Expires`，拿到后请及时下载。
+- **PPT 必须流式**：`ppt` 标签强制 `stream: true`；文档内容放 `system` 消息，生成指令放 `user` 消息，`.pptx` 链接在流末尾的 `content` 字段。
+- **OSS 链接过期**：TTS/Video/PPT 返回的下载链接都有 `Expires`，拿到后请及时下载。
 - **模型/音色配置**：以上后端模型、音色都在服务器 `~/.aginxbrain/config.yaml` 的 routes/providers 里配置；换模型改配置即可，不用改代码。
