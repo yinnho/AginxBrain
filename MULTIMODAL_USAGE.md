@@ -17,7 +17,7 @@
 | 服务地址 | `https://brain.aginx.net`（本地为 `http://127.0.0.1:8083`） |
 | 鉴权 | `Authorization: Bearer <caller_key>`（在管理后台创建的调用密钥） |
 | 统一入口 | `POST /v1/chat/completions`（OpenAI Chat 格式） |
-| 模型名 | 用**标签名**当 model：`tts` / `audio` / `video` / `ppt`（AginxBrain 内部解析到具体后端模型） |
+| 模型名 | 用**标签名**当 model：`tts` / `audio` / `video` / `ppt` / `seedance`（AginxBrain 内部解析到具体后端模型） |
 
 四项能力**都复用 OpenAI Chat 接口**——把要处理的"内容"放在 `messages` 里，靠 `model` 字段区分走哪条管道：
 
@@ -25,7 +25,7 @@
 curl https://brain.aginx.net/v1/chat/completions \
   -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" \
-  -d '{ "model": "<tts|audio|video|ppt>", "messages": [...] }'
+  -d '{ "model": "<tts|audio|video|ppt|seedance>", "messages": [...] }'
 ```
 
 `$KEY` 是你的 caller key。下文每节给出完整示例。
@@ -229,6 +229,72 @@ while true; do
 done
 ```
 
+### 3.4 Seedance 2.0（火山方舟，另一套视频后端）
+
+除了阿里 wanx，还接入了字节火山方舟的 **Seedance 2.0**（文生视频 / 首帧图生视频 / 多模态参考），用**独立的 `seedance` 标签**。调用方式和 wanx 一样是"提交 + 轮询"两步，但**参数和轮询响应格式不同**。
+
+> 各异步视频后端用各自独立的 tag（`video`=wanx，`seedance`=Seedance），因为轮询按 tag 的第一个候选路由解析 provider，混用 tag 会把任务轮询到错的 provider。
+
+**提交**（model=`seedance`，返回立刻拿到 task_id）：
+
+```bash
+curl -X POST https://brain.aginx.net/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "seedance",
+    "messages": [
+      { "role": "user", "content": "一只金毛犬在阳光明媚的草地上奔跑，慢动作" }
+    ],
+    "resolution": "720p",
+    "ratio": "16:9",
+    "duration": 5,
+    "generate_audio": true
+  }'
+```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `resolution` | 分辨率：`480p` / `720p` / `1080p` / `4K` | `1080p` |
+| `ratio` | 画幅：`16:9` / `9:16` / `1:1` 等 | `16:9` |
+| `duration` | 时长（秒）`4`–`15`，或 `-1` 智能 | `5` |
+| `generate_audio` | 是否生成配音 | `true` |
+
+**图生视频**：在 `messages` 的 user 内容里加一个 `image_url` 块作为首帧：
+
+```json
+{ "role": "user", "content": [
+    { "type": "text", "text": "让画面动起来，镜头缓慢推进" },
+    { "type": "image_url", "image_url": { "url": "https://.../first_frame.png" } }
+] }
+```
+
+**提交响应**（和 wanx 同样的 shape）：
+```json
+{ "code": "Success", "task_id": "cgt-20260719210128-66hb5", "task_status": "queued", "tag": "seedance" }
+```
+
+**轮询**：`GET /v1/tasks/seedance/{task_id}`。注意返回的是**火山原生格式**（和 wanx 的 `output.task_status`/`output.video_url` 不同）：
+
+```json
+{
+  "id": "cgt-...",
+  "status": "running",
+  "model": "doubao-seedance-2-0-260128"
+}
+```
+
+完成时（`status: "succeeded"`）视频链接在 `content.video_url`：
+```json
+{ "id": "cgt-...", "status": "succeeded", "content": { "video_url": "https://...mp4?X-Tos-Expires=86400&..." }, "usage": { "completion_tokens": 108900 } }
+```
+
+`status` 取值：`queued` / `running` / `succeeded` / `failed` / `cancelled`。
+
+> - Seedance 带音频生成较慢，常要 **2–5 分钟**，轮询间隔建议 10–15s。
+> - `video_url` 是火山 TOS 签名链接，24h 有效，拿到后用 GET 下载。
+> - 换 Fast 版（更快更便宜）把 route 的 model 改成 `doubao-seedance-2-0-fast-260128` 即可。
+
 ---
 
 ## 4. PPT -- 幻灯片生成（文档 -> PPT，流式）
@@ -310,6 +376,8 @@ curl -o result.pptx "http://zhiwen-tob-prod.oss-cn-hangzhou.aliyuncs.com/ppt/...
 | Video | `video` | POST `/v1/chat/completions` | messages 里的 prompt | `task_id`（再轮询） |
 | Video 轮询 | — | GET `/v1/tasks/video/{task_id}` | — | `task_status` + `video_url` |
 | PPT | `ppt` | POST `/v1/chat/completions` | system 消息放文档，user 消息放指令 | 流式：`reasoning_content`=大纲+各页 HTML，`content`=`.pptx` 下载链接 |
+| Seedance | `seedance` | POST `/v1/chat/completions` | messages 里 prompt（+可选首帧 image_url） | `task_id`（再轮询） |
+| Seedance 轮询 | - | GET `/v1/tasks/seedance/{task_id}` | - | 火山原生：`status` + `content.video_url` |
 
 ## 6. 注意事项
 
