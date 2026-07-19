@@ -167,6 +167,19 @@ pub async fn handle_openai_responses(
     handle_proxy("openai_responses", state, headers, caller_key_id, axum::Json(body)).await
 }
 
+/// Build the upstream poll URL for an async generation task. Seedance (Volcano
+/// Ark) polls the task resource under its own v3 path; everything else
+/// (DashScope) uses the shared /api/v1/tasks/{id} endpoint.
+fn task_poll_url(route: &Route, task_id: &str) -> String {
+    let base = route.base_url.trim_end_matches('/');
+    match route.format {
+        ProviderFormat::Seedance => {
+            format!("{}/api/v3/contents/generations/tasks/{}", base, task_id)
+        }
+        _ => format!("{}/api/v1/tasks/{}", base, task_id),
+    }
+}
+
 /// Poll a DashScope async task by tag and task ID. After POSTing a video (or
 /// future async image) generation, the client polls GET /v1/tasks/{tag}/{task_id}
 /// for completion. AginxBrain proxies the GET to the upstream provider's
@@ -193,11 +206,7 @@ pub async fn handle_task_poll(
                 route.provider
             )));
         }
-        let task_url = format!(
-            "{}/api/v1/tasks/{}",
-            route.base_url.trim_end_matches('/'),
-            task_id
-        );
+        let task_url = task_poll_url(route, &task_id);
         (task_url, provider)
     };
 
@@ -818,6 +827,16 @@ async fn handle_proxy(
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
                             log::warn!("[Proxy] video route failed: {}", e);
+                            if is_retryable(&e) { last_error = Some(e); continue; }
+                            return Err(e);
+                        }
+                    }
+                }
+                ProviderFormat::Seedance => {
+                    match handle_seedance_video_request(state.clone(), caller_key_id, route, provider, &body, start).await {
+                        Ok(resp) => return Ok(resp),
+                        Err(e) => {
+                            log::warn!("[Proxy] seedance route failed: {}", e);
                             if is_retryable(&e) { last_error = Some(e); continue; }
                             return Err(e);
                         }
@@ -2613,6 +2632,7 @@ fn format_string(format: &ProviderFormat) -> String {
         ProviderFormat::DashscopeTts => "dashscope_tts",
         ProviderFormat::DashscopeAsr => "dashscope_asr",
         ProviderFormat::Kling => "kling",
+        ProviderFormat::Seedance => "seedance",
         ProviderFormat::MinimaxImage => "minimax_image",
     }.to_string()
 }
@@ -2780,6 +2800,141 @@ async fn handle_video_request(
     let resp = json!({
         "task_id": task_id,
         "task_status": task_status,
+        "tag": tag,
+        "code": "Success"
+    });
+    Ok(Json(resp).into_response())
+}
+
+/// Find the first image_url anywhere in messages (for image-to-video first
+/// frame). Handles both `{"image_url":"..."}` and `{"image_url":{"url":"..."}}`.
+fn find_first_image_url(body: &Value) -> Option<String> {
+    let messages = body.get("messages").and_then(|m| m.as_array())?;
+    for msg in messages {
+        let Some(arr) = msg.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in arr {
+            let url = block.get("image_url").and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    Some(s.to_string())
+                } else {
+                    v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string())
+                }
+            });
+            if let Some(u) = url {
+                return Some(u);
+            }
+        }
+    }
+    None
+}
+
+/// Seedance (Volcano Ark) video generation: submit an async task and return the
+/// task_id immediately. The client polls GET /v1/tasks/{tag}/{task_id}, which
+/// forwards to GET {base}/api/v3/contents/generations/tasks/{id} (see
+/// handle_task_poll). The Volcano native poll response is passed through.
+///
+/// Client body (OpenAI chat):
+///   text-to-video:  messages: [{role:user, content:"<prompt>"}]
+///   image-to-video: messages: [{role:user, content:[{type:text,text:..},{type:image_url,image_url:{url}}]}]
+///   resolution: "480p"|"720p"|"1080p"|"4K"  (default "1080p")
+///   ratio:      "16:9"|"9:16"|"1:1"|...      (default "16:9")
+///   duration:   4..15 | -1 (smart)           (default 5)
+///   generate_audio: bool                      (default true)
+async fn handle_seedance_video_request(
+    state: AppState,
+    caller_key_id: Option<i64>,
+    route: &Route,
+    provider: &Provider,
+    body: &Value,
+    start: std::time::Instant,
+) -> Result<Response, ProxyError> {
+    let prompt = last_user_text(body)
+        .ok_or_else(|| ProxyError::Upstream("seedance: no text prompt found in messages".into()))?;
+    let resolution = body
+        .get("resolution")
+        .and_then(|v| v.as_str())
+        .unwrap_or("1080p")
+        .to_string();
+    let ratio = body
+        .get("ratio")
+        .and_then(|v| v.as_str())
+        .unwrap_or("16:9")
+        .to_string();
+    let duration = body.get("duration").and_then(|v| v.as_i64()).unwrap_or(5);
+    let generate_audio = body
+        .get("generate_audio")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.effective_path());
+    log::info!(
+        "[Proxy] seedance → {} (model={}, format={:?})",
+        provider.name, route.model, route.format
+    );
+    log::info!("[Proxy] submitting seedance task to {}", url);
+
+    // content: text prompt + optional first-frame image (image-to-video).
+    let mut content = vec![json!({ "type": "text", "text": prompt })];
+    if let Some(img) = find_first_image_url(body) {
+        content.push(json!({ "type": "image_url", "image_url": { "url": img } }));
+    }
+
+    let submit_body = json!({
+        "model": route.model,
+        "content": content,
+        "resolution": resolution,
+        "ratio": ratio,
+        "duration": duration,
+        "generate_audio": generate_audio,
+    });
+    let result = send_image_post(&state, provider, &url, &submit_body, &[]).await?;
+    let task_id = result
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| {
+            ProxyError::Upstream(format!(
+                "No task id in Seedance response: {}",
+                truncate_chars(&result.to_string(), 200)
+            ))
+        })?;
+    let tag = route
+        .tags
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "seedance".to_string());
+
+    log::info!(
+        "[Proxy] seedance task submitted: task_id={} latency={}ms",
+        task_id,
+        start.elapsed().as_millis()
+    );
+
+    let _ = crate::db::insert_usage_log(
+        &state.db,
+        crate::db::UsageInsert {
+            caller_key_id,
+            tag: tag.clone(),
+            provider: provider.name.clone(),
+            model: route.model.clone(),
+            request_model: route.model.clone(),
+            modality: "video_generation".into(),
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: start.elapsed().as_millis() as i64,
+            status: "submitted".into(),
+            error_message: None,
+        },
+    )
+    .await;
+
+    // Truly async — return the task ID immediately (same shape as the DashScope
+    // video response); the client polls GET /v1/tasks/{tag}/{task_id}.
+    let resp = json!({
+        "task_id": task_id,
+        "task_status": "queued",
         "tag": tag,
         "code": "Success"
     });
@@ -3911,6 +4066,54 @@ mod tests {
         assert_eq!(body["skill"][0]["template_id"], "science_01");
         assert_eq!(body["stream"], true);
         assert!(body.get("template_id").is_none());
+    }
+
+    fn route_with_format(format: crate::config::ProviderFormat) -> Route {
+        Route {
+            id: "r1".into(),
+            provider: "seedance".into(),
+            base_url: "https://ark.cn-beijing.volces.com".into(),
+            ws_url: None,
+            model: "doubao-seedance-2-0-260128".into(),
+            tags: vec!["seedance".into()],
+            format,
+            path: "".into(),
+            enabled: true,
+            tool_mode: crate::config::ToolMode::Native,
+        }
+    }
+
+    #[test]
+    fn test_find_first_image_url() {
+        let obj = json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"make it move"},
+            {"type":"image_url","image_url":{"url":"https://x/first.png"}}
+        ]}]});
+        assert_eq!(find_first_image_url(&obj).as_deref(), Some("https://x/first.png"));
+
+        let as_str = json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":"https://x/f2.png"}
+        ]}]});
+        assert_eq!(find_first_image_url(&as_str).as_deref(), Some("https://x/f2.png"));
+
+        let none = json!({"messages":[{"role":"user","content":"text only"}]});
+        assert!(find_first_image_url(&none).is_none());
+    }
+
+    #[test]
+    fn test_task_poll_url_formats() {
+        let seedance = route_with_format(crate::config::ProviderFormat::Seedance);
+        assert_eq!(
+            task_poll_url(&seedance, "cgt-123"),
+            "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/cgt-123"
+        );
+
+        let mut ds = route_with_format(crate::config::ProviderFormat::DashscopeVideo);
+        ds.base_url = "https://dashscope.aliyuncs.com".into();
+        assert_eq!(
+            task_poll_url(&ds, "task-9"),
+            "https://dashscope.aliyuncs.com/api/v1/tasks/task-9"
+        );
     }
 
     #[test]

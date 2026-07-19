@@ -99,6 +99,10 @@ pub enum ProviderFormat {
     #[serde(rename = "dashscope_chat_image")]
     DashscopeChatImage,
     Kling,
+    /// Volcano Engine Ark video generation (Seedance 2.0). Async task:
+    /// submit POST /api/v3/contents/generations/tasks, poll GET .../tasks/{id}.
+    #[serde(rename = "seedance")]
+    Seedance,
     #[serde(rename = "minimax_image")]
     MinimaxImage,
 }
@@ -128,6 +132,7 @@ impl ProviderFormat {
             ProviderFormat::DashscopeVideo => "/api/v1/services/aigc/video-generation/video-synthesis",
             ProviderFormat::DashscopeTts => "/api/v1/services/aigc/text-to-speech/stream",
             ProviderFormat::Kling => "/v1/videos/text2video",
+            ProviderFormat::Seedance => "/api/v3/contents/generations/tasks",
             ProviderFormat::MinimaxImage => "/v1/image_generation",
         }
     }
@@ -702,6 +707,11 @@ mod tests {
         let yaml = "kling";
         let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(fmt, ProviderFormat::Kling);
+
+        let yaml = "seedance";
+        let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fmt, ProviderFormat::Seedance);
+        assert_eq!(fmt.path(), "/api/v3/contents/generations/tasks");
 
         let yaml = "minimax_image";
         let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
