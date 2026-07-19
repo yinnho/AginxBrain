@@ -592,6 +592,34 @@ fn find_input_audio(body: &Value) -> Option<(String, String)> {
 // Core proxy logic (protocol-aware)
 // ---------------------------------------------------------------------------
 
+/// Detect whether a (already protocol-converted) request body carries image
+/// content - i.e. a vision request. Reasoning-over-images models such as
+/// qwen3.7-plus legitimately spend well past the 45s non-streaming ceiling
+/// before emitting the first byte, so callers use this to opt into the longer
+/// reasoning timeout. Scans both `messages` (Chat / Anthropic) and `input`
+/// (Responses) arrays and their content-block arrays for image block types
+/// (`image_url`, `input_image`, `image`).
+fn body_has_image_content(body: &Value) -> bool {
+    for key in ["messages", "input"] {
+        let Some(arr) = body.get(key).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for msg in arr {
+            let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for block in blocks {
+                if let Some(t) = block.get("type").and_then(|v| v.as_str()) {
+                    if matches!(t, "image_url" | "input_image" | "image") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 async fn handle_proxy(
     client_protocol: &str,
     State(state): State<AppState>,
@@ -926,7 +954,11 @@ async fn handle_proxy(
     let req_timeout = std::time::Duration::from_secs(
         if is_streaming {
             STREAM_TIMEOUT
-        } else if tag == "reasoning" {
+        } else if tag == "reasoning" || body_has_image_content(&fwd_body) {
+            // Reasoning models (qwen3.7-plus vision, deepseek-v4-pro thinking)
+            // legitimately spend 60-120s "thinking" before emitting output -
+            // and vision input makes it heavier. The 45s chat timeout would
+            // cut them off mid-reasoning and trigger a wasteful failover.
             NON_STREAM_TIMEOUT_REASONING
         } else {
             NON_STREAM_TIMEOUT
