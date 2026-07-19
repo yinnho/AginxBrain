@@ -152,7 +152,7 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
                     if let Some(c) = content {
                         if let Some(arr) = c.as_array() {
                             let mut has_tool_result = false;
-                            let mut text_parts = Vec::new();
+                            let mut parts: Vec<Value> = Vec::new();
                             let mut tool_results = Vec::new();
 
                             for block in arr {
@@ -174,12 +174,18 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
                                     Some("text") => {
                                         if let Some(t) = block.get("text").and_then(|t| t.as_str())
                                         {
-                                            text_parts.push(t.to_string());
+                                            parts.push(json!({"type": "text", "text": t}));
+                                        }
+                                    }
+                                    Some("image") => {
+                                        // Anthropic image -> OpenAI Chat image_url
+                                        if let Some(url) = anthropic_image_source_to_url(block) {
+                                            parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
                                         }
                                     }
                                     _ => {
                                         // Pass through other content blocks as text
-                                        text_parts.push(block.to_string());
+                                        parts.push(json!({"type": "text", "text": block.to_string()}));
                                     }
                                 }
                             }
@@ -190,19 +196,20 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
                                 for tr in tool_results {
                                     messages.push(tr);
                                 }
-                                // Any remaining text goes after tool results
-                                let text = text_parts.join("");
-                                if !text.is_empty() {
+                                // Any remaining content goes after tool results
+                                if !parts.is_empty() {
                                     messages.push(json!({
                                         "role": "user",
-                                        "content": text
+                                        "content": collapse_text_parts(&parts, "text")
                                     }));
                                 }
                             } else {
-                                let text = text_parts.join("");
+                                // Regular user message. Emit a plain string for
+                                // text-only content (matches prior behaviour), or a
+                                // parts array when images are present.
                                 messages.push(json!({
                                     "role": "user",
-                                    "content": text
+                                    "content": collapse_text_parts(&parts, "text")
                                 }));
                             }
                         } else {
@@ -495,6 +502,55 @@ fn extract_text_from_content(content: &Value) -> String {
     }
 }
 
+/// Extract a URL (or `data:` URL) from an Anthropic `image` content block's
+/// `source`. Returns `None` for malformed sources so the caller can skip them
+/// instead of leaking raw JSON into the prompt.
+///
+/// Anthropic image sources come in two shapes:
+///   { "type": "url",    "url": "https://..." }
+///   { "type": "base64", "media_type": "image/png", "data": "..." }
+fn anthropic_image_source_to_url(block: &Value) -> Option<String> {
+    let source = block.get("source")?;
+    match source.get("type").and_then(|v| v.as_str()) {
+        Some("url") => source
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        Some("base64") => {
+            let media_type = source
+                .get("media_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/png");
+            let data = source.get("data").and_then(|v| v.as_str())?;
+            Some(format!("data:{};base64,{}", media_type, data))
+        }
+        _ => None,
+    }
+}
+
+/// Collapse a list of converted content parts into the most compact form:
+/// a plain string when every part is a text part of the given `text_type`
+/// (token-efficient and matches prior behaviour for text-only messages), or
+/// the parts array otherwise (required when images are present). Empty input
+/// collapses to an empty string.
+fn collapse_text_parts(parts: &[Value], text_type: &str) -> Value {
+    if parts.is_empty() {
+        return Value::String(String::new());
+    }
+    if parts
+        .iter()
+        .all(|p| p.get("type").and_then(|v| v.as_str()) == Some(text_type))
+    {
+        let text: String = parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        return Value::String(text);
+    }
+    Value::Array(parts.to_vec())
+}
+
 // ===========================================================================
 // OpenAI Responses API conversions
 // ===========================================================================
@@ -596,7 +652,7 @@ pub fn anthropic_to_responses_request(body: &Value, target_model: &str) -> Value
                     if let Some(c) = content {
                         if let Some(arr) = c.as_array() {
                             let mut has_tool_result = false;
-                            let mut text_parts: Vec<Value> = Vec::new();
+                            let mut parts: Vec<Value> = Vec::new();
                             let mut tool_results: Vec<Value> = Vec::new();
 
                             for block in arr {
@@ -617,11 +673,18 @@ pub fn anthropic_to_responses_request(body: &Value, target_model: &str) -> Value
                                     }
                                     Some("text") => {
                                         if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                                            text_parts.push(Value::String(t.to_string()));
+                                            parts.push(json!({"type": "input_text", "text": t}));
+                                        }
+                                    }
+                                    Some("image") => {
+                                        // Anthropic image -> Responses input_image
+                                        if let Some(url) = anthropic_image_source_to_url(block) {
+                                            parts.push(json!({"type": "input_image", "image_url": url}));
                                         }
                                     }
                                     _ => {
-                                        text_parts.push(Value::String(block.to_string()));
+                                        // Unknown block - pass through as text
+                                        parts.push(json!({"type": "input_text", "text": block.to_string()}));
                                     }
                                 }
                             }
@@ -631,19 +694,24 @@ pub fn anthropic_to_responses_request(body: &Value, target_model: &str) -> Value
                                 for tr in tool_results {
                                     input.push(tr);
                                 }
-                                // Any remaining text goes after
-                                let text = text_parts.iter().filter_map(|t| t.as_str()).collect::<Vec<_>>().join("");
-                                if !text.is_empty() {
+                                // Any remaining content goes after
+                                if !parts.is_empty() {
                                     input.push(json!({
                                         "role": "user",
-                                        "content": text
+                                        "content": collapse_text_parts(&parts, "input_text")
                                     }));
                                 }
                             } else {
-                                // Regular user message
-                                let text = text_parts.iter().filter_map(|t| t.as_str()).collect::<Vec<_>>().join("");
-                                if !text.is_empty() {
-                                    input.push(json!({"role": "user", "content": text}));
+                                // Regular user message. Emit a plain string for
+                                // text-only content (token-efficient, matches prior
+                                // behaviour), or a parts array when images are present.
+                                // Note: an image-only message (no text) now survives -
+                                // previously it was dropped by the empty-text guard.
+                                if !parts.is_empty() {
+                                    input.push(json!({
+                                        "role": "user",
+                                        "content": collapse_text_parts(&parts, "input_text")
+                                    }));
                                 }
                             }
                         } else {

@@ -518,4 +518,118 @@ mod tests {
         assert!(tools[0]["parameters"].is_object());
         assert!(tools[0].get("function").is_none());
     }
+
+    #[test]
+    fn test_anthropic_to_openai_converts_image_block() {
+        // Claude Code sends Anthropic image blocks; the OpenAI Chat provider
+        // needs image_url blocks, not a stringified JSON blob.
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/cat.png"}}
+                ]
+            }],
+            "max_tokens": 100
+        });
+        let result = anthropic_to_openai_request(&body, "gpt-4o");
+        let messages = result["messages"].as_array().unwrap();
+        // system message is not present (no system field), so messages[0] is the user
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "What is in this image?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "https://example.com/cat.png");
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_image_base64_to_data_url() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "QUJD"}}
+                ]
+            }],
+            "max_tokens": 100
+        });
+        let result = anthropic_to_openai_request(&body, "gpt-4o");
+        let content = result["messages"].as_array().unwrap()[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(content[0]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_text_only_stays_string() {
+        // Text-only user messages must collapse back to a plain string
+        // (prior behaviour), not an array.
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 100
+        });
+        let result = anthropic_to_openai_request(&body, "gpt-4o");
+        assert_eq!(result["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_converts_image_block() {
+        // Claude Code -> qwen3.7-plus (Responses). Image must become input_image,
+        // not a stringified JSON blob in the prompt.
+        let body = json!({
+            "model": "vision",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this"},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
+                ]
+            }],
+            "max_tokens": 100
+        });
+        let result = anthropic_to_responses_request(&body, "qwen3.7-plus");
+        let input = result["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "user");
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "https://example.com/x.png");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_image_only_message_survives() {
+        // An image-only user message (no text) used to be dropped by the
+        // empty-text guard; it must now be emitted with the image.
+        let body = json!({
+            "model": "vision",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/y.png"}}
+                ]
+            }],
+            "max_tokens": 100
+        });
+        let result = anthropic_to_responses_request(&body, "qwen3.7-plus");
+        let input = result["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1, "image-only message must not be dropped");
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "input_image");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_text_only_stays_string() {
+        let body = json!({
+            "model": "vision",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            "max_tokens": 100
+        });
+        let result = anthropic_to_responses_request(&body, "qwen3.7-plus");
+        assert_eq!(result["input"][0]["content"], "hello");
+    }
 }
