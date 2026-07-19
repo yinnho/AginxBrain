@@ -1006,14 +1006,17 @@ async fn handle_proxy(
     let req_timeout = std::time::Duration::from_secs(
         if is_streaming {
             STREAM_TIMEOUT
-        } else if tag == "reasoning" || tag == "vision" || body_has_image_content(&fwd_body) {
-            // Reasoning models (qwen3.7-plus vision, deepseek-v4-pro thinking)
-            // legitimately spend 60-120s "thinking" before emitting output -
-            // and vision input makes it heavier. Observed qwen3.7-plus vision
-            // latencies reach ~42s on success, so the 45s chat ceiling cuts
-            // off the slow tail and triggers a wasteful failover. The `vision`
-            // tag covers text-only vision calls; body_has_image_content covers
-            // image requests routed through any other tag.
+        } else if matches!(tag.as_str(), "reasoning" | "vision" | "short-drama")
+            || body_has_image_content(&fwd_body)
+        {
+            // Reasoning / deep-thinking models (qwen3.7-plus vision,
+            // deepseek-v4-pro thinking, doubao-seed-2.1-pro via the
+            // `short-drama` tag) legitimately spend 60-120s "thinking" before
+            // emitting output - and vision input makes it heavier. The 45s chat
+            // ceiling cuts off the slow tail and triggers a wasteful failover.
+            // `vision` covers text-only vision calls; `short-drama` covers the
+            // doubao 2.1 reasoning route; body_has_image_content covers image
+            // requests routed through any other tag.
             NON_STREAM_TIMEOUT_REASONING
         } else {
             NON_STREAM_TIMEOUT
