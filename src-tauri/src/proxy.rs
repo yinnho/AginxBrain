@@ -1007,16 +1007,19 @@ async fn handle_proxy(
         if is_streaming {
             STREAM_TIMEOUT
         } else if matches!(tag.as_str(), "reasoning" | "vision" | "short-drama")
+            || route.tags.iter().any(|t| matches!(t.as_str(), "reasoning" | "vision" | "short-drama"))
             || body_has_image_content(&fwd_body)
         {
             // Reasoning / deep-thinking models (qwen3.7-plus vision,
-            // deepseek-v4-pro thinking, doubao-seed-2.1-pro via the
-            // `short-drama` tag) legitimately spend 60-120s "thinking" before
-            // emitting output - and vision input makes it heavier. The 45s chat
-            // ceiling cuts off the slow tail and triggers a wasteful failover.
-            // `vision` covers text-only vision calls; `short-drama` covers the
-            // doubao 2.1 reasoning route; body_has_image_content covers image
-            // requests routed through any other tag.
+            // deepseek-v4-pro thinking, doubao-seed-2.1-pro, Kimi K3) legitimately
+            // spend 60-120s "thinking" (+ web search) before emitting output. The
+            // 45s chat ceiling cuts off the slow tail and triggers a wasteful
+            // failover - and for K3 it cancels mid built-in tool call (Kimi logs
+            // `context canceled` / 499). Key off BOTH the request tag AND the
+            // route's tags: a reasoning model reached through a non-reasoning tag
+            // (e.g. K3 via `opus`, which is tagged [reasoning, opus]) still needs
+            // the long ceiling. body_has_image_content covers image requests
+            // routed through any other tag.
             NON_STREAM_TIMEOUT_REASONING
         } else {
             NON_STREAM_TIMEOUT
