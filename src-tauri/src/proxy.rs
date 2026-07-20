@@ -2671,12 +2671,27 @@ async fn handle_image_request(
         url
     );
 
+    // Reference image (image-to-image / editing): forward the first image_url
+    // block in messages as the provider's `image` param (Seedream 5.0 supports
+    // it on /images/generations). Also pass through a few Seedream-specific
+    // params the client may set. These ride on `extra`, which
+    // generate_openai_images merges into the upstream request body.
+    let mut extra = std::collections::HashMap::new();
+    if let Some(img) = find_first_image_url(body) {
+        extra.insert("image".to_string(), Value::String(img));
+    }
+    for k in ["output_format", "watermark"] {
+        if let Some(v) = body.get(k) {
+            extra.insert(k.to_string(), v.clone());
+        }
+    }
+
     let req = GenerateImageRequest {
         tag: None,
         prompt: prompt.clone(),
         size,
         n,
-        extra: std::collections::HashMap::new(),
+        extra,
     };
 
     let images: Vec<GeneratedImage> = match &route.format {
