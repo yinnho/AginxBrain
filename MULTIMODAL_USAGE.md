@@ -321,6 +321,14 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 
 > Seedream 出图较慢（pro ~60–70s），AginxBrain 图片生成超时已放到 180s。
 
+**图生图 / 编辑**（image-to-image）：在 `messages` 的 user 内容里加一个 `image_url` 块作为参考图，AginxBrain 会把它作为 `image` 参数透传给 Seedream。可配合 `size`（支持 `2K` 等别名）、`output_format`、`watermark` 等参数：
+```json
+{ "role": "user", "content": [
+    { "type": "text", "text": "在左下角加一摞杂志，移除草图线条，保持构图" },
+    { "type": "image_url", "image_url": { "url": "https://.../sketch.png" } }
+] }
+```
+
 ### 3.6 短剧完整链路（short-drama -> seedream -> seedance）
 
 把上面三块串起来就是短剧生成流水线：
