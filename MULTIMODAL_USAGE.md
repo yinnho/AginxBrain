@@ -17,7 +17,7 @@
 | 服务地址 | `https://brain.aginx.net`（本地为 `http://127.0.0.1:8083`） |
 | 鉴权 | `Authorization: Bearer <caller_key>`（在管理后台创建的调用密钥） |
 | 统一入口 | `POST /v1/chat/completions`（OpenAI Chat 格式） |
-| 模型名 | 用**标签名**当 model：`tts` / `audio` / `video` / `ppt` / `seedance`（AginxBrain 内部解析到具体后端模型） |
+| 模型名 | 用**标签名**当 model：`tts` / `audio` / `video` / `ppt` / `seedance` / `seedream` / `seedream-lite`（AginxBrain 内部解析到具体后端模型） |
 
 四项能力**都复用 OpenAI Chat 接口**——把要处理的"内容"放在 `messages` 里，靠 `model` 字段区分走哪条管道：
 
@@ -25,7 +25,7 @@
 curl https://brain.aginx.net/v1/chat/completions \
   -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" \
-  -d '{ "model": "<tts|audio|video|ppt|seedance>", "messages": [...] }'
+  -d '{ "model": "<tts|audio|video|ppt|seedance|seedream|seedream-lite>", "messages": [...] }'
 ```
 
 `$KEY` 是你的 caller key。下文每节给出完整示例。
@@ -295,6 +295,57 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 > - `video_url` 是火山 TOS 签名链接，24h 有效，拿到后用 GET 下载。
 > - 换 Fast 版（更快更便宜）把 route 的 model 改成 `doubao-seedance-2-0-fast-260128` 即可。
 
+### 3.5 Seedream 5.0 文生图（火山方舟，配 Seedance 做图生视频）
+
+Seedance 会**拒识「真人」首帧**（photograph of a real human）。绕过办法：用 **Seedream 5.0**（字节文生图）生成首帧--AI 生成的图被当作非真人，Seedance 放行。两个 tag：
+
+| tag | 模型 | 说明 |
+|-----|------|------|
+| `seedream` | `doubao-seedream-5-0-pro-260628` | 旗舰，质量好，任意尺寸 |
+| `seedream-lite` | `doubao-seedream-5-0-260128` | **有免费额度**，但要求 `size` ≥ 3,686,400 像素（如 `2560x1440` / `2048x2048`） |
+
+**请求**（和其它图片生成一样，prompt 放 user 消息）：
+```bash
+curl -X POST https://brain.aginx.net/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{
+    "model": "seedream-lite",
+    "messages": [{"role":"user","content":"一只金毛幼犬坐在草地上，电影感光照，无真人"}],
+    "size": "2560x1440"
+  }'
+```
+**响应**（图片 URL 在 `output.choices[].message.content[].image`，TOS 签名 24h）：
+```json
+{"code":"Success","output":{"choices":[{"message":{"content":[{"image":"https://...jpeg?X-Tos-Expires=86400&..."}]}}]}}
+```
+
+> Seedream 出图较慢（pro ~60–70s），AginxBrain 图片生成超时已放到 180s。
+
+### 3.6 短剧完整链路（short-drama -> seedream -> seedance）
+
+把上面三块串起来就是短剧生成流水线：
+
+1. **`short-drama`**（doubao 2.1 推理）：写剧本/分镜/首帧画面描述
+2. **`seedream` / `seedream-lite`**：按首帧描述生非真人图，拿 `image` URL
+3. **`seedance`**（图生视频）：把上一步的 URL 当首帧 `image_url`，加运镜指令，出片
+
+```bash
+# 3. seedance 图生视频（用 2. 拿到的 image URL 当首帧）
+curl -X POST https://brain.aginx.net/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{
+    "model": "seedance",
+    "messages": [{"role":"user","content":[
+        {"type":"text","text":"幼犬开始朝镜头奔跑，慢动作"},
+        {"type":"image_url","image_url":{"url":"<seedream 返回的 image URL>"}}
+    ]}],
+    "resolution":"720p","ratio":"16:9","duration":5,"generate_audio":false
+  }'
+# -> task_id -> 轮询 GET /v1/tasks/seedance/{task_id} -> video_url
+```
+
+> 首帧用 Seedream 生成（而非真实照片），Seedance 不触发真人拒识。`generate_audio:false` 出片更快（~2 分钟）。
+
 ---
 
 ## 4. PPT -- 幻灯片生成（文档 -> PPT，流式）
@@ -376,6 +427,8 @@ curl -o result.pptx "http://zhiwen-tob-prod.oss-cn-hangzhou.aliyuncs.com/ppt/...
 | Video | `video` | POST `/v1/chat/completions` | messages 里的 prompt | `task_id`（再轮询） |
 | Video 轮询 | — | GET `/v1/tasks/video/{task_id}` | — | `task_status` + `video_url` |
 | PPT | `ppt` | POST `/v1/chat/completions` | system 消息放文档，user 消息放指令 | 流式：`reasoning_content`=大纲+各页 HTML，`content`=`.pptx` 下载链接 |
+| Seedream | `seedream` | POST `/v1/chat/completions` | messages 里 prompt | `output.choices[].message.content[].image`（TOS URL） |
+| Seedream Lite | `seedream-lite` | POST `/v1/chat/completions` | messages 里 prompt（size≥3,686,400px） | 同上（有免费额度） |
 | Seedance | `seedance` | POST `/v1/chat/completions` | messages 里 prompt（+可选首帧 image_url） | `task_id`（再轮询） |
 | Seedance 轮询 | - | GET `/v1/tasks/seedance/{task_id}` | - | 火山原生：`status` + `content.video_url` |
 
