@@ -46,6 +46,27 @@ async fn serve_audio_file(Path(filename): Path<String>) -> Response {
     }
 }
 
+/// Serve the MULTIMODAL_USAGE.md guide, embedded at compile time. Public (no
+/// auth) - it's a usage doc with no secrets.
+async fn serve_multimodal_doc() -> Response {
+    (
+        StatusCode::OK,
+        [("content-type", "text/markdown; charset=utf-8")],
+        include_str!("../../MULTIMODAL_USAGE.md"),
+    )
+        .into_response()
+}
+
+/// Serve README.md, embedded at compile time. Public (no auth).
+async fn serve_readme_doc() -> Response {
+    (
+        StatusCode::OK,
+        [("content-type", "text/markdown; charset=utf-8")],
+        include_str!("../../README.md"),
+    )
+        .into_response()
+}
+
 pub async fn start(state: AppState) -> (String, u16) {
     let port = state.config.read().await.port;
     let host = state.config.read().await.host.clone();
@@ -182,8 +203,15 @@ pub async fn start(state: AppState) -> (String, u16) {
     let audio_routes = axum::Router::new()
         .route("/audio/{filename}", axum::routing::get(serve_audio_file));
 
+    // Public markdown docs: embedded at compile time so the gateway binary
+    // serves them with no separate static host (brain.aginx.net/MULTIMODAL_USAGE.md).
+    let docs_routes = axum::Router::new()
+        .route("/MULTIMODAL_USAGE.md", axum::routing::get(serve_multimodal_doc))
+        .route("/README.md", axum::routing::get(serve_readme_doc));
+
     let app = axum::Router::new()
         .merge(audio_routes)
+        .merge(docs_routes)
         .merge(proxy_routes)
         .nest("/api", api_routes)
         .layer(axum::middleware::from_fn(request_log_middleware))
