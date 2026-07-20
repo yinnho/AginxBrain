@@ -3101,7 +3101,11 @@ async fn send_image_post(
     }
     let resp = builder
         .json(body)
-        .timeout(std::time::Duration::from_secs(45))
+        // Image generation can be slow: high-quality models like Seedream 5.0
+        // pro spend 60-70s per image. 45s cut it off and 502'd. This is a
+        // ceiling (fast providers like wanx still return quickly), also used
+        // for async video task submission which returns in <1s.
+        .timeout(std::time::Duration::from_secs(180))
         .send()
         .await
         .map_err(|e| ProxyError::Upstream(e.to_string()))?;
