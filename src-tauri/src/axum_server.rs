@@ -103,6 +103,7 @@ pub async fn start(state: AppState) -> (String, u16) {
             "/v1/tasks/{tag}/{task_id}",
             axum::routing::get(crate::proxy::handle_task_poll),
         )
+        .route("/v1/help", axum::routing::get(crate::proxy::handle_help))
         .route("/v1/models", axum::routing::get(crate::api::get_models))
         .route("/responses", axum::routing::post(crate::proxy::handle_openai_responses))
         .route("/responses/compact", axum::routing::post(crate::proxy::handle_openai_responses))

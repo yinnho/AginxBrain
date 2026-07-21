@@ -180,6 +180,22 @@ fn task_poll_url(route: &Route, task_id: &str) -> String {
     }
 }
 
+/// GET /v1/help - return the multimodal usage guide (embedded markdown) so an
+/// agent with a caller key can discover how to use each tag at runtime: which
+/// tags exist, their endpoints, params, and special contracts (ppt needs a
+/// document in a system message; video/seedance are async submit+poll;
+/// seedream-lite needs a large size; etc.). Caller-key protected (lives in the
+/// proxy_routes group), so it's reachable by authenticated agents but not open
+/// to the public.
+pub async fn handle_help() -> Response {
+    (
+        StatusCode::OK,
+        [("content-type", "text/markdown; charset=utf-8")],
+        include_str!("../../MULTIMODAL_USAGE.md"),
+    )
+        .into_response()
+}
+
 /// Poll a DashScope async task by tag and task ID. After POSTing a video (or
 /// future async image) generation, the client polls GET /v1/tasks/{tag}/{task_id}
 /// for completion. AginxBrain proxies the GET to the upstream provider's
