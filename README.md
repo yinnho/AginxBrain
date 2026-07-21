@@ -6,7 +6,7 @@
 
 Speak Anthropic, OpenAI, or Responses on the client side — any of them on the provider side. AginxBrain converts between them, routes by tag, and fails over automatically.
 
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/yinnho/AginxBrain/releases)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/yinnho/AginxBrain/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20Server-lightgrey)](https://github.com/yinnho/AginxBrain/releases)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange)](https://www.rust-lang.org/)
