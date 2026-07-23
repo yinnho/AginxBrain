@@ -240,12 +240,14 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
         }
     }
 
-    // Safety net: backfill an empty `tool` response for any assistant tool_call
-    // whose result is missing. Inbound Anthropic history can carry an orphaned
-    // `tool_use` - e.g. client-side context truncation (Claude Code /compact)
-    // slicing between a tool_use and its tool_result. OpenAI-format providers
-    // reject unanswered tool_call_ids with a 400; mirror the Responses-path
-    // `CodexChatConversionState::fill_missing_tool_results` safety net.
+    // Safety net: ensure every assistant tool_call is immediately followed by
+    // its tool response (repositioned if it existed elsewhere, synthesized empty
+    // if missing) and drop orphan tool messages. Inbound Anthropic history can
+    // violate OpenAI's adjacency requirement after client-side context
+    // truncation (Claude Code /compact): a tool_use whose tool_result was
+    // dropped, or a tool_result landing in a later user message. OpenAI
+    // providers 400 on these; mirror the Responses-path
+    // `CodexChatConversionState::fill_missing_tool_results`.
     fill_missing_tool_results_openai(&mut messages);
 
     out.insert("messages".into(), Value::Array(messages));
@@ -316,43 +318,69 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
     Value::Object(out)
 }
 
-/// Backfill an empty `tool` response for any assistant `tool_calls` id that has
-/// no matching `tool` message downstream. OpenAI providers 400 when a
-/// `tool_call_id` has no response, and inbound Anthropic history can carry an
-/// orphaned `tool_use` (e.g. after client-side context truncation). Mirrors the
-/// Responses-path `CodexChatConversionState::fill_missing_tool_results`.
+/// Ensure every assistant `tool_calls` id is immediately followed by its `tool`
+/// response, as OpenAI providers require (DeepSeek 400s with "tool_calls must
+/// be followed by tool messages" otherwise). Inbound Anthropic history can
+/// violate this in two ways after client-side context truncation (e.g. Claude
+/// Code /compact): a `tool_use` whose `tool_result` was dropped entirely, or a
+/// `tool_result` that lands in a later user message so the converted `tool`
+/// message is not adjacent to its assistant `tool_calls`. This rebuilds the
+/// list: each assistant tool_call is followed by its existing `tool` response
+/// (repositioned) or a synthesized empty one (if missing); orphan `tool`
+/// messages with no matching tool_call are dropped. Mirrors the Responses-path
+/// `CodexChatConversionState::fill_missing_tool_results`.
 fn fill_missing_tool_results_openai(messages: &mut Vec<Value>) {
-    // ids that already have a `tool` response somewhere in the message list.
-    let answered: std::collections::HashSet<String> = messages
-        .iter()
-        .filter_map(|m| {
-            if m.get("role").and_then(|v| v.as_str()) == Some("tool") {
-                m.get("tool_call_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // Rebuild the list, injecting an empty tool reply right after any assistant
-    // message that emits an unanswered tool_call (OpenAI requires the response
-    // to follow the assistant turn).
-    let mut out: Vec<Value> = Vec::with_capacity(messages.len() + 4);
-    let mut filled = std::collections::HashSet::new();
+    // Index existing `tool` responses by tool_call_id (first wins; later dups dropped).
+    let mut tool_responses: std::collections::HashMap<String, Value> =
+        std::collections::HashMap::new();
     for m in messages.iter() {
+        if m.get("role").and_then(|v| v.as_str()) == Some("tool") {
+            if let Some(id) = m.get("tool_call_id").and_then(|v| v.as_str()) {
+                tool_responses.entry(id.to_string()).or_insert_with(|| m.clone());
+            }
+        }
+    }
+
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len() + 4);
+    let mut injected = 0usize;
+    let mut repositioned = 0usize;
+    for m in messages.iter() {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        // Tool messages are re-emitted right after their assistant tool_call
+        // below (or dropped if they have no matching tool_call).
+        if role == "tool" {
+            continue;
+        }
         out.push(m.clone());
-        if m.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+        if role == "assistant" {
             if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tcs {
                     let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    if !id.is_empty() && !answered.contains(id) && filled.insert(id.to_string()) {
+                    if id.is_empty() {
+                        continue;
+                    }
+                    if let Some(resp) = tool_responses.remove(id) {
+                        repositioned += 1;
+                        out.push(resp);
+                    } else {
+                        injected += 1;
                         out.push(json!({"role": "tool", "tool_call_id": id, "content": ""}));
                     }
                 }
             }
         }
+    }
+
+    // Remaining indexed responses are orphan `tool` messages (no matching
+    // assistant tool_call) - dropping them avoids a 400 of its own.
+    let orphan_dropped = tool_responses.len();
+    if injected > 0 || orphan_dropped > 0 {
+        log::info!(
+            "[orphan-fix] repositioned={} injected_empty={} orphan_tool_dropped={}",
+            repositioned,
+            injected,
+            orphan_dropped
+        );
     }
     *messages = out;
 }

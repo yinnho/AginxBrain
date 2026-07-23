@@ -248,6 +248,48 @@ mod tests {
         assert_eq!(messages[2]["content"], "");
     }
 
+    #[test]
+    fn test_anthropic_to_openai_repositions_misplaced_tool_result() {
+        // tool_result exists but lands in a user message AFTER a text user
+        // message, so the converted `tool` response is not adjacent to the
+        // assistant tool_call. DeepSeek 400s ("tool_calls must be followed by
+        // tool messages"). The converter must reposition the tool response
+        // right after the assistant.
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "user", "content": "do X"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_misplace", "name": "bash", "input": {"cmd": "ls"}}
+                ]},
+                {"role": "user", "content": "an intermediate note"},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_misplace", "content": "file1"}
+                ]},
+                {"role": "user", "content": "reply hi"}
+            ],
+            "tools": [
+                {"name": "bash", "description": "Run bash", "input_schema": {"type": "object"}}
+            ]
+        });
+        let result = anthropic_to_openai_request(&body, "deepseek-v4-pro");
+        let messages = result["messages"].as_array().unwrap();
+        // The assistant tool_call message must be immediately followed by its tool response.
+        let asst_idx = messages
+            .iter()
+            .position(|m| {
+                m.get("role").and_then(|v| v.as_str()) == Some("assistant")
+                    && m.get("tool_calls")
+                        .and_then(|v| v.as_array())
+                        .map(|a| !a.is_empty())
+                        .unwrap_or(false)
+            })
+            .expect("assistant tool_call message present");
+        assert_eq!(messages[asst_idx + 1]["role"], "tool");
+        assert_eq!(messages[asst_idx + 1]["tool_call_id"], "toolu_misplace");
+        assert_eq!(messages[asst_idx + 1]["content"], "file1");
+    }
+
     // =======================================================================
     // OpenAI Responses conversion tests
     // =======================================================================
