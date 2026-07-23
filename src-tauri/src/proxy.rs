@@ -969,6 +969,14 @@ async fn handle_proxy(
         if needs_thinking && fwd_body.get("thinking").is_none() {
             if let Some(obj) = fwd_body.as_object_mut() {
                 obj.insert("thinking".to_string(), json!({"type": "enabled", "budget_tokens": 10000}));
+                // Anthropic requires max_tokens > thinking.budget_tokens so the
+                // response has room after the thinking block. openai_to_anthropic
+                // defaults max_tokens to 4096; bump it above the budget here.
+                let budget: u64 = 10000;
+                let cur = obj.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4096);
+                if cur < budget + 6000 {
+                    obj.insert("max_tokens".to_string(), json!(budget + 6000));
+                }
             }
         }
     }

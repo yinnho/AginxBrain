@@ -313,6 +313,39 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Convert an OpenAI Chat Completions request to Anthropic Messages format.
+/// Build an Anthropic image `source` from an OpenAI Chat `image_url` content
+/// block. `data:` URLs become a base64 source; http(s) URLs become a url
+/// source. Returns `None` for anything untranslatable so the caller can skip
+/// the block. Inverse of `anthropic_image_source_to_url`.
+fn openai_image_url_to_anthropic_source(part: &Value) -> Option<Value> {
+    let url = part
+        .get("image_url")
+        .and_then(|v| {
+            if let Some(s) = v.as_str() {
+                Some(s.to_string())
+            } else {
+                v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string())
+            }
+        })?;
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, data) = rest.split_once(',')?;
+        let media_type = meta
+            .split(';')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("image/png")
+            .to_string();
+        if !meta.contains("base64") {
+            return None;
+        }
+        return Some(json!({"type": "base64", "media_type": media_type, "data": data}));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(json!({"type": "url", "url": url}));
+    }
+    None
+}
+
 pub fn openai_to_anthropic_request(body: &Value, target_model: &str) -> Value {
     let mut out = serde_json::Map::new();
     out.insert("model".into(), Value::String(target_model.to_string()));
@@ -342,22 +375,46 @@ pub fn openai_to_anthropic_request(body: &Value, target_model: &str) -> Value {
                             "content": s
                         }));
                     } else if let Some(arr) = content.as_array() {
-                        // Convert array content: extract text parts, skip non-text (images etc.)
-                        let text = arr.iter()
-                            .filter_map(|part| {
-                                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                                    Some(t.to_string())
-                                } else if let Some(s) = part.as_str() {
-                                    Some(s.to_string())
-                                } else {
-                                    None
+                        // Convert array content: preserve block order, keeping
+                        // text and image_url blocks. Pure-text arrays collapse to
+                        // a string; arrays with images become an Anthropic
+                        // content-blocks array (Anthropic requires blocks when an
+                        // image is present). Previously images were silently
+                        // dropped here, so Anthropic-format vision routes (e.g.
+                        // Kimi K3) never received the image.
+                        let mut blocks: Vec<Value> = Vec::new();
+                        let mut has_image = false;
+                        for part in arr {
+                            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                                if !t.is_empty() {
+                                    blocks.push(serde_json::json!({"type": "text", "text": t}));
                                 }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
+                            } else if let Some(s) = part.as_str() {
+                                if !s.is_empty() {
+                                    blocks.push(serde_json::json!({"type": "text", "text": s}));
+                                }
+                            } else if part.get("type").and_then(|v| v.as_str()) == Some("image_url")
+                                || part.get("image_url").is_some()
+                            {
+                                if let Some(src) = openai_image_url_to_anthropic_source(part) {
+                                    blocks.push(serde_json::json!({"type": "image", "source": src}));
+                                    has_image = true;
+                                }
+                            }
+                        }
+                        let content_val = if has_image {
+                            Value::Array(blocks)
+                        } else {
+                            let text = blocks
+                                .iter()
+                                .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("");
+                            Value::String(text)
+                        };
                         anthropic_messages.push(serde_json::json!({
                             "role": "user",
-                            "content": text
+                            "content": content_val
                         }));
                     } else {
                         anthropic_messages.push(serde_json::json!({
@@ -474,6 +531,13 @@ pub fn openai_to_anthropic_request(body: &Value, target_model: &str) -> Value {
         if let Some(val) = body.get(*key) {
             out.insert(dest.to_string(), val.clone());
         }
+    }
+
+    // Anthropic Messages requires `max_tokens` (it has no default); OpenAI Chat
+    // treats it as optional. Default it when the client omitted it, otherwise
+    // Anthropic-format providers (e.g. Kimi K3) reject the request with 400.
+    if !out.contains_key("max_tokens") {
+        out.insert("max_tokens".to_string(), json!(4096));
     }
 
     Value::Object(out)
