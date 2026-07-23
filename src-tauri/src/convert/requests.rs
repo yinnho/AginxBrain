@@ -240,6 +240,14 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
         }
     }
 
+    // Safety net: backfill an empty `tool` response for any assistant tool_call
+    // whose result is missing. Inbound Anthropic history can carry an orphaned
+    // `tool_use` - e.g. client-side context truncation (Claude Code /compact)
+    // slicing between a tool_use and its tool_result. OpenAI-format providers
+    // reject unanswered tool_call_ids with a 400; mirror the Responses-path
+    // `CodexChatConversionState::fill_missing_tool_results` safety net.
+    fill_missing_tool_results_openai(&mut messages);
+
     out.insert("messages".into(), Value::Array(messages));
 
     // max_tokens
@@ -306,6 +314,47 @@ pub fn anthropic_to_openai_request(body: &Value, target_model: &str) -> Value {
     }
 
     Value::Object(out)
+}
+
+/// Backfill an empty `tool` response for any assistant `tool_calls` id that has
+/// no matching `tool` message downstream. OpenAI providers 400 when a
+/// `tool_call_id` has no response, and inbound Anthropic history can carry an
+/// orphaned `tool_use` (e.g. after client-side context truncation). Mirrors the
+/// Responses-path `CodexChatConversionState::fill_missing_tool_results`.
+fn fill_missing_tool_results_openai(messages: &mut Vec<Value>) {
+    // ids that already have a `tool` response somewhere in the message list.
+    let answered: std::collections::HashSet<String> = messages
+        .iter()
+        .filter_map(|m| {
+            if m.get("role").and_then(|v| v.as_str()) == Some("tool") {
+                m.get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Rebuild the list, injecting an empty tool reply right after any assistant
+    // message that emits an unanswered tool_call (OpenAI requires the response
+    // to follow the assistant turn).
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len() + 4);
+    let mut filled = std::collections::HashSet::new();
+    for m in messages.iter() {
+        out.push(m.clone());
+        if m.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+            if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
+                for tc in tcs {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if !id.is_empty() && !answered.contains(id) && filled.insert(id.to_string()) {
+                        out.push(json!({"role": "tool", "tool_call_id": id, "content": ""}));
+                    }
+                }
+            }
+        }
+    }
+    *messages = out;
 }
 
 // ---------------------------------------------------------------------------

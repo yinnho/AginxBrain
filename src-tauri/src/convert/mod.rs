@@ -218,6 +218,36 @@ mod tests {
         assert!(messages[1].get("reasoning_content").is_none());
     }
 
+    #[test]
+    fn test_anthropic_to_openai_backfills_orphan_tool_use() {
+        // Orphaned tool_use: assistant emitted a tool_call with no matching
+        // tool_result (e.g. history truncated mid tool-turn by the client, as
+        // happens with Claude Code /compact). The converter must synthesize an
+        // empty tool response so the OpenAI provider doesn't 400 on an
+        // unanswered tool_call_id.
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "user", "content": "List files"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_orphan", "name": "bash", "input": {"cmd": "ls"}}
+                ]}
+            ],
+            "tools": [
+                {"name": "bash", "description": "Run bash", "input_schema": {"type": "object"}}
+            ]
+        });
+        let result = anthropic_to_openai_request(&body, "deepseek-v4-pro");
+        let messages = result["messages"].as_array().unwrap();
+        // user, assistant(tool_calls), synthesized empty tool reply
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "toolu_orphan");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "toolu_orphan");
+        assert_eq!(messages[2]["content"], "");
+    }
+
     // =======================================================================
     // OpenAI Responses conversion tests
     // =======================================================================
