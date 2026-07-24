@@ -923,6 +923,10 @@ async fn handle_proxy(
             let mut b = body.clone();
             b["model"] = Value::String(route.model.clone());
             normalize_roles(&mut b);
+            // Orphan/misplaced tool_use after client-side context truncation
+            // makes strict Anthropic-format providers (Kimi K3) 400; repair the
+            // pairs before forwarding.
+            repair_anthropic_tool_pairs(&mut b);
             strip_anthropic_specific_fields(&mut b);
             inject_reasoning_content(&mut b);
             if route.tool_mode == crate::config::ToolMode::ReactXml {
@@ -2465,6 +2469,113 @@ fn strip_anthropic_specific_fields(value: &mut Value) {
     }
 }
 
+/// Ensure every `tool_use` block is followed by a matching `tool_result`, as
+/// Anthropic-compatible providers require. Inbound history (e.g. Claude Code
+/// after context truncation /compact) can orphan or misplace a `tool_result`,
+/// and strict Anthropic-format providers like Kimi K3 reject the request with
+/// "tool_calls must be followed by tool messages". This collects every
+/// `tool_result`, strips it from its origin, then re-derives the user message
+/// after each assistant `tool_use` so every `tool_use_id` is answered (existing
+/// result repositioned, or a synthesized empty one when missing). It preserves
+/// user/assistant alternation, merges results with any text the following user
+/// message carries, and drops orphan `tool_result` blocks with no matching
+/// `tool_use` (which would themselves trigger a 400).
+fn repair_anthropic_tool_pairs(body: &mut Value) {
+    let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+
+    // 1. Index every tool_result by tool_use_id (first wins) and strip it from
+    //    its original user message, leaving the non-tool_result content behind.
+    let mut results: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    for m in msgs.iter_mut() {
+        if m.get("role").and_then(|v| v.as_str()) == Some("user") {
+            if let Some(arr) = m.get_mut("content").and_then(|c| c.as_array_mut()) {
+                let mut kept = Vec::with_capacity(arr.len());
+                for block in arr.drain(..) {
+                    let is_tr = block.get("type").and_then(|v| v.as_str()) == Some("tool_result");
+                    let id = block.get("tool_use_id").and_then(|v| v.as_str()).map(String::from);
+                    if is_tr {
+                        if let Some(id) = id {
+                            results.entry(id).or_insert(block);
+                        }
+                        // duplicate or id-less tool_result: drop
+                    } else {
+                        kept.push(block);
+                    }
+                }
+                *arr = kept;
+            }
+        }
+    }
+
+    // 2. Rebuild. `pending` holds tool_use_ids from the last assistant message
+    //    awaiting their tool_results; they are answered in the next user
+    //    message (merged), or flushed as a synthetic user message otherwise.
+    let mut out: Vec<Value> = Vec::with_capacity(msgs.len() + 4);
+    let mut pending: Vec<String> = Vec::new();
+    for m in msgs.iter() {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        if role == "user" {
+            let mut blocks: Vec<Value> = pending
+                .drain(..)
+                .map(|id| {
+                    results
+                        .remove(&id)
+                        .unwrap_or_else(|| json!({"type":"tool_result","tool_use_id":id,"content":""}))
+                })
+                .collect();
+            match m.get("content") {
+                Some(Value::Array(arr)) => blocks.extend(arr.iter().cloned()),
+                Some(Value::String(s)) => blocks.push(json!({"type":"text","text":s})),
+                _ => {}
+            }
+            if !blocks.is_empty() {
+                out.push(json!({"role":"user","content":blocks}));
+            }
+            // an emptied user message (only tool_results, now stripped) is dropped
+        } else {
+            // Flush pending before a non-user message to keep pairing correct.
+            if !pending.is_empty() {
+                let blocks: Vec<Value> = pending
+                    .drain(..)
+                    .map(|id| {
+                        results
+                            .remove(&id)
+                            .unwrap_or_else(|| json!({"type":"tool_result","tool_use_id":id,"content":""}))
+                    })
+                    .collect();
+                out.push(json!({"role":"user","content":blocks}));
+            }
+            out.push(m.clone());
+            if role == "assistant" {
+                if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+                    pending = arr
+                        .iter()
+                        .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+                        .filter_map(|b| b.get("id").and_then(|v| v.as_str()).map(String::from))
+                        .filter(|id| !id.is_empty())
+                        .collect();
+                }
+            }
+        }
+    }
+    // Trailing assistant tool_use with no following user message: answer it.
+    if !pending.is_empty() {
+        let blocks: Vec<Value> = pending
+            .drain(..)
+            .map(|id| {
+                results
+                    .remove(&id)
+                    .unwrap_or_else(|| json!({"type":"tool_result","tool_use_id":id,"content":""}))
+            })
+            .collect();
+        out.push(json!({"role":"user","content":blocks}));
+    }
+
+    *msgs = out;
+}
+
 /// Remove or convert content blocks with types that Anthropic providers don't
 /// accept (only `text`, `thinking`, `image`, `document`, `tool_use`, and
 /// `tool_result` are valid). Unknown types are either mapped to a supported
@@ -3968,6 +4079,97 @@ mod tests {
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[2]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_repair_anthropic_injects_missing_tool_result() {
+        // Orphaned tool_use with no tool_result anywhere (e.g. truncated by /compact).
+        let mut body = json!({
+            "model": "kimi",
+            "messages": [
+                {"role": "user", "content": "analyze these"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "analyze_image:48", "name": "analyze_image", "input": {"url": "x"}}
+                ]},
+                {"role": "user", "content": "never mind, reply hi"}
+            ]
+        });
+        repair_anthropic_tool_pairs(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        let content = messages[2]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[0]["tool_use_id"], "analyze_image:48");
+        assert_eq!(content[0]["content"], "");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "never mind, reply hi");
+    }
+
+    #[test]
+    fn test_repair_anthropic_repositions_misplaced_tool_result() {
+        // tool_result lands in a user message AFTER a text user message, so it is
+        // not adjacent to the assistant tool_use. Must be moved up and merged.
+        let mut body = json!({
+            "model": "kimi",
+            "messages": [
+                {"role": "user", "content": "do X"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "analyze_image:50", "name": "analyze_image", "input": {}}
+                ]},
+                {"role": "user", "content": "an intermediate note"},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "analyze_image:50", "content": "img desc"}
+                ]},
+                {"role": "user", "content": "reply hi"}
+            ]
+        });
+        repair_anthropic_tool_pairs(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        let asst_idx = messages
+            .iter()
+            .position(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .unwrap();
+        let next = &messages[asst_idx + 1];
+        assert_eq!(next["role"], "user");
+        let content = next["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[0]["tool_use_id"], "analyze_image:50");
+        assert_eq!(content[0]["content"], "img desc");
+        // no empty user messages left behind
+        for m in messages.iter() {
+            if m.get("role").and_then(|v| v.as_str()) == Some("user") {
+                if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+                    assert!(!arr.is_empty(), "no empty user content blocks");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_repair_anthropic_wellformed_unchanged() {
+        let mut body = json!({
+            "model": "kimi",
+            "messages": [
+                {"role": "user", "content": "do X"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "let me look"},
+                    {"type": "tool_use", "id": "t1", "name": "bash", "input": {"cmd": "ls"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                    {"type": "text", "text": "thanks"}
+                ]},
+                {"role": "user", "content": "next"}
+            ]
+        });
+        repair_anthropic_tool_pairs(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        let content = messages[2]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[0]["tool_use_id"], "t1");
+        assert_eq!(content[0]["content"], "ok");
+        assert_eq!(content[1]["text"], "thanks");
     }
 
     #[test]
