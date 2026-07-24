@@ -923,16 +923,12 @@ async fn handle_proxy(
             let mut b = body.clone();
             b["model"] = Value::String(route.model.clone());
             normalize_roles(&mut b);
-            // Orphan/misplaced tool_use after client-side context truncation
-            // makes strict Anthropic-format providers (Kimi K3) 400; repair the
-            // pairs before forwarding.
+            // Z.ai server-tool blocks (opencarrier analyze_image/webReader) are
+            // malformed for Anthropic-compatible providers like Kimi K3; strip
+            // them (their call+result are duplicated as text). Then repair any
+            // orphan/misplaced regular tool_use pairs from context truncation.
+            strip_server_tool_use(&mut b);
             repair_anthropic_tool_pairs(&mut b);
-            // TEMP debug: dump pre/post-repair Anthropic bodies to inspect why
-            // Kimi K3 still 400s on analyze_image tool_call_ids. Remove after.
-            if body.to_string().contains("analyze_image") {
-                let _ = std::fs::write("/tmp/aginx_prerepair.json", serde_json::to_string_pretty(&body).unwrap_or_default());
-                let _ = std::fs::write("/tmp/aginx_postrepair.json", serde_json::to_string_pretty(&b).unwrap_or_default());
-            }
             strip_anthropic_specific_fields(&mut b);
             inject_reasoning_content(&mut b);
             if route.tool_mode == crate::config::ToolMode::ReactXml {
@@ -2472,6 +2468,49 @@ fn strip_anthropic_specific_fields(value: &mut Value) {
         // beta/extended fields are provider-specific
         obj.remove("anthropic_beta");
         obj.remove("anthropic_version");
+    }
+}
+
+/// Strip Z.ai-style `server_tool_use` blocks and their `tool_result` responses.
+/// Clients like opencarrier emit server-side tool calls (analyze_image,
+/// webReader) as `server_tool_use` blocks whose `tool_result` lands *inside* the
+/// same assistant message — malformed for Anthropic-compatible providers like
+/// Kimi K3, which reject the request ("tool_calls must be followed by tool
+/// messages"). The call and result are already duplicated as text blocks
+/// ("🌐 Z.ai Built-in Tool: ..." / "Output: ..."), so dropping the structured
+/// blocks loses no information. Removes every `server_tool_use` block and every
+/// `tool_result` whose tool_use_id matches one.
+fn strip_server_tool_use(body: &mut Value) {
+    let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    let mut server_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in msgs.iter() {
+        if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+            for blk in arr {
+                if blk.get("type").and_then(|v| v.as_str()) == Some("server_tool_use") {
+                    if let Some(id) = blk.get("id").and_then(|v| v.as_str()) {
+                        server_ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if server_ids.is_empty() {
+        return;
+    }
+    for m in msgs.iter_mut() {
+        if let Some(arr) = m.get_mut("content").and_then(|c| c.as_array_mut()) {
+            arr.retain(|blk| match blk.get("type").and_then(|v| v.as_str()) {
+                Some("server_tool_use") => false,
+                Some("tool_result") => blk
+                    .get("tool_use_id")
+                    .and_then(|v| v.as_str())
+                    .map(|id| !server_ids.contains(id))
+                    .unwrap_or(true),
+                _ => true,
+            });
+        }
     }
 }
 
@@ -4176,6 +4215,36 @@ mod tests {
         assert_eq!(content[0]["tool_use_id"], "t1");
         assert_eq!(content[0]["content"], "ok");
         assert_eq!(content[1]["text"], "thanks");
+    }
+
+    #[test]
+    fn test_strip_server_tool_use_removes_blocks_and_results() {
+        // opencarrier/Z.ai server-tool pattern: a server_tool_use block with its
+        // tool_result embedded in the same assistant message.
+        let mut body = json!({
+            "model": "kimi",
+            "messages": [
+                {"role": "user", "content": "analyze"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "calling tool"},
+                    {"type": "server_tool_use", "id": "call_srv1", "name": "analyze_image", "input": {}},
+                    {"type": "tool_result", "tool_use_id": "call_srv1", "content": "image desc"},
+                    {"type": "tool_use", "id": "call_cli1", "name": "bash", "input": {"cmd": "ls"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_cli1", "content": "file1"}
+                ]}
+            ]
+        });
+        strip_server_tool_use(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        let asst = messages[1]["content"].as_array().unwrap();
+        assert!(!asst.iter().any(|b| b["type"] == "server_tool_use"));
+        assert!(!asst.iter().any(|b| b["type"] == "tool_result" && b["tool_use_id"] == "call_srv1"));
+        assert!(asst.iter().any(|b| b["type"] == "text"));
+        assert!(asst.iter().any(|b| b["type"] == "tool_use" && b["id"] == "call_cli1"));
+        let user = messages[2]["content"].as_array().unwrap();
+        assert_eq!(user[0]["tool_use_id"], "call_cli1");
     }
 
     #[test]
