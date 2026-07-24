@@ -927,6 +927,12 @@ async fn handle_proxy(
             // makes strict Anthropic-format providers (Kimi K3) 400; repair the
             // pairs before forwarding.
             repair_anthropic_tool_pairs(&mut b);
+            // TEMP debug: dump pre/post-repair Anthropic bodies to inspect why
+            // Kimi K3 still 400s on analyze_image tool_call_ids. Remove after.
+            if body.to_string().contains("analyze_image") {
+                let _ = std::fs::write("/tmp/aginx_prerepair.json", serde_json::to_string_pretty(body).unwrap_or_default());
+                let _ = std::fs::write("/tmp/aginx_postrepair.json", serde_json::to_string_pretty(&b).unwrap_or_default());
+            }
             strip_anthropic_specific_fields(&mut b);
             inject_reasoning_content(&mut b);
             if route.tool_mode == crate::config::ToolMode::ReactXml {
