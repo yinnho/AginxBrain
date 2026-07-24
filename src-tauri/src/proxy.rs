@@ -233,7 +233,46 @@ pub async fn handle_task_poll(
         task_url
     );
     let result = send_image_get(&state, &provider, &task_url).await?;
+
+    // Capture authoritative token usage for async tasks that report it in the
+    // completion response (Seedance bills by completion_tokens). Updates the
+    // submit-time usage_log row matched by task_id; no-op for tasks/providers
+    // whose poll response carries no usage (e.g. DashScope wanx video).
+    capture_async_task_usage(&state.db, &task_id, &result).await;
+
     Ok(Json(result).into_response())
+}
+
+/// Update the submit-time usage_log row for an async generation task with the
+/// authoritative token usage + terminal status from its poll response. Only
+/// acts when the task reports usage (Seedance) or reaches a terminal state.
+async fn capture_async_task_usage(db: &sqlx::SqlitePool, task_id: &str, result: &Value) {
+    let status = result.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let usage = result.get("usage");
+    let completion = usage
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(|v| v.as_i64());
+    let total = usage
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(|v| v.as_i64());
+    let prompt = usage
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|v| v.as_i64());
+    // Video models bill completion_tokens (output) with 0 input; derive input
+    // as prompt_tokens, else total - completion, else 0.
+    let input = Some(
+        prompt
+            .or_else(|| total.zip(completion).map(|(t, c)| t - c))
+            .unwrap_or(0),
+    );
+
+    let is_terminal = matches!(status, "succeeded" | "failed" | "cancelled" | "expired");
+    if completion.is_none() && !is_terminal {
+        return;
+    }
+    let new_status = if status.is_empty() { None } else { Some(status) };
+    let _ = crate::db::update_video_usage_by_task_id(db, task_id, new_status, input, completion)
+        .await;
 }
 
 /// Parse request body as JSON, accepting any content-type.
@@ -2824,7 +2863,7 @@ async fn handle_video_request(
         start.elapsed().as_millis()
     );
 
-    let _ = crate::db::insert_usage_log(
+    let usage_id = crate::db::insert_usage_log(
         &state.db,
         crate::db::UsageInsert {
             caller_key_id,
@@ -2840,6 +2879,9 @@ async fn handle_video_request(
             error_message: None,
         },
     ).await;
+    if let Ok(id) = usage_id {
+        let _ = crate::db::set_usage_task_id(&state.db, id, &task_id).await;
+    }
 
     // Truly async — return the task ID immediately. The client polls.
     let resp = json!({
@@ -2957,7 +2999,7 @@ async fn handle_seedance_video_request(
         start.elapsed().as_millis()
     );
 
-    let _ = crate::db::insert_usage_log(
+    let usage_id = crate::db::insert_usage_log(
         &state.db,
         crate::db::UsageInsert {
             caller_key_id,
@@ -2974,6 +3016,9 @@ async fn handle_seedance_video_request(
         },
     )
     .await;
+    if let Ok(id) = usage_id {
+        let _ = crate::db::set_usage_task_id(&state.db, id, &task_id).await;
+    }
 
     // Truly async — return the task ID immediately (same shape as the DashScope
     // video response); the client polls GET /v1/tasks/{tag}/{task_id}.

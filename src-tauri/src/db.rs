@@ -300,6 +300,50 @@ pub async fn update_usage_tokens_opt(
     Ok(())
 }
 
+/// Update an async generation task's usage_log row (matched by `task_id`) with
+/// authoritative token usage captured at poll time (e.g. Seedance's
+/// `usage.completion_tokens`, which bills the video) plus the terminal task
+/// status. COALESCE keeps the known value when a field is NULL, so repeated
+/// polls of a completed task are idempotent. No-op if no row has this task_id
+/// (e.g. submitted before this column existed).
+pub async fn update_video_usage_by_task_id(
+    pool: &SqlitePool,
+    task_id: &str,
+    status: Option<&str>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE usage_logs
+         SET status = COALESCE(?1, status),
+             input_tokens = COALESCE(?2, input_tokens),
+             output_tokens = COALESCE(?3, output_tokens)
+         WHERE task_id = ?4",
+    )
+    .bind(status)
+    .bind(input_tokens)
+    .bind(output_tokens)
+    .bind(task_id)
+    .execute(pool)
+    .await
+    .context("updating video usage by task_id")?;
+    Ok(())
+}
+
+/// Stamp the async task_id onto a usage_log row so the poll handler can later
+/// backfill authoritative token usage via `update_video_usage_by_task_id`.
+/// Separate from `insert_usage_log` so the common synchronous-modalities
+/// inserts don't need to know about task_id.
+pub async fn set_usage_task_id(pool: &SqlitePool, id: i64, task_id: &str) -> Result<()> {
+    sqlx::query("UPDATE usage_logs SET task_id = ?1 WHERE id = ?2")
+        .bind(task_id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("setting usage task_id")?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Usage aggregation
 // ---------------------------------------------------------------------------
