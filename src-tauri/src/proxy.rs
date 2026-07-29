@@ -684,6 +684,153 @@ fn body_has_image_content(body: &Value) -> bool {
     false
 }
 
+/// Best-effort image MIME from a URL's extension; used when the fetch response
+/// has no usable `Content-Type: image/*`. The query/fragment is stripped first
+/// so `image.jpeg?sender_id=...%40im.wechat` doesn't poison the lookup.
+fn guess_image_mime(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "image/jpeg",
+    }
+}
+
+/// Cap on a single inlined image (raw bytes). Base64 inflates ~1.37x, so 10MB
+/// raw becomes ~13.6MB in the provider request - around typical vision limits.
+/// Larger images are left as URLs (the provider may still reject them, but we
+/// avoid ballooning the request / OOMing on a hostile huge file).
+const INLINE_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+/// Fetch an image URL as `(media_type, base64)`. opencarrier serves vision
+/// images at publicly fetchable (anonymous) URLs, so no auth is needed.
+/// 30s timeout, 10MB cap. Returns None on any failure so the caller can leave
+/// the URL in place.
+async fn fetch_image_to_base64(
+    client: &reqwest::Client,
+    url: &str,
+) -> Option<(String, String)> {
+    // Bounded fetch: 30s per image. The shared client's global timeout is 1h -
+    // a hanging image host must not stall the whole request.
+    let resp = match client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            log::warn!(
+                "[Proxy] inline_image: {} -> HTTP {} (leaving url as-is)",
+                url,
+                r.status()
+            );
+            return None;
+        }
+        Err(e) => {
+            log::warn!(
+                "[Proxy] inline_image: {} fetch failed: {} (leaving url as-is)",
+                url,
+                e
+            );
+            return None;
+        }
+    };
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(';').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.starts_with("image/"))
+        .unwrap_or_else(|| guess_image_mime(url).to_string());
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!(
+                "[Proxy] inline_image: {} read body failed: {} (leaving url as-is)",
+                url,
+                e
+            );
+            return None;
+        }
+    };
+    if bytes.is_empty() {
+        log::warn!("[Proxy] inline_image: {} empty body (leaving url as-is)", url);
+        return None;
+    }
+    if bytes.len() > INLINE_IMAGE_MAX_BYTES {
+        log::warn!(
+            "[Proxy] inline_image: {} too large ({} bytes > {}, leaving url as-is)",
+            url,
+            bytes.len(),
+            INLINE_IMAGE_MAX_BYTES
+        );
+        return None;
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    log::info!(
+        "[Proxy] inline_image: inlined {} ({} bytes -> {} b64 chars)",
+        url,
+        bytes.len(),
+        b64.len()
+    );
+    Some((mime, b64))
+}
+
+/// Walk an Anthropic-format request body and inline-fetch every `image` block
+/// whose source is a URL, rewriting it to a base64 source. Anthropic-compatible
+/// providers (Kimi K3, GLM, 豆包) reject `{"type":"url"}` image sources
+/// ("unsupported image url") and only accept base64. Runs AFTER protocol
+/// conversion, gated on the target provider being Anthropic-format, so it
+/// covers every client path (openai/anthropic/responses -> anthropic) - the
+/// decision is provider-driven, not client-protocol-driven. Best-effort: on
+/// fetch failure the URL source is left in place (a provider that supports URLs
+/// still gets it; a strict one 400s, same as today).
+async fn inline_anthropic_image_urls(
+    client: &reqwest::Client,
+    body: &mut Value,
+) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for msg in messages.iter_mut() {
+        let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            if block.get("type").and_then(|v| v.as_str()) != Some("image") {
+                continue;
+            }
+            let is_url_source = block
+                .get("source")
+                .and_then(|s| s.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("url");
+            if !is_url_source {
+                continue;
+            }
+            let Some(url) = block
+                .get("source")
+                .and_then(|s| s.get("url"))
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string())
+            else {
+                continue;
+            };
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                continue;
+            }
+            if let Some((media_type, data)) = fetch_image_to_base64(client, &url).await {
+                block["source"] = json!({"type":"base64","media_type":media_type,"data":data});
+            }
+        }
+    }
+}
+
 /// Inject the qwen-doc-turbo PPT `skill` parameter and force `stream: true` on
 /// an already protocol-converted request body. qwen-doc-turbo only emits slide
 /// HTML (in `reasoning_content`) when `skill` is present at the top level and
@@ -1042,6 +1189,12 @@ async fn handle_proxy(
     //     tool_result. Unknown types are remapped where possible, dropped if not.
     if matches!(provider_format, ProviderFormat::Anthropic) {
         sanitize_anthropic_blocks(&mut fwd_body);
+        // Inline-fetch URL image sources -> base64. Anthropic-compatible
+        // providers (Kimi K3, GLM, 豆包) reject {"type":"url"} image sources
+        // ("unsupported image url"); clients send bare URLs, AginxBrain fetches
+        // + inlines per provider. Runs post-conversion so it covers every
+        // client path targeting an Anthropic-format provider.
+        inline_anthropic_image_urls(&state.http_client, &mut fwd_body).await;
     }
 
     // 5. Build URL
@@ -4017,6 +4170,20 @@ impl IntoResponse for ProxyError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_guess_image_mime_strips_query() {
+        // Query string must not poison the extension lookup (file.yinnho.cn
+        // vision URLs carry ?sender_id=...%40im.wechat).
+        assert_eq!(
+            guess_image_mime("https://file.yinnho.cn/api/files/view/ai-writer/input/image_1785.jpeg?sender_id=o9cq%40im.wechat"),
+            "image/jpeg"
+        );
+        assert_eq!(guess_image_mime("https://x/a/b/c.PNG"), "image/png");
+        assert_eq!(guess_image_mime("https://x/pic.webp#frag"), "image/webp");
+        // No extension -> jpeg default.
+        assert_eq!(guess_image_mime("https://x/avatar"), "image/jpeg");
+    }
 
     #[test]
     fn test_is_context_limit_error_detects_variants() {
