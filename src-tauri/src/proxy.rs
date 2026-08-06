@@ -2796,15 +2796,38 @@ fn sanitize_anthropic_blocks(value: &mut Value) {
                         }
                     }
                 }
-                // Then drop anything still not in the allow-list
+                // Then drop anything still not in the allow-list, AND drop
+                // empty text blocks. Some Anthropic-compatible providers (Kimi
+                // K3) reject `{"type":"text","text":""}` with "text content is
+                // empty" even though the real Anthropic API tolerates them.
                 content.retain(|block| {
                     let t = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if t.is_empty() || VALID_TYPES.contains(&t) {
-                        return true;
+                    if !t.is_empty() && !VALID_TYPES.contains(&t) {
+                        log::warn!("[Proxy] dropping unrecognised Anthropic content block type: {t}");
+                        return false;
                     }
-                    log::warn!("[Proxy] dropping unrecognised Anthropic content block type: {t}");
-                    false
+                    if t == "text" {
+                        let empty = block
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.is_empty())
+                            .unwrap_or(true);
+                        if empty {
+                            log::warn!("[Proxy] dropping empty text content block (Kimi rejects it)");
+                            return false;
+                        }
+                    }
+                    true
                 });
+                // Dropping empty/invalid blocks can leave a message with an
+                // empty content array, which providers also reject. Backfill
+                // with a minimal placeholder so the message survives (we can't
+                // drop the message itself without breaking user/assistant
+                // alternation).
+                if content.is_empty() {
+                    log::warn!("[Proxy] backfilling emptied message content with placeholder");
+                    content.push(json!({"type":"text","text":" "}));
+                }
             }
         }
     }
@@ -4412,6 +4435,36 @@ mod tests {
         assert!(asst.iter().any(|b| b["type"] == "tool_use" && b["id"] == "call_cli1"));
         let user = messages[2]["content"].as_array().unwrap();
         assert_eq!(user[0]["tool_use_id"], "call_cli1");
+    }
+
+    #[test]
+    fn test_sanitize_drops_empty_text_blocks_and_backfills() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                // assistant message with an empty text block alongside real content
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": ""},
+                    {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}
+                ]},
+                // message whose ONLY block is empty text -> becomes placeholder
+                {"role": "user", "content": [ {"type": "text", "text": ""} ]},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+            ]
+        });
+        sanitize_anthropic_blocks(&mut body);
+        let m = body["messages"].as_array().unwrap();
+        // empty text dropped, tool_use kept
+        let asst = m[1]["content"].as_array().unwrap();
+        assert_eq!(asst.len(), 1);
+        assert_eq!(asst[0]["type"], "tool_use");
+        // emptied message backfilled with a placeholder text block
+        let user = m[2]["content"].as_array().unwrap();
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0]["type"], "text");
+        assert!(!user[0]["text"].as_str().unwrap().is_empty());
+        // real text untouched
+        assert_eq!(m[3]["content"][0]["text"], "ok");
     }
 
     #[test]
