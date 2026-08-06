@@ -2786,6 +2786,8 @@ fn sanitize_anthropic_blocks(value: &mut Value) {
     const VALID_TYPES: &[&str] = &["text", "thinking", "image", "document", "tool_use", "tool_result"];
 
     if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        let mut dropped_empty_text = 0usize;
+        let mut backfilled = 0usize;
         for msg in messages.iter_mut() {
             if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
                 // First remap known non-standard types that have the same shape
@@ -2813,7 +2815,7 @@ fn sanitize_anthropic_blocks(value: &mut Value) {
                             .map(|s| s.is_empty())
                             .unwrap_or(true);
                         if empty {
-                            log::warn!("[Proxy] dropping empty text content block (Kimi rejects it)");
+                            dropped_empty_text += 1;
                             return false;
                         }
                     }
@@ -2825,10 +2827,19 @@ fn sanitize_anthropic_blocks(value: &mut Value) {
                 // drop the message itself without breaking user/assistant
                 // alternation).
                 if content.is_empty() {
-                    log::warn!("[Proxy] backfilling emptied message content with placeholder");
+                    backfilled += 1;
                     content.push(json!({"type":"text","text":" "}));
                 }
             }
+        }
+        // One summary line per request instead of one WARN per block - large
+        // Claude Code contexts routinely carry dozens of empty text blocks and
+        // would otherwise flood the log.
+        if dropped_empty_text > 0 || backfilled > 0 {
+            log::info!(
+                "[Proxy] sanitize_anthropic: dropped {} empty text block(s), backfilled {} emptied message(s)",
+                dropped_empty_text, backfilled
+            );
         }
     }
 }
