@@ -1286,9 +1286,13 @@ async fn handle_proxy(
             status.canonical_reason().unwrap_or("?"),
             truncate_chars(&err_body, 300)
         );
-        // 5xx server errors and 429 (rate limit) → retryable, try next candidate
-        if status_code >= 500 || status_code == 429 {
-            if status_code == 429 { rate_limited_count += 1; }
+        // 5xx server errors, 429 (rate limit), and 401/403 (auth / quota) →
+        // retryable, try next candidate. 401/403 are account-level failures on
+        // THIS provider (invalid key, or usage limit for the billing cycle —
+        // e.g. Kimi returns 403 "reached your usage limit"), not a malformed
+        // request: another provider in the chain may still serve it.
+        if status_code >= 500 || status_code == 429 || status_code == 401 || status_code == 403 {
+            if status_code == 429 || status_code == 403 { rate_limited_count += 1; }
             let err = ProxyError::Upstream(format!("HTTP {}: {}",
                 status_code, truncate_chars(&err_body, 200)));
             log::warn!("[Proxy] upstream {} (retryable): {}", status_code, err);
@@ -1780,12 +1784,17 @@ async fn handle_proxy(
     )
     .await;
 
-    // All candidates failed — if they were all rate-limited, return 429 so the
-    // client knows to retry with backoff instead of crashing on an unexpected 502.
+    // All candidates failed — if they were all rate-limited (or quota-blocked
+    // with 401/403), return 429 so the client knows to retry with backoff
+    // instead of crashing on an unexpected 502.
     if rate_limited_count > 0 && rate_limited_count as usize == candidates.len() {
         Err(ProxyError::RateLimited("all providers rate limited, please retry later".into()))
     } else {
-        Err(ProxyError::Upstream("all providers unavailable, please try again later".into()))
+        let detail = last_error.as_ref().map(|e| e.to_string()).unwrap_or_default();
+        Err(ProxyError::Upstream(format!(
+            "all providers unavailable, please try again later: {}",
+            detail
+        )))
     }
 }
 
