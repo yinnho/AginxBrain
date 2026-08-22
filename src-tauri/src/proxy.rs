@@ -558,6 +558,27 @@ fn is_context_limit_error(err_body: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Detect upstream error bodies that signal the request's modality exceeds
+/// the provider's capability - e.g. a vision request landing on a text-only
+/// model (Ark coding glm-5.3 returns 400 "Model only support text input").
+/// The request is well-formed; this route just lacks the capability, so a
+/// multimodal-capable route further down the chain may still serve it.
+fn is_unsupported_modality_error(err_body: &str) -> bool {
+    let lower = err_body.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "only support text",
+        "only supports text",
+        "not support image",
+        "doesn't support image",
+        "does not support image",
+        "image input",
+        "multimodal input",
+        "not support audio",
+        "not support video",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 fn is_chat_format(format: &ProviderFormat) -> bool {
     matches!(
         format,
@@ -1310,6 +1331,19 @@ async fn handle_proxy(
                 truncate_chars(&err_body, 200)
             ));
             log::warn!("[Proxy] {} context-limit 400 (retryable): trying next route", tag);
+            last_error = Some(err);
+            continue;
+        }
+        // 400 "model only supports text input" (and friends) is a capability
+        // gap on THIS route (text-only model given an image-bearing request),
+        // not a malformed request - fail over so a multimodal-capable route
+        // can serve it instead of hard-failing the request.
+        if status_code == 400 && is_unsupported_modality_error(&err_body) {
+            let err = ProxyError::Upstream(format!(
+                "HTTP 400 unsupported modality: {}",
+                truncate_chars(&err_body, 200)
+            ));
+            log::warn!("[Proxy] {} modality 400 (retryable): trying next route", tag);
             last_error = Some(err);
             continue;
         }
@@ -4240,6 +4274,21 @@ mod tests {
         assert!(is_context_limit_error("Your prompt is too long for this model."));
         assert!(!is_context_limit_error("Invalid API key"));
         assert!(!is_context_limit_error("Bad request: missing field model"));
+    }
+
+    #[test]
+    fn test_is_unsupported_modality_error_detects_variants() {
+        // Ark coding glm-5.3 on an image-bearing request.
+        assert!(is_unsupported_modality_error(
+            "{\"error\":{\"code\":\"InvalidParameter\",\"message\":\"Model only support text input Request id: 0217...\"}}"
+        ));
+        assert!(is_unsupported_modality_error("This model does not support image input"));
+        assert!(is_unsupported_modality_error("Image input is not enabled for this model"));
+        assert!(is_unsupported_modality_error("multimodal input not supported"));
+        // Text-only 400s that are request-shape or auth problems stay put.
+        assert!(!is_unsupported_modality_error("Invalid API key"));
+        assert!(!is_unsupported_modality_error("Bad request: missing field model"));
+        assert!(!is_context_limit_error("Model only support text input"));
     }
 
     #[test]
