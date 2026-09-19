@@ -554,6 +554,11 @@ fn is_context_limit_error(err_body: &str) -> bool {
         "too many tokens",
         "prompt is too long",
         "request too large",
+        // Zhipu gateway variant of "too big": on a 9.5 MB request zhipu-v3
+        // reported 1261 "prompt is too long" while a sibling zhipu account
+        // reported 1213 below for the same body - the gateway failing to take
+        // the payload, not a malformed request.
+        "未正常接收到prompt参数",
     ];
     MARKERS.iter().any(|m| lower.contains(m))
 }
@@ -1421,29 +1426,63 @@ async fn handle_proxy(
             let usage_format_c = usage_format.clone();
             let upstream = resp.bytes_stream();
             tokio::spawn(async move {
-                const MAX_USAGE_BUF: usize = 1024 * 1024; // 1 MB cap for usage extraction
-                let mut buf = Vec::new();
+                // Usage events sit at the two ends of the stream (Anthropic
+                // message_start at the head, final message_delta at the tail),
+                // so keep the first and last 512 KB - the middle is dead
+                // weight for extraction. Head-only retention lost the tail on
+                // big streams, where zhipu/kimi put ALL real usage numbers.
+                const MAX_USAGE_HEAD: usize = 512 * 1024;
+                const MAX_USAGE_TAIL: usize = 512 * 1024;
+                let mut head: Vec<u8> = Vec::new();
+                let mut tail: Vec<u8> = Vec::new();
                 let mut capped = false;
                 let mut upstream = Box::pin(upstream);
                 while let Some(result) = upstream.next().await {
                     if let Ok(ref bytes) = result {
-                        if !capped && buf.len() + bytes.len() <= MAX_USAGE_BUF {
-                            buf.extend_from_slice(bytes);
-                        } else if !capped {
-                            buf.extend_from_slice(&bytes[..MAX_USAGE_BUF.saturating_sub(buf.len())]);
-                            capped = true;
-                            log::warn!("[Proxy] usage extraction buffer capped at {} bytes", MAX_USAGE_BUF);
+                        if !capped {
+                            if head.len() + bytes.len() <= MAX_USAGE_HEAD {
+                                head.extend_from_slice(bytes);
+                            } else {
+                                let take = MAX_USAGE_HEAD - head.len();
+                                head.extend_from_slice(&bytes[..take]);
+                                capped = true;
+                                log::info!(
+                                    "[Proxy] usage extraction: large stream, retaining head+tail ({}+{} bytes cap each)",
+                                    MAX_USAGE_HEAD, MAX_USAGE_TAIL
+                                );
+                                let rest = &bytes[take..];
+                                if rest.len() >= MAX_USAGE_TAIL {
+                                    tail.extend_from_slice(&rest[rest.len() - MAX_USAGE_TAIL..]);
+                                } else {
+                                    tail.extend_from_slice(rest);
+                                }
+                            }
+                        } else if tail.len() + bytes.len() <= MAX_USAGE_TAIL {
+                            tail.extend_from_slice(bytes);
+                        } else {
+                            let overflow = tail.len() + bytes.len() - MAX_USAGE_TAIL;
+                            if overflow >= tail.len() {
+                                tail.clear();
+                                tail.extend_from_slice(&bytes[bytes.len() - MAX_USAGE_TAIL..]);
+                            } else {
+                                tail.drain(..overflow);
+                                tail.extend_from_slice(bytes);
+                            }
                         }
                     }
                     let _ = drain_tx.send(result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
                 }
-                let (input, output) = extract_usage_from_sse_buffer(&buf, &usage_format_c);
+                let (input, output) = if capped {
+                    extract_usage_from_sse_buffer(&head, Some(&tail), &usage_format_c)
+                } else {
+                    extract_usage_from_sse_buffer(&head, None, &usage_format_c)
+                };
                 if let (Some(i), Some(o)) = (input, output) {
                     if let Some(id) = log_id_c {
                         let _ = crate::db::update_usage_tokens(&db_c, id, i, o).await;
                     }
                 } else if log_id_c.is_some() {
-                    log::warn!("[Proxy] usage extraction incomplete: input={:?}, output={:?} for log_id={:?}, buf_len={}", input, output, log_id_c, buf.len());
+                    log::warn!("[Proxy] usage extraction incomplete: input={:?}, output={:?} for log_id={:?}, head_len={}, tail_len={}", input, output, log_id_c, head.len(), tail.len());
                 }
             });
         }
@@ -2094,12 +2133,21 @@ use tokio::sync::Mutex;
 /// For Anthropic-format streams, some providers (Zhipu GLM, Baidu) report
 /// `output_tokens` that excludes thinking tokens. We estimate output tokens
 /// from the actual content (text_delta + thinking_delta) and use the higher value.
-fn extract_usage_from_sse_buffer(buf: &[u8], format: &ProviderFormat) -> (Option<i64>, Option<i64>) {
+struct SseUsageScan {
+    input: Option<i64>,
+    output: Option<i64>,
+    estimated_output_chars: i64,
+    delta_events: u32,
+}
+
+fn scan_sse_for_usage(buf: &[u8], format: &ProviderFormat) -> SseUsageScan {
     let text = String::from_utf8_lossy(buf);
-    let mut input = None;
-    let mut output = None;
-    let mut estimated_output_chars: i64 = 0;
-    let mut delta_events = 0u32;
+    let mut scan = SseUsageScan {
+        input: None,
+        output: None,
+        estimated_output_chars: 0,
+        delta_events: 0,
+    };
 
     for line in text.lines() {
         let line = line.trim();
@@ -2111,33 +2159,41 @@ fn extract_usage_from_sse_buffer(buf: &[u8], format: &ProviderFormat) -> (Option
             if let Ok(json) = serde_json::from_str::<Value>(data) {
                 // Estimate output from content_block_delta events (covers thinking + text + tool use)
                 if let Some(delta) = json.get("delta") {
-                    delta_events += 1;
+                    scan.delta_events += 1;
                     if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
-                        estimated_output_chars += t.len() as i64;
+                        scan.estimated_output_chars += t.len() as i64;
                     }
                     if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
-                        estimated_output_chars += t.len() as i64;
+                        scan.estimated_output_chars += t.len() as i64;
                     }
                     if let Some(t) = delta.get("partial_json").and_then(|v| v.as_str()) {
-                        estimated_output_chars += t.len() as i64;
+                        scan.estimated_output_chars += t.len() as i64;
                     }
                 }
-                if let Some(usage) = json.get("usage") {
+                // Usage placement varies by provider: top-level `usage`
+                // (Anthropic message_delta, OpenAI chat final chunk), nested
+                // `message.usage` (Anthropic message_start), nested
+                // `response.usage` (OpenAI Responses `response.completed`).
+                let usage = json
+                    .get("usage")
+                    .or_else(|| json.pointer("/message/usage"))
+                    .or_else(|| json.pointer("/response/usage"));
+                if let Some(usage) = usage {
                     match format {
                         ProviderFormat::Anthropic | ProviderFormat::OpenaiResponses => {
                             if let Some(total) = anthropic_total_input(usage) {
-                                input = Some(total);
+                                scan.input = Some(total);
                             }
                             if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
-                                output = Some(v);
+                                scan.output = Some(v);
                             }
                         }
                         ProviderFormat::Openai | ProviderFormat::OpenaiImages => {
                             if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
-                                input = Some(v);
+                                scan.input = Some(v);
                             }
                             if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
-                                output = Some(v);
+                                scan.output = Some(v);
                             }
                         }
                         _ => {}
@@ -2145,6 +2201,39 @@ fn extract_usage_from_sse_buffer(buf: &[u8], format: &ProviderFormat) -> (Option
                 }
             }
         }
+    }
+
+    scan
+}
+
+/// Extract token usage from the retained head (and, for streams that exceeded
+/// it, tail) of an upstream SSE buffer. Usage events sit at the two ends of a
+/// stream - Anthropic `message_start` at the head, `message_delta` with the
+/// final counts at the tail - so scanning both keeps provider-reported numbers
+/// for arbitrarily large streams. `tail` must be None when the whole stream fit
+/// in `buf` (the slices never overlap, so estimates are not double-counted).
+fn extract_usage_from_sse_buffer(
+    buf: &[u8],
+    tail: Option<&[u8]>,
+    format: &ProviderFormat,
+) -> (Option<i64>, Option<i64>) {
+    let head_scan = scan_sse_for_usage(buf, format);
+    let mut input = head_scan.input;
+    let mut output = head_scan.output;
+    let mut estimated_output_chars = head_scan.estimated_output_chars;
+    let mut delta_events = head_scan.delta_events;
+
+    if let Some(tail) = tail {
+        let tail_scan = scan_sse_for_usage(tail, format);
+        // Tail events are the later ones (message_delta); let them win.
+        if tail_scan.input.is_some() {
+            input = tail_scan.input;
+        }
+        if tail_scan.output.is_some() {
+            output = tail_scan.output;
+        }
+        estimated_output_chars += tail_scan.estimated_output_chars;
+        delta_events += tail_scan.delta_events;
     }
 
     // Rough token estimate: ~3 chars per token for mixed CJK/English content (conservative)
@@ -4272,8 +4361,65 @@ mod tests {
         ));
         assert!(is_context_limit_error("context_length_exceeded"));
         assert!(is_context_limit_error("Your prompt is too long for this model."));
+        // Zhipu gateway 1213 on an oversized 9.5 MB Codex request (same body
+        // got 1261 "prompt is too long" from a sibling zhipu account).
+        assert!(is_context_limit_error(
+            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"1213\",\"message\":\"[1213][未正常接收到prompt参数。]\"}}"
+        ));
         assert!(!is_context_limit_error("Invalid API key"));
         assert!(!is_context_limit_error("Bad request: missing field model"));
+    }
+
+    #[test]
+    fn test_extract_usage_anthropic_tail_message_delta() {
+        // Zhipu/kimi put ALL real usage in the stream-tail message_delta
+        // (message_start carries input_tokens: 0 or nothing useful).
+        let head = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hel\"}}\n\n";
+        let tail = b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":45230,\"output_tokens\":12135,\"cache_read_input_tokens\":900}}\n\n";
+        let (input, output) =
+            extract_usage_from_sse_buffer(head, Some(tail), &ProviderFormat::Anthropic);
+        assert_eq!(input, Some(45230 + 900));
+        assert_eq!(output, Some(12135));
+    }
+
+    #[test]
+    fn test_extract_usage_uncapped_single_buffer() {
+        // Whole stream fits: tail=None, usage from message_delta in the one buffer.
+        let buf = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hello world\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":18,\"output_tokens\":29}}\n\n";
+        let (input, output) = extract_usage_from_sse_buffer(buf, None, &ProviderFormat::Anthropic);
+        assert_eq!(input, Some(18));
+        assert_eq!(output, Some(29));
+    }
+
+    #[test]
+    fn test_extract_usage_responses_nested_response_usage() {
+        // OpenAI Responses `response.completed` nests usage under response -
+        // top-level lookup alone never found it (deepseek /v1/responses).
+        let buf = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"usage\":{\"input_tokens\":777,\"output_tokens\":55}}}\n\n";
+        let (input, output) =
+            extract_usage_from_sse_buffer(buf, None, &ProviderFormat::OpenaiResponses);
+        assert_eq!(input, Some(777));
+        assert_eq!(output, Some(55));
+    }
+
+    #[test]
+    fn test_extract_usage_openai_chat_unchanged() {
+        let buf = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20}}\n\ndata: [DONE]\n\n";
+        let (input, output) = extract_usage_from_sse_buffer(buf, None, &ProviderFormat::Openai);
+        assert_eq!(input, Some(100));
+        assert_eq!(output, Some(20));
+    }
+
+    #[test]
+    fn test_extract_usage_truncated_boundary_line_is_tolerated() {
+        // The head's last line may be cut mid-JSON at the cap boundary; the
+        // parse failure must not poison the rest of the scan.
+        let head = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"abc\"}}\n\ndata: {\"type\":\"mess";
+        let tail = b"age_delta\"},\"usage\":{\"input_tokens\":9,\"output_tokens\":3}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":91,\"output_tokens\":33}}\n\n";
+        let (input, output) =
+            extract_usage_from_sse_buffer(head, Some(tail), &ProviderFormat::Anthropic);
+        assert_eq!(input, Some(91));
+        assert_eq!(output, Some(33));
     }
 
     #[test]
