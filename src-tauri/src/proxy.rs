@@ -584,6 +584,19 @@ fn is_unsupported_modality_error(err_body: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Detect upstream 400s that demand the assistant's reasoning be passed back
+/// (DeepSeek thinking mode: "The `reasoning_text` in the thinking mode must be
+/// passed back to the API"). Happens when the client's history carries
+/// textless reasoning items (encrypted_content / empty summary) that no
+/// conversion can reconstruct for THIS provider's format - another route
+/// (e.g. Anthropic-format thinking passthrough) may still serve the request.
+fn is_reasoning_passback_error(err_body: &str) -> bool {
+    let lower = err_body.to_lowercase();
+    lower.contains("reasoning_text") && lower.contains("passed back")
+        || lower.contains("reasoning must be passed back")
+        || lower.contains("reasoning_content") && lower.contains("passed back")
+}
+
 fn is_chat_format(format: &ProviderFormat) -> bool {
     matches!(
         format,
@@ -1349,6 +1362,18 @@ async fn handle_proxy(
                 truncate_chars(&err_body, 200)
             ));
             log::warn!("[Proxy] {} modality 400 (retryable): trying next route", tag);
+            last_error = Some(err);
+            continue;
+        }
+        // 400 "reasoning_text must be passed back" (thinking-mode models): the
+        // history's reasoning can't be reconstructed for THIS provider's
+        // format, but the request itself is well-formed - advance the chain.
+        if status_code == 400 && is_reasoning_passback_error(&err_body) {
+            let err = ProxyError::Upstream(format!(
+                "HTTP 400 reasoning passback: {}",
+                truncate_chars(&err_body, 200)
+            ));
+            log::warn!("[Proxy] {} reasoning-passback 400 (retryable): trying next route", tag);
             last_error = Some(err);
             continue;
         }
@@ -4435,6 +4460,25 @@ mod tests {
         assert!(!is_unsupported_modality_error("Invalid API key"));
         assert!(!is_unsupported_modality_error("Bad request: missing field model"));
         assert!(!is_context_limit_error("Model only support text input"));
+    }
+
+    #[test]
+    fn test_is_reasoning_passback_error_detects_variants() {
+        // DeepSeek thinking mode on a Codex history with textless reasoning items.
+        assert!(is_reasoning_passback_error(
+            "{\"error\":{\"message\":\"The `reasoning_text` in the thinking mode must be passed back to the API.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}"
+        ));
+        assert!(is_reasoning_passback_error(
+            "The reasoning_content must be passed back to the API."
+        ));
+        // Ordinary request-shape errors stay non-retryable.
+        assert!(!is_reasoning_passback_error("Invalid API key"));
+        assert!(!is_reasoning_passback_error(
+            "Model only support text input"
+        ));
+        assert!(!is_reasoning_passback_error(
+            "[1213][未正常接收到prompt参数。]"
+        ));
     }
 
     #[test]
