@@ -3657,10 +3657,10 @@ async fn handle_tts_request(
         return Err(ProxyError::Upstream("tts: no audio data received".into()));
     }
 
-    // Save to ~/.aginxbrain/audio/{id}.mp3
-    let audio_dir = match dirs::home_dir() {
-        Some(h) => h.join(".aginxbrain").join("audio"),
-        None => return Err(ProxyError::Upstream("no home directory for audio storage".into())),
+    // Save to {brain_home}/audio/{id}.mp3
+    let audio_dir = match crate::config::brain_home() {
+        Ok(h) => h.join("audio"),
+        Err(e) => return Err(ProxyError::Upstream(format!("no brain home for audio storage: {e}"))),
     };
     let _ = tokio::fs::create_dir_all(&audio_dir).await;
     let now_ms = std::time::SystemTime::now()

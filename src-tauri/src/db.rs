@@ -15,8 +15,7 @@ pub fn db_path() -> Result<PathBuf> {
             return Ok(PathBuf::from(path));
         }
     }
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-    Ok(home.join(".aginxbrain").join("aginxbrain.db"))
+    Ok(crate::config::brain_home()?.join("aginxbrain.db"))
 }
 
 /// Initialize the SQLite database: create file if missing, create pool, run migrations.

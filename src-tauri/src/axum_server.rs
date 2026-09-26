@@ -32,9 +32,9 @@ async fn serve_audio_file(Path(filename): Path<String>) -> Response {
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
         return (StatusCode::NOT_FOUND, [("content-type", "text/plain")], "Not Found".to_string()).into_response();
     }
-    let path = match dirs::home_dir() {
-        Some(h) => h.join(".aginxbrain").join("audio").join(&filename),
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, [("content-type", "text/plain")], "no home dir".to_string()).into_response(),
+    let path = match crate::config::brain_home() {
+        Ok(h) => h.join("audio").join(&filename),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, [("content-type", "text/plain")], "no brain home".to_string()).into_response(),
     };
     match tokio::fs::read(&path).await {
         Ok(bytes) => (

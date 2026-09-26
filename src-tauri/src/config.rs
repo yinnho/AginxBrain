@@ -315,6 +315,19 @@ impl Default for AppConfig {
     }
 }
 
+/// Brain's state home: config.yaml, DB, and audio files live here.
+/// Devices mount it elsewhere via AGINXBRAIN_HOME (e.g. /var/lib/aginx/aginxbrain);
+/// default ~/.aginxbrain/ stays for servers and desktops.
+pub fn brain_home() -> Result<PathBuf> {
+    if let Ok(h) = std::env::var("AGINXBRAIN_HOME") {
+        if !h.is_empty() {
+            return Ok(PathBuf::from(h));
+        }
+    }
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    Ok(home.join(".aginxbrain"))
+}
+
 pub fn config_path() -> Result<PathBuf> {
     // Allow override via AGINXBRAIN_CONFIG environment variable
     if let Ok(path) = std::env::var("AGINXBRAIN_CONFIG") {
@@ -323,8 +336,7 @@ pub fn config_path() -> Result<PathBuf> {
             return Ok(PathBuf::from(path));
         }
     }
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-    Ok(home.join(".aginxbrain").join("config.yaml"))
+    Ok(brain_home()?.join("config.yaml"))
 }
 
 /// Migrate old config format where providers carried `base_url`/`ws_url` and
@@ -651,6 +663,16 @@ pub fn spawn_config_watcher(config: Arc<RwLock<AppConfig>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_brain_home_defaults_to_dotdir() {
+        // AGINXBRAIN_HOME unset in the test environment → ~/.aginxbrain
+        if std::env::var("AGINXBRAIN_HOME").is_err() {
+            let h = brain_home().unwrap();
+            let expected = dirs::home_dir().unwrap().join(".aginxbrain");
+            assert_eq!(h, expected);
+        }
+    }
 
     #[test]
     fn test_default_config_has_sensible_values() {
