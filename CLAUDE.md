@@ -118,7 +118,7 @@ management_key: aginxbrain-local  # 管理 API 密钥
 | 端点 | 用途 |
 |------|------|
 | `POST /v1/chat/completions` | OpenAI Chat 格式代理 |
-| `POST /api/anthropic/v1/messages` | Anthropic Messages 格式代理 |
+| `POST /anthropic/v1/messages` (同 `/v1/messages`) | Anthropic Messages 格式代理 |
 | `POST /responses` | OpenAI Responses 格式代理（Codex） |
 | `GET /v1/models` | 模型列表（Codex 兼容） |
 | `GET /api/providers` | 管理：列出 providers |
