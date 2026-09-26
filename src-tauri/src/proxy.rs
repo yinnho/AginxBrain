@@ -1189,26 +1189,49 @@ async fn handle_proxy(
         inject_openai_reasoning_content(&mut fwd_body);
     }
 
-    // 4c. For Anthropic format, if the route's tag suggests reasoning/thinking
-    //     is needed (e.g. "reasoning" tag) and the request doesn't already have
-    //     a thinking config, inject one. This ensures providers like Zhipu GLM
-    //     activate thinking mode even when the client uses OpenAI Chat format
-    //     (which has no thinking field).
+    // 4c. Thinking control. An explicit client-side switch overrides the
+    //     route-tag default:
+    //     - Anthropic face: thinking.type "disabled" / "enabled" (budget_tokens)
+    //     - OpenAI chat face: reasoning_effort none/minimal → off,
+    //       low/medium/high → on (budget 4000/10000/24000); zhipu-style
+    //       thinking{type} and enable_thinking also honored
+    //     - Responses face: reasoning.effort same mapping
+    //     Without explicit intent the legacy default applies: a "reasoning"
+    //     tag on the route injects thinking with a 10000 budget — even when
+    //     the client asked for a small max_tokens (aux callers like the
+    //     aginxos mother's summary/compact calls hit this).
     if matches!(provider_format, ProviderFormat::Anthropic) {
-        let needs_thinking = route.tags.iter().any(|t| t == "reasoning")
-            || tag == "reasoning";
-        if needs_thinking && fwd_body.get("thinking").is_none() {
-            if let Some(obj) = fwd_body.as_object_mut() {
-                obj.insert("thinking".to_string(), json!({"type": "enabled", "budget_tokens": 10000}));
-                // Anthropic requires max_tokens > thinking.budget_tokens so the
-                // response has room after the thinking block. openai_to_anthropic
-                // defaults max_tokens to 4096; bump it above the budget here.
-                let budget: u64 = 10000;
-                let cur = obj.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4096);
-                if cur < budget + 6000 {
-                    obj.insert("max_tokens".to_string(), json!(budget + 6000));
+        match parse_thinking_intent(client_protocol, &body) {
+            Some(ThinkingIntent::Disabled) => {
+                if let Some(obj) = fwd_body.as_object_mut() {
+                    obj.insert("thinking".to_string(), json!({"type": "disabled"}));
                 }
             }
+            Some(ThinkingIntent::Enabled { budget_tokens }) => {
+                enable_anthropic_thinking(&mut fwd_body, budget_tokens);
+            }
+            None => {
+                let needs_thinking = route.tags.iter().any(|t| t == "reasoning")
+                    || tag == "reasoning";
+                if needs_thinking && fwd_body.get("thinking").is_none() {
+                    enable_anthropic_thinking(&mut fwd_body, 10000);
+                }
+            }
+        }
+    } else if matches!(provider_format, ProviderFormat::Openai)
+        && parse_thinking_intent(client_protocol, &body) == Some(ThinkingIntent::Disabled)
+    {
+        // Translate an explicit OFF into the zhipu/ark/moonshot-style chat
+        // switch; deepseek-style providers ignore the field. ON flows
+        // natively via reasoning_effort passthrough.
+        if let Some(obj) = fwd_body.as_object_mut() {
+            obj.insert("thinking".to_string(), json!({"type": "disabled"}));
+        }
+    } else if matches!(provider_format, ProviderFormat::OpenaiResponses)
+        && parse_thinking_intent(client_protocol, &body) == Some(ThinkingIntent::Disabled)
+    {
+        if let Some(obj) = fwd_body.as_object_mut() {
+            obj.remove("reasoning");
         }
     }
 
@@ -2723,6 +2746,73 @@ fn inject_reasoning_content(value: &mut Value) {
 /// - Any assistant message already has `reasoning_content` → thinking was
 ///   active in a prior turn, so it's still active now.
 /// - The request has `enable_thinking: true` (DeepSeek's thinking switch).
+/// Explicit client-side thinking intent, normalized across the three faces.
+/// None means the client expressed nothing — legacy route-tag defaults apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingIntent {
+    Disabled,
+    Enabled { budget_tokens: u64 },
+}
+
+fn effort_to_intent(effort: &str) -> Option<ThinkingIntent> {
+    match effort {
+        "none" | "minimal" => Some(ThinkingIntent::Disabled),
+        "low" => Some(ThinkingIntent::Enabled { budget_tokens: 4000 }),
+        "medium" => Some(ThinkingIntent::Enabled { budget_tokens: 10000 }),
+        "high" => Some(ThinkingIntent::Enabled { budget_tokens: 24000 }),
+        _ => None,
+    }
+}
+
+fn parse_anthropic_thinking_param(t: &Value) -> Option<ThinkingIntent> {
+    match t.get("type")?.as_str()? {
+        "disabled" => Some(ThinkingIntent::Disabled),
+        "enabled" => Some(ThinkingIntent::Enabled {
+            budget_tokens: t.get("budget_tokens").and_then(|v| v.as_u64()).unwrap_or(10000),
+        }),
+        _ => None,
+    }
+}
+
+/// Read thinking intent from the ORIGINAL client body (not the converted
+/// fwd_body — conversions drop the thinking param).
+fn parse_thinking_intent(client_protocol: &str, body: &Value) -> Option<ThinkingIntent> {
+    match client_protocol {
+        "anthropic" => body.get("thinking").and_then(parse_anthropic_thinking_param),
+        "openai" => body
+            .get("reasoning_effort")
+            .and_then(|v| v.as_str())
+            .and_then(effort_to_intent)
+            .or_else(|| body.get("thinking").and_then(parse_anthropic_thinking_param))
+            .or_else(|| {
+                match body.get("enable_thinking").and_then(|v| v.as_bool()) {
+                    Some(false) => Some(ThinkingIntent::Disabled),
+                    Some(true) => Some(ThinkingIntent::Enabled { budget_tokens: 10000 }),
+                    None => None,
+                }
+            }),
+        "openai_responses" => body
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(|v| v.as_str())
+            .and_then(effort_to_intent),
+        _ => None,
+    }
+}
+
+fn enable_anthropic_thinking(body: &mut Value, budget_tokens: u64) {
+    let Some(obj) = body.as_object_mut() else { return };
+    obj.insert(
+        "thinking".to_string(),
+        json!({"type": "enabled", "budget_tokens": budget_tokens}),
+    );
+    // Anthropic requires max_tokens > thinking.budget_tokens.
+    let cur = obj.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4096);
+    if cur <= budget_tokens {
+        obj.insert("max_tokens".to_string(), json!(budget_tokens + 6000));
+    }
+}
+
 fn inject_openai_reasoning_content(value: &mut Value) {
     // Detect thinking mode in two steps to satisfy the borrow checker:
     // 1. Check enable_thinking flag (immutable borrow)
@@ -5007,5 +5097,96 @@ mod tests {
         });
         inject_openai_reasoning_content(&mut body);
         assert!(body["messages"][1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn test_parse_thinking_intent_anthropic_face() {
+        assert_eq!(
+            parse_thinking_intent("anthropic", &json!({"thinking": {"type": "disabled"}})),
+            Some(ThinkingIntent::Disabled)
+        );
+        assert_eq!(
+            parse_thinking_intent(
+                "anthropic",
+                &json!({"thinking": {"type": "enabled", "budget_tokens": 2000}})
+            ),
+            Some(ThinkingIntent::Enabled { budget_tokens: 2000 })
+        );
+        // absent / unknown type / not an object → no intent
+        assert_eq!(parse_thinking_intent("anthropic", &json!({})), None);
+        assert_eq!(
+            parse_thinking_intent("anthropic", &json!({"thinking": {"type": "adaptive"}})),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_thinking_intent_openai_face() {
+        assert_eq!(
+            parse_thinking_intent("openai", &json!({"reasoning_effort": "none"})),
+            Some(ThinkingIntent::Disabled)
+        );
+        assert_eq!(
+            parse_thinking_intent("openai", &json!({"reasoning_effort": "minimal"})),
+            Some(ThinkingIntent::Disabled)
+        );
+        assert_eq!(
+            parse_thinking_intent("openai", &json!({"reasoning_effort": "high"})),
+            Some(ThinkingIntent::Enabled { budget_tokens: 24000 })
+        );
+        // unknown effort → no intent (falls through, nothing else set)
+        assert_eq!(
+            parse_thinking_intent("openai", &json!({"reasoning_effort": "xhigh"})),
+            None
+        );
+        // zhipu-style thinking param fallback
+        assert_eq!(
+            parse_thinking_intent("openai", &json!({"thinking": {"type": "disabled"}})),
+            Some(ThinkingIntent::Disabled)
+        );
+        // enable_thinking fallback
+        assert_eq!(
+            parse_thinking_intent("openai", &json!({"enable_thinking": false})),
+            Some(ThinkingIntent::Disabled)
+        );
+        assert_eq!(parse_thinking_intent("openai", &json!({})), None);
+    }
+
+    #[test]
+    fn test_parse_thinking_intent_responses_face() {
+        assert_eq!(
+            parse_thinking_intent(
+                "openai_responses",
+                &json!({"reasoning": {"effort": "none"}})
+            ),
+            Some(ThinkingIntent::Disabled)
+        );
+        assert_eq!(
+            parse_thinking_intent(
+                "openai_responses",
+                &json!({"reasoning": {"effort": "low"}})
+            ),
+            Some(ThinkingIntent::Enabled { budget_tokens: 4000 })
+        );
+        assert_eq!(parse_thinking_intent("openai_responses", &json!({})), None);
+    }
+
+    #[test]
+    fn test_enable_anthropic_thinking_bumps_only_when_needed() {
+        // max_tokens below budget → bumped above it
+        let mut b = json!({"max_tokens": 150});
+        enable_anthropic_thinking(&mut b, 10000);
+        assert_eq!(b["thinking"]["budget_tokens"], 10000);
+        assert_eq!(b["max_tokens"], 16000);
+
+        // max_tokens already above budget → respected
+        let mut b = json!({"max_tokens": 12000});
+        enable_anthropic_thinking(&mut b, 10000);
+        assert_eq!(b["max_tokens"], 12000);
+
+        // missing max_tokens → defaulted to 4096; budget above it forces a bump
+        let mut b = json!({});
+        enable_anthropic_thinking(&mut b, 5000);
+        assert_eq!(b["max_tokens"], 11000);
     }
 }
