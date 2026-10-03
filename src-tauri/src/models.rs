@@ -35,6 +35,9 @@ pub struct CallerKey {
     pub created_at: String,
     /// Plaintext token (nullable for legacy keys before 003 migration).
     pub token: Option<String>,
+    /// Default thinking tier for this key: none|low|medium|high, NULL = unset.
+    /// Precedence: request param > this > global default.
+    pub default_thinking: Option<String>,
 }
 
 /// Request to create a new caller API key.

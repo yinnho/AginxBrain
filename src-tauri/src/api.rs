@@ -212,6 +212,40 @@ pub async fn update_key(
     Ok(StatusCode::OK)
 }
 
+// PATCH /api/keys/:id/thinking — set/clear the per-key default thinking tier.
+// Precedence contract (aginxos mother, BRAIN-CODEX.md §4.5): request param >
+// per-key default > global default. This never overrides request params.
+#[derive(Debug, Deserialize)]
+pub struct SetKeyThinkingRequest {
+    /// none|low|medium|high; null/empty clears the tier.
+    pub default_thinking: Option<String>,
+}
+
+pub async fn set_key_thinking(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<SetKeyThinkingRequest>,
+) -> Result<StatusCode, ApiError> {
+    let tier = match req.default_thinking.as_deref() {
+        None | Some("") => None,
+        Some(t) => match t {
+            "none" | "low" | "medium" | "high" => Some(t),
+            _ => {
+                return Err(ApiError::Validation(
+                    "default_thinking must be none|low|medium|high or null".to_string(),
+                ))
+            }
+        },
+    };
+    let ok = db::set_caller_default_thinking(&state.db, id, tier)
+        .await
+        .map_err(ApiError::from)?;
+    if !ok {
+        return Err(ApiError::Validation("key not found".to_string()));
+    }
+    Ok(StatusCode::OK)
+}
+
 // DELETE /api/keys/:id
 pub async fn delete_key(
     State(state): State<AppState>,
@@ -1004,7 +1038,9 @@ pub enum ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        ApiError::Internal(e.to_string())
+        // {:#} joins the whole context chain so the UI/log shows the OS-level
+        // root cause, not just the outermost context ("backing up ...").
+        ApiError::Internal(format!("{e:#}"))
     }
 }
 

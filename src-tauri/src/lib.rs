@@ -86,14 +86,14 @@ struct TakeoverStateCmd {
 #[cfg(feature = "desktop")]
 #[tauri::command(rename_all = "camelCase")]
 fn takeover_claude(server: String, api_key: String) -> Result<bool, String> {
-    takeover::take_over_claude_remote(&server, &api_key).map_err(|e| e.to_string())
+    takeover::take_over_claude_remote(&server, &api_key).map_err(|e| format!("{e:#}"))
 }
 
 /// Toggle Claude Code off: restore the backed-up settings.json.
 #[cfg(feature = "desktop")]
 #[tauri::command]
 fn restore_claude() -> Result<bool, String> {
-    takeover::restore_claude().map_err(|e| e.to_string())?;
+    takeover::restore_claude().map_err(|e| format!("{e:#}"))?;
     Ok(false)
 }
 
@@ -101,14 +101,14 @@ fn restore_claude() -> Result<bool, String> {
 #[cfg(feature = "desktop")]
 #[tauri::command(rename_all = "camelCase")]
 fn takeover_codex(server: String, api_key: String) -> Result<bool, String> {
-    takeover::take_over_codex_remote(&server, &api_key).map_err(|e| e.to_string())
+    takeover::take_over_codex_remote(&server, &api_key).map_err(|e| format!("{e:#}"))
 }
 
 /// Toggle Codex off: restore the backed-up config.
 #[cfg(feature = "desktop")]
 #[tauri::command]
 fn restore_codex() -> Result<bool, String> {
-    takeover::restore_codex().map_err(|e| e.to_string())?;
+    takeover::restore_codex().map_err(|e| format!("{e:#}"))?;
     Ok(false)
 }
 

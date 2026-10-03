@@ -927,6 +927,21 @@ async fn handle_proxy(
 
     let start = std::time::Instant::now();
 
+    // Per-API-key default thinking tier (BRAIN-CODEX.md §4.5). Precedence:
+    // request param > per-key default > global default (never force) — the
+    // per-key intent is only consulted when the request expresses nothing.
+    let per_key_thinking = match caller_key_id {
+        Some(kid) => crate::db::get_caller_default_thinking(&state.db, kid)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|t| effort_to_intent(&t)),
+        None => None,
+    };
+    if per_key_thinking.is_some() {
+        log::info!("[Proxy] thinking: per-key default applies (caller={:?})", caller_key_id);
+    }
+
     // Read config and immediately drop the lock to avoid blocking admin config writes.
     // Clone the entire config — it's small (5.8KB) and avoids holding RwLockReadGuard
     // for the duration of streaming responses (which can be 30+ seconds).
@@ -1196,12 +1211,13 @@ async fn handle_proxy(
     //       low/medium/high → on (budget 4000/10000/24000); zhipu-style
     //       thinking{type} and enable_thinking also honored
     //     - Responses face: reasoning.effort same mapping
-    //     Without explicit intent the legacy default applies: a "reasoning"
+    //     Without any intent the legacy default applies: a "reasoning"
     //     tag on the route injects thinking with a 10000 budget — even when
     //     the client asked for a small max_tokens (aux callers like the
     //     aginxos mother's summary/compact calls hit this).
+    let client_thinking = parse_thinking_intent(client_protocol, &body).or(per_key_thinking);
     if matches!(provider_format, ProviderFormat::Anthropic) {
-        match parse_thinking_intent(client_protocol, &body) {
+        match client_thinking {
             Some(ThinkingIntent::Disabled) => {
                 if let Some(obj) = fwd_body.as_object_mut() {
                     obj.insert("thinking".to_string(), json!({"type": "disabled"}));
@@ -1219,7 +1235,7 @@ async fn handle_proxy(
             }
         }
     } else if matches!(provider_format, ProviderFormat::Openai)
-        && parse_thinking_intent(client_protocol, &body) == Some(ThinkingIntent::Disabled)
+        && client_thinking == Some(ThinkingIntent::Disabled)
     {
         // Translate an explicit OFF into the zhipu/ark/moonshot-style chat
         // switch; deepseek-style providers ignore the field. ON flows
@@ -1228,7 +1244,7 @@ async fn handle_proxy(
             obj.insert("thinking".to_string(), json!({"type": "disabled"}));
         }
     } else if matches!(provider_format, ProviderFormat::OpenaiResponses)
-        && parse_thinking_intent(client_protocol, &body) == Some(ThinkingIntent::Disabled)
+        && client_thinking == Some(ThinkingIntent::Disabled)
     {
         if let Some(obj) = fwd_body.as_object_mut() {
             obj.remove("reasoning");

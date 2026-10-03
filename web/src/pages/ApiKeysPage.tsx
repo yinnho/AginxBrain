@@ -47,6 +47,15 @@ export function ApiKeysPage() {
     }
   };
 
+  const setThinking = async (id: number, tier: string) => {
+    try {
+      await api.setKeyThinking(id, tier === '' ? null : tier);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to set thinking tier');
+    }
+  };
+
   const handleDelete = async (id: number) => {
     if (!confirm('Delete this API key? It cannot be undone.')) return;
     try {
@@ -142,17 +151,18 @@ export function ApiKeysPage() {
               <th style={{ textAlign: 'left', padding: '8px 0', color: 'var(--text-muted)', fontWeight: 500 }}>API Key</th>
               <th style={{ textAlign: 'left', padding: '8px 0', color: 'var(--text-muted)', fontWeight: 500 }}>Note</th>
               <th style={{ textAlign: 'left', padding: '8px 0', color: 'var(--text-muted)', fontWeight: 500 }}>Status</th>
+              <th style={{ textAlign: 'left', padding: '8px 0', color: 'var(--text-muted)', fontWeight: 500 }}>思考档</th>
               <th style={{ textAlign: 'left', padding: '8px 0', color: 'var(--text-muted)', fontWeight: 500 }}>Created</th>
               <th style={{ textAlign: 'right', padding: '8px 0', color: 'var(--text-muted)', fontWeight: 500 }}>Actions</th>
             </tr>
           </thead>
           <tbody>
             {keys.map((key) => (
-              <KeyRow key={key.id} keyData={key} onDelete={handleDelete} onToggle={toggleEnabled} />
+              <KeyRow key={key.id} keyData={key} onDelete={handleDelete} onToggle={toggleEnabled} onSetThinking={setThinking} />
             ))}
             {keys.length === 0 && (
               <tr>
-                <td colSpan={6} style={{ padding: 20, textAlign: 'center', color: 'var(--text-muted)' }}>
+                <td colSpan={7} style={{ padding: 20, textAlign: 'center', color: 'var(--text-muted)' }}>
                   No API keys yet.
                 </td>
               </tr>
@@ -185,10 +195,12 @@ function KeyRow({
   keyData,
   onDelete,
   onToggle,
+  onSetThinking,
 }: {
   keyData: api.CallerKey;
   onDelete: (id: number) => void;
   onToggle: (key: api.CallerKey) => void;
+  onSetThinking: (id: number, tier: string) => void;
 }) {
   const [revealed, setRevealed] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -253,6 +265,24 @@ function KeyRow({
         >
           {keyData.enabled ? 'Active' : 'Disabled'}
         </button>
+      </td>
+      <td style={{ padding: '10px 0' }} title="仅对未带思考参数的请求生效；请求参数 > 此档 > 全局默认">
+        <select
+          value={keyData.default_thinking ?? ''}
+          onChange={(e) => onSetThinking(keyData.id, e.target.value)}
+          style={{
+            padding: '4px 8px', fontSize: 12,
+            border: '1px solid var(--border)', borderRadius: 6,
+            background: 'var(--bg-primary)', color: 'var(--text-primary)',
+            cursor: 'pointer',
+          }}
+        >
+          <option value="">默认</option>
+          <option value="none">关 (none)</option>
+          <option value="low">低 (low)</option>
+          <option value="medium">中 (medium)</option>
+          <option value="high">高 (high)</option>
+        </select>
       </td>
       <td style={{ padding: '10px 0', color: 'var(--text-muted)', fontSize: 12 }}>{keyData.created_at.slice(0, 10)}</td>
       <td style={{ padding: '10px 0', textAlign: 'right' }}>

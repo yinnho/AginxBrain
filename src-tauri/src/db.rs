@@ -114,8 +114,8 @@ fn hash_token(token: &str) -> String {
 }
 
 pub async fn list_caller_keys(pool: &SqlitePool) -> Result<Vec<CallerKey>> {
-    let rows: Vec<(i64, String, String, i64, String)> = sqlx::query_as(
-        "SELECT id, name, note, enabled, created_at FROM caller_keys ORDER BY created_at DESC",
+    let rows: Vec<(i64, String, String, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, name, note, enabled, created_at, default_thinking FROM caller_keys ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await
@@ -123,15 +123,48 @@ pub async fn list_caller_keys(pool: &SqlitePool) -> Result<Vec<CallerKey>> {
 
     Ok(rows
         .into_iter()
-        .map(|(id, name, note, enabled, created_at)| CallerKey {
+        .map(|(id, name, note, enabled, created_at, default_thinking)| CallerKey {
             id,
             name,
             note,
             enabled: enabled != 0,
             created_at,
             token: None,
+            default_thinking,
         })
         .collect())
+}
+
+/// Thinking tier configured on a caller key (none|low|medium|high), if any.
+pub async fn get_caller_default_thinking(
+    pool: &SqlitePool,
+    id: i64,
+) -> Result<Option<String>> {
+    let tier: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT default_thinking FROM caller_keys WHERE id = ?1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("fetching caller key thinking tier")?;
+    Ok(tier.flatten())
+}
+
+/// Set (or clear with NULL) a caller key's default thinking tier.
+pub async fn set_caller_default_thinking(
+    pool: &SqlitePool,
+    id: i64,
+    tier: Option<&str>,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE caller_keys SET default_thinking = ?1 WHERE id = ?2",
+    )
+    .bind(tier)
+    .bind(id)
+    .execute(pool)
+    .await
+    .context("updating caller key thinking tier")?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn create_caller_key(

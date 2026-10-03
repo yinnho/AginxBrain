@@ -92,6 +92,9 @@ export interface CallerKey {
   enabled: boolean;
   created_at: string;
   token?: string | null;
+  /** Default thinking tier: none|low|medium|high; null = unset (global default).
+   *  Precedence: request param > per-key default > global default. */
+  default_thinking?: string | null;
 }
 
 export interface CreateCallerKeyResponse extends CallerKey {
@@ -228,6 +231,16 @@ export async function deleteKey(id: number): Promise<void> {
   const res = await fetch(`${API_BASE}/keys/${id}`, {
     method: 'DELETE',
     credentials: 'include',
+  });
+  await checkOk(res);
+}
+
+export async function setKeyThinking(id: number, tier: string | null): Promise<void> {
+  const res = await fetch(`${API_BASE}/keys/${id}/thinking`, {
+    method: 'PATCH',
+    headers: jsonHeaders(),
+    credentials: 'include',
+    body: JSON.stringify({ default_thinking: tier }),
   });
   await checkOk(res);
 }

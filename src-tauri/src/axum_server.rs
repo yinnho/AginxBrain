@@ -125,6 +125,10 @@ pub async fn start(state: AppState) -> (String, u16) {
         .route("/keys", axum::routing::get(crate::api::list_keys))
         .route("/keys", axum::routing::post(crate::api::create_key))
         .route("/keys/{id}", axum::routing::put(crate::api::update_key))
+        .route(
+            "/keys/{id}/thinking",
+            axum::routing::patch(crate::api::set_key_thinking),
+        )
         .route("/keys/{id}", axum::routing::delete(crate::api::delete_key))
         .route("/cost-rates", axum::routing::get(crate::api::list_cost_rates))
         .route("/cost-rates", axum::routing::post(crate::api::set_cost_rate))
