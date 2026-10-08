@@ -1,5 +1,6 @@
 use crate::config::{AppState, AppConfig, CircuitState, CircuitStatus, Provider, ProviderFormat, Route};
 use crate::convert;
+use crate::failure_class::{self, FailoverAction, FailureClass};
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -28,6 +29,18 @@ const HEALTH_CHECK_TIMEOUT: u64 = 30;
 // instead of jumping to a different provider via cross-route failover.
 const SAME_ROUTE_RETRIES: u32 = 2;
 const SAME_ROUTE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+// First-chunk (TTFT) deadline for streaming responses on NON-LAST candidates
+// only: a provider that accepts the request then goes silent hands off to the
+// next candidate instead of hanging until STREAM_TIMEOUT. The last candidate
+// always runs to an answer. All major protocols emit a session/meta event
+// immediately (message_start / response.created / role delta), so a generous
+// 45s bound never cuts a legitimately-thinking model.
+const FIRST_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+// Streaming idle watchdog: reset on every upstream chunk. True silence (no
+// bytes at all, not even thinking deltas — providers stream their reasoning)
+// for this long means a dead connection: terminate the stream instead of
+// hanging the client until STREAM_TIMEOUT.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 // Circuit breaker: after consecutive failures on a route, stop trying it for
 // a cooldown period, then probe once (half-open). Prevents hammering a dead
 // provider on every new request.
@@ -349,6 +362,81 @@ fn is_retryable(err: &ProxyError) -> bool {
     matches!(err, ProxyError::Upstream(_))
 }
 
+/// Backoff before same-route retry #`attempt` (1-based): 300ms, 600ms, capped
+/// at 2s — transient hiccups clear instantly, so the delays stay short.
+fn same_route_backoff(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(3);
+    std::cmp::min(
+        SAME_ROUTE_DELAY * (1u32 << shift),
+        std::time::Duration::from_millis(2000),
+    )
+}
+
+/// Send the upstream request, retrying the SAME route on transient failures
+/// (network errors and 5xx) with short backoff — these are usually instant
+/// hiccups, and keeping the same model beats jumping providers. Rate-limit /
+/// credential / quota failures are NOT retried here: another attempt on the
+/// same key can't clear them, so the caller's class-aware failover handles
+/// those (docs/BIFROST-STUDY.md §2).
+async fn send_with_same_route_retries(
+    builder: reqwest::RequestBuilder,
+    clone: &Option<reqwest::RequestBuilder>,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Response, ProxyError> {
+    let mut resp = match builder.timeout(timeout).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // Network-level failure (connect error, TLS, timeout): same-route
+            // retries before giving the route up.
+            let mut last_err = e.to_string();
+            for attempt in 1..=SAME_ROUTE_RETRIES {
+                let Some(base) = clone.as_ref() else { break };
+                log::warn!(
+                    "[Proxy] send failed, same-route retry #{}: {}",
+                    attempt,
+                    last_err
+                );
+                tokio::time::sleep(same_route_backoff(attempt)).await;
+                match base.try_clone() {
+                    Some(c) => match c.timeout(timeout).send().await {
+                        Ok(r) => return Ok(r),
+                        Err(e2) => last_err = e2.to_string(),
+                    },
+                    None => break,
+                }
+            }
+            return Err(ProxyError::Upstream(last_err));
+        }
+    };
+
+    // Upstream 5xx — retry the same route a couple of times before handing
+    // the (still-failing) response back for cross-route classification.
+    let mut attempt = 0;
+    while resp.status().as_u16() >= 500 && attempt < SAME_ROUTE_RETRIES {
+        let Some(base) = clone.as_ref() else { break };
+        attempt += 1;
+        log::warn!(
+            "[Proxy] upstream {}, same-route retry #{}",
+            resp.status(),
+            attempt
+        );
+        tokio::time::sleep(same_route_backoff(attempt)).await;
+        match base.try_clone() {
+            Some(c) => match c.timeout(timeout).send().await {
+                Ok(r) => resp = r,
+                Err(e) => {
+                    // Network error mid-retry: keep the 5xx response in hand —
+                    // the caller classifies it Transient and fails over.
+                    log::warn!("[Proxy] same-route retry #{} send failed: {}", attempt, e);
+                    break;
+                }
+            },
+            None => break,
+        }
+    }
+    Ok(resp)
+}
+
 async fn check_and_transition_circuit(
     route_id: &str,
     circuits: &Arc<RwLock<std::collections::HashMap<String, CircuitState>>>,
@@ -536,65 +624,6 @@ fn extract_xml_tool_uses(resp: &mut Value) {
         }
     }
     *content = new_content;
-}
-
-/// Detect upstream error bodies that signal the request exceeded the provider's
-/// context window / token limit. These are per-route limits (not malformed
-/// requests), so failover to another route with a larger window may succeed.
-fn is_context_limit_error(err_body: &str) -> bool {
-    let lower = err_body.to_lowercase();
-    const MARKERS: &[&str] = &[
-        "context length",
-        "context window",
-        "maximum context",
-        "context_length_exceeded",
-        "token limit",
-        "tokens limit",
-        "maximum number of tokens",
-        "too many tokens",
-        "prompt is too long",
-        "request too large",
-        // Zhipu gateway variant of "too big": on a 9.5 MB request zhipu-v3
-        // reported 1261 "prompt is too long" while a sibling zhipu account
-        // reported 1213 below for the same body - the gateway failing to take
-        // the payload, not a malformed request.
-        "未正常接收到prompt参数",
-    ];
-    MARKERS.iter().any(|m| lower.contains(m))
-}
-
-/// Detect upstream error bodies that signal the request's modality exceeds
-/// the provider's capability - e.g. a vision request landing on a text-only
-/// model (Ark coding glm-5.3 returns 400 "Model only support text input").
-/// The request is well-formed; this route just lacks the capability, so a
-/// multimodal-capable route further down the chain may still serve it.
-fn is_unsupported_modality_error(err_body: &str) -> bool {
-    let lower = err_body.to_lowercase();
-    const MARKERS: &[&str] = &[
-        "only support text",
-        "only supports text",
-        "not support image",
-        "doesn't support image",
-        "does not support image",
-        "image input",
-        "multimodal input",
-        "not support audio",
-        "not support video",
-    ];
-    MARKERS.iter().any(|m| lower.contains(m))
-}
-
-/// Detect upstream 400s that demand the assistant's reasoning be passed back
-/// (DeepSeek thinking mode: "The `reasoning_text` in the thinking mode must be
-/// passed back to the API"). Happens when the client's history carries
-/// textless reasoning items (encrypted_content / empty summary) that no
-/// conversion can reconstruct for THIS provider's format - another route
-/// (e.g. Anthropic-format thinking passthrough) may still serve the request.
-fn is_reasoning_passback_error(err_body: &str) -> bool {
-    let lower = err_body.to_lowercase();
-    lower.contains("reasoning_text") && lower.contains("passed back")
-        || lower.contains("reasoning must be passed back")
-        || lower.contains("reasoning_content") && lower.contains("passed back")
 }
 
 fn is_chat_format(format: &ProviderFormat) -> bool {
@@ -1004,7 +1033,7 @@ async fn handle_proxy(
     // Track how many candidates failed due to rate-limiting (429).
     let mut rate_limited_count: u32 = 0;
 
-    for (attempt, (_route_idx, route)) in candidates.iter().enumerate() {
+    'candidates: for (attempt, (_route_idx, route)) in candidates.iter().enumerate() {
         if attempt > 0 {
             log::warn!("[Proxy] {} failover: trying route #{} (provider={}, model={})",
                 tag, attempt + 1, route.provider, route.model);
@@ -1327,24 +1356,21 @@ async fn handle_proxy(
     );
 
     // 7. Send. Keep a clone AFTER setting the body so same-route retry
-    //    re-sends the full request (not an empty body).
+    //    re-sends the full request (not an empty body). Transient failures
+    //    (5xx / network) are retried on the SAME route with backoff inside
+    //    send_with_same_route_retries; everything else is classified below.
     let json_builder = req_builder.json(&fwd_body);
     let req_clone = json_builder.try_clone();
-    let resp = match json_builder
-        .timeout(req_timeout)
-        .send()
-        .await
-    {
+    let resp = match send_with_same_route_retries(json_builder, &req_clone, req_timeout).await {
         Ok(r) => r,
-        Err(e) => {
-            let err = ProxyError::Upstream(e.to_string());
-            if is_retryable(&err) {
-                log::warn!("[Proxy] {} timeout/connection error (retryable): {}", if is_streaming { "streaming" } else { "non-streaming" }, err);
-                record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
-                last_error = Some(err);
-                continue;
-            }
-            return Err(err);
+        Err(err) => {
+            // Network-level failure survived same-route retries — transient by
+            // definition. Try the next candidate.
+            log::warn!("[Proxy] {} timeout/connection error after same-route retries: {}",
+                if is_streaming { "streaming" } else { "non-streaming" }, err);
+            record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
+            last_error = Some(err);
+            continue;
         }
     };
 
@@ -1364,63 +1390,153 @@ async fn handle_proxy(
             status.canonical_reason().unwrap_or("?"),
             truncate_chars(&err_body, 300)
         );
-        // 5xx server errors, 429 (rate limit), and 401/403 (auth / quota) →
-        // retryable, try next candidate. 401/403 are account-level failures on
-        // THIS provider (invalid key, or usage limit for the billing cycle —
-        // e.g. Kimi returns 403 "reached your usage limit"), not a malformed
-        // request: another provider in the chain may still serve it.
-        if status_code >= 500 || status_code == 429 || status_code == 401 || status_code == 403 {
-            if status_code == 429 || status_code == 403 { rate_limited_count += 1; }
-            let err = ProxyError::Upstream(format!("HTTP {}: {}",
-                status_code, truncate_chars(&err_body, 200)));
-            log::warn!("[Proxy] upstream {} (retryable): {}", status_code, err);
-            record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
-            last_error = Some(err);
-            continue;
+        // Classify first (structured code/type → message phrases → bare
+        // status), then act on the class — see docs/BIFROST-STUDY.md §1-2.
+        let class = failure_class::classify_upstream_failure(Some(status_code), &err_body);
+        match class.failover_action() {
+            FailoverAction::NextRoute { backoff } => {
+                if matches!(class, FailureClass::RateLimit | FailureClass::Quota) {
+                    rate_limited_count += 1;
+                }
+                let err = ProxyError::Upstream(format!("HTTP {}: {}",
+                    status_code, truncate_chars(&err_body, 200)));
+                log::warn!("[Proxy] upstream {} classified {:?} (retryable): trying next route",
+                    status_code, class);
+                // Request-shaped failures (context limit, modality gap) say
+                // nothing about route health and must not trip the circuit.
+                if class.counts_against_route_health() {
+                    record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
+                }
+                if let Some(delay) = backoff {
+                    tokio::time::sleep(delay).await;
+                }
+                last_error = Some(err);
+                continue;
+            }
+            FailoverAction::ReturnToClient => {
+                // 4xx client errors → non-retryable, return immediately. Still log usage
+                // so the dashboard surfaces auth failures, rate limits, and bad requests.
+                let axum_status =
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+                let _ = crate::db::insert_usage_log(
+                    &state.db,
+                    crate::db::UsageInsert {
+                        caller_key_id,
+                        tag: tag.clone(),
+                        provider: provider.name.clone(),
+                        model: route.model.clone(),
+                        request_model: request_model.clone(),
+                        modality: format!("{:?}", route.format),
+                        input_tokens: None,
+                        output_tokens: None,
+                        latency_ms: start.elapsed().as_millis() as i64,
+                        status: "error".to_string(),
+                        error_message: Some(format!(
+                            "HTTP {}: {}",
+                            status_code,
+                            truncate_chars(&err_body, 200)
+                        )),
+                    },
+                )
+                .await;
+                return Ok((
+                    axum_status,
+                    [("content-type", "application/json")],
+                    err_body,
+                )
+                    .into_response());
+            }
         }
-        // 400 "context length / token limit exceeded" is a per-route limit, not a
-        // malformed request — a different route may have a higher context window.
-        // Retry on the next candidate so an oversized request isn't hard-failed
-        // just because the first route's limit is smaller.
-        if status_code == 400 && is_context_limit_error(&err_body) {
-            let err = ProxyError::Upstream(format!(
-                "HTTP 400 context limit: {}",
-                truncate_chars(&err_body, 200)
-            ));
-            log::warn!("[Proxy] {} context-limit 400 (retryable): trying next route", tag);
-            last_error = Some(err);
-            continue;
+    }
+
+    // 8. Convert response if needed
+    if is_streaming {
+        // ── Commit gate: validate the first SSE event before forwarding ──
+        // Once the streaming response is returned the request is committed —
+        // no failover is possible. Inspect the head of the stream first:
+        //   * TTFT deadline (non-last candidates only): a provider that
+        //     accepts the request then goes silent hands off to the next
+        //     candidate instead of hanging until STREAM_TIMEOUT. The last
+        //     candidate always runs to an answer.
+        //   * In-band error scan: some providers (zhipu, kimi) return HTTP
+        //     200 and then emit an error event as the first SSE frame. A
+        //     detected error still failovers — a 200 + error event is never
+        //     the client's fault.
+        let is_last_candidate = attempt + 1 == candidates.len();
+        let mut upstream = Box::pin(resp.bytes_stream());
+        let mut prefix: Vec<Result<bytes::Bytes, reqwest::Error>> = Vec::new();
+        let mut event_buf: Vec<u8> = Vec::new();
+        const MAX_FIRST_EVENT_SCAN: usize = 16 * 1024;
+
+        let mut validated = false;
+        while !validated {
+            let next = if is_last_candidate {
+                upstream.next().await
+            } else {
+                match tokio::time::timeout(FIRST_CHUNK_TIMEOUT, upstream.next()).await {
+                    Ok(item) => item,
+                    Err(_) => {
+                        let err = ProxyError::Upstream(format!(
+                            "first chunk timeout after {}s (TTFT deadline)",
+                            FIRST_CHUNK_TIMEOUT.as_secs()
+                        ));
+                        log::warn!("[Proxy] {} — failing over to next candidate", err);
+                        record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
+                        last_error = Some(err);
+                        continue 'candidates;
+                    }
+                }
+            };
+            let item = match next {
+                Some(i) => i,
+                None => {
+                    // Upstream closed before a complete first event — broken
+                    // response, not an empty answer.
+                    let err = ProxyError::Upstream(
+                        "upstream closed stream before first event".to_string(),
+                    );
+                    log::warn!("[Proxy] {} — failing over to next candidate", err);
+                    record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
+                    last_error = Some(err);
+                    continue 'candidates;
+                }
+            };
+            let bytes = match item {
+                Ok(b) => b,
+                Err(e) => {
+                    let err =
+                        ProxyError::Upstream(format!("stream error before first event: {}", e));
+                    log::warn!("[Proxy] {} — failing over to next candidate", err);
+                    record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
+                    last_error = Some(err);
+                    continue 'candidates;
+                }
+            };
+            event_buf.extend_from_slice(&bytes);
+            let complete = event_buf.windows(2).any(|w| w == b"\n\n")
+                || event_buf.windows(4).any(|w| w == b"\r\n\r\n")
+                || event_buf.len() >= MAX_FIRST_EVENT_SCAN;
+            prefix.push(Ok(bytes));
+            if complete {
+                if let Some(err_detail) = failure_class::scan_sse_event_error(&event_buf) {
+                    // HTTP 200 + error event: provider-level failure. Always
+                    // fail over — even for classes that would normally return
+                    // to the client, the request was accepted.
+                    let err = ProxyError::Upstream(format!(
+                        "in-stream error: {}",
+                        truncate_chars(&err_detail, 200)
+                    ));
+                    log::warn!("[Proxy] {} — failing over to next candidate", err);
+                    record_circuit_failure(&route.id, &err, &state.circuit_breaker).await;
+                    last_error = Some(err);
+                    continue 'candidates;
+                }
+                validated = true;
+            }
         }
-        // 400 "model only supports text input" (and friends) is a capability
-        // gap on THIS route (text-only model given an image-bearing request),
-        // not a malformed request - fail over so a multimodal-capable route
-        // can serve it instead of hard-failing the request.
-        if status_code == 400 && is_unsupported_modality_error(&err_body) {
-            let err = ProxyError::Upstream(format!(
-                "HTTP 400 unsupported modality: {}",
-                truncate_chars(&err_body, 200)
-            ));
-            log::warn!("[Proxy] {} modality 400 (retryable): trying next route", tag);
-            last_error = Some(err);
-            continue;
-        }
-        // 400 "reasoning_text must be passed back" (thinking-mode models): the
-        // history's reasoning can't be reconstructed for THIS provider's
-        // format, but the request itself is well-formed - advance the chain.
-        if status_code == 400 && is_reasoning_passback_error(&err_body) {
-            let err = ProxyError::Upstream(format!(
-                "HTTP 400 reasoning passback: {}",
-                truncate_chars(&err_body, 200)
-            ));
-            log::warn!("[Proxy] {} reasoning-passback 400 (retryable): trying next route", tag);
-            last_error = Some(err);
-            continue;
-        }
-        // 4xx client errors → non-retryable, return immediately. Still log usage
-        // so the dashboard surfaces auth failures, rate limits, and bad requests.
-        let axum_status =
-            StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
-        let _ = crate::db::insert_usage_log(
+
+        // First event is clean — NOW commit: record usage, close the circuit.
+        let usage_log_id = crate::db::insert_usage_log(
             &state.db,
             crate::db::UsageInsert {
                 caller_key_id,
@@ -1432,53 +1548,29 @@ async fn handle_proxy(
                 input_tokens: None,
                 output_tokens: None,
                 latency_ms: start.elapsed().as_millis() as i64,
-                status: "error".to_string(),
-                error_message: Some(format!(
-                    "HTTP {}: {}",
-                    status_code,
-                    truncate_chars(&err_body, 200)
-                )),
+                status: "success".to_string(),
+                error_message: None,
             },
         )
-        .await;
-        return Ok((
-            axum_status,
-            [("content-type", "application/json")],
-            err_body,
-        )
-            .into_response());
-    }
+        .await
+        .ok();
 
-    // Record successful request log (placeholder; tokens updated for non-streaming)
-    let usage_log_id = crate::db::insert_usage_log(
-        &state.db,
-        crate::db::UsageInsert {
-            caller_key_id,
-            tag: tag.clone(),
-            provider: provider.name.clone(),
-            model: route.model.clone(),
-            request_model: request_model.clone(),
-            modality: format!("{:?}", route.format),
-            input_tokens: None,
-            output_tokens: None,
-            latency_ms: start.elapsed().as_millis() as i64,
-            status: "success".to_string(),
-            error_message: None,
-        },
-    )
-    .await
-    .ok();
+        close_circuit(&route.id, &state.circuit_breaker).await;
 
-    // Close the circuit on success — the route is healthy.
-    close_circuit(&route.id, &state.circuit_breaker).await;
-
-    // 8. Convert response if needed
-    if is_streaming {
         // ── Drain upstream in background to capture full usage even if client disconnects ──
         // The upstream response must be fully consumed so the usage tee sees the
         // message_delta event (which contains the final token counts). Without this,
         // a client disconnect causes Axum to drop the response body, which stops the
         // stream converter from polling upstream, and the tee misses the tail of the SSE.
+        // The validated prefix is chained in front so the converters and the usage
+        // tee see the exact byte stream the provider sent.
+        let chained: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>,
+        > = if prefix.is_empty() {
+            upstream
+        } else {
+            Box::pin(futures::stream::iter(prefix).chain(upstream))
+        };
         let (drain_tx, drain_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
         let db = state.db.clone();
@@ -1488,7 +1580,7 @@ async fn handle_proxy(
             let db_c = db.clone();
             let log_id_c = log_id;
             let usage_format_c = usage_format.clone();
-            let upstream = resp.bytes_stream();
+            let mut upstream = chained;
             tokio::spawn(async move {
                 // Usage events sit at the two ends of the stream (Anthropic
                 // message_start at the head, final message_delta at the tail),
@@ -1500,8 +1592,26 @@ async fn handle_proxy(
                 let mut head: Vec<u8> = Vec::new();
                 let mut tail: Vec<u8> = Vec::new();
                 let mut capped = false;
-                let mut upstream = Box::pin(upstream);
-                while let Some(result) = upstream.next().await {
+                loop {
+                    // Idle watchdog (docs/BIFROST-STUDY.md §4): reset on every
+                    // chunk. Thinking models stream their reasoning, so true
+                    // byte-silence means a dead connection — terminate the
+                    // stream instead of hanging until STREAM_TIMEOUT.
+                    let item = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, upstream.next()).await {
+                        Ok(item) => item,
+                        Err(_) => {
+                            log::warn!(
+                                "[Proxy] upstream stream idle for {}s — terminating stream (log_id={:?})",
+                                STREAM_IDLE_TIMEOUT.as_secs(), log_id_c
+                            );
+                            let _ = drain_tx.send(Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "upstream stream idle timeout",
+                            )));
+                            break;
+                        }
+                    };
+                    let Some(result) = item else { break };
                     if let Ok(ref bytes) = result {
                         if !capped {
                             if head.len() + bytes.len() <= MAX_USAGE_HEAD {
@@ -1699,7 +1809,30 @@ async fn handle_proxy(
             }
         }
     } else {
-        // Non-streaming
+        // Non-streaming: success is already committed (the full body arrived
+        // with a 2xx), so record usage and close the circuit up front.
+        let usage_log_id = crate::db::insert_usage_log(
+            &state.db,
+            crate::db::UsageInsert {
+                caller_key_id,
+                tag: tag.clone(),
+                provider: provider.name.clone(),
+                model: route.model.clone(),
+                request_model: request_model.clone(),
+                modality: format!("{:?}", route.format),
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: start.elapsed().as_millis() as i64,
+                status: "success".to_string(),
+                error_message: None,
+            },
+        )
+        .await
+        .ok();
+
+        // Close the circuit on success — the route is healthy.
+        close_circuit(&route.id, &state.circuit_breaker).await;
+
         let status_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK);
         log::info!("[Proxy] non-streaming response received: status={} latency={}ms", status.as_u16(), start.elapsed().as_millis());
         let resp_body = match resp.bytes().await {
@@ -4483,25 +4616,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_context_limit_error_detects_variants() {
-        assert!(is_context_limit_error(
-            "Error code: 400 - {'error': {'message': 'input token limit is 202752'}}"
-        ));
-        assert!(is_context_limit_error(
-            "This model's maximum context length is 8192 tokens."
-        ));
-        assert!(is_context_limit_error("context_length_exceeded"));
-        assert!(is_context_limit_error("Your prompt is too long for this model."));
-        // Zhipu gateway 1213 on an oversized 9.5 MB Codex request (same body
-        // got 1261 "prompt is too long" from a sibling zhipu account).
-        assert!(is_context_limit_error(
-            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"1213\",\"message\":\"[1213][未正常接收到prompt参数。]\"}}"
-        ));
-        assert!(!is_context_limit_error("Invalid API key"));
-        assert!(!is_context_limit_error("Bad request: missing field model"));
-    }
-
-    #[test]
     fn test_extract_usage_anthropic_tail_message_delta() {
         // Zhipu/kimi put ALL real usage in the stream-tail message_delta
         // (message_start carries input_tokens: 0 or nothing useful).
@@ -4551,40 +4665,6 @@ mod tests {
             extract_usage_from_sse_buffer(head, Some(tail), &ProviderFormat::Anthropic);
         assert_eq!(input, Some(91));
         assert_eq!(output, Some(33));
-    }
-
-    #[test]
-    fn test_is_unsupported_modality_error_detects_variants() {
-        // Ark coding glm-5.3 on an image-bearing request.
-        assert!(is_unsupported_modality_error(
-            "{\"error\":{\"code\":\"InvalidParameter\",\"message\":\"Model only support text input Request id: 0217...\"}}"
-        ));
-        assert!(is_unsupported_modality_error("This model does not support image input"));
-        assert!(is_unsupported_modality_error("Image input is not enabled for this model"));
-        assert!(is_unsupported_modality_error("multimodal input not supported"));
-        // Text-only 400s that are request-shape or auth problems stay put.
-        assert!(!is_unsupported_modality_error("Invalid API key"));
-        assert!(!is_unsupported_modality_error("Bad request: missing field model"));
-        assert!(!is_context_limit_error("Model only support text input"));
-    }
-
-    #[test]
-    fn test_is_reasoning_passback_error_detects_variants() {
-        // DeepSeek thinking mode on a Codex history with textless reasoning items.
-        assert!(is_reasoning_passback_error(
-            "{\"error\":{\"message\":\"The `reasoning_text` in the thinking mode must be passed back to the API.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}"
-        ));
-        assert!(is_reasoning_passback_error(
-            "The reasoning_content must be passed back to the API."
-        ));
-        // Ordinary request-shape errors stay non-retryable.
-        assert!(!is_reasoning_passback_error("Invalid API key"));
-        assert!(!is_reasoning_passback_error(
-            "Model only support text input"
-        ));
-        assert!(!is_reasoning_passback_error(
-            "[1213][未正常接收到prompt参数。]"
-        ));
     }
 
     #[test]

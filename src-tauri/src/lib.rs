@@ -4,6 +4,7 @@ mod config;
 mod convert;
 mod dashscope_ws;
 mod db;
+mod failure_class;
 mod models;
 mod proxy;
 mod smart_routing;
