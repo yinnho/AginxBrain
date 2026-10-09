@@ -151,16 +151,19 @@ pub fn classify_upstream_failure(status: Option<u16>, err_body: &str) -> Failure
     // DeepSeek 402 "Insufficient Balance", ark "Quota exceeded" — the key is
     // alive, the wallet isn't.
     const QUOTA: &[&str] = &[
-        "insufficient_quota",
+        // Generic marker: catches OpenAI insufficient_quota, ark "Quota
+        // exceeded", and DeepSeek's camel-case "AccountQuotaExceeded" code.
+        "quota",
         "insufficient balance",
         "balance is insufficient",
         "arrearage",
         "usage limit",
-        "exceeded your current quota",
-        "quota exceeded",
-        "subscription quota",
         "spend limit",
         "credit balance",
+        // zhipu 1310: weekly/monthly cap that resets hours later, but the
+        // error carries type=rate_limit_error — the phrase must beat that
+        // wording so we skip the pointless 300ms backoff.
+        "使用上限",
         "欠费",
         "余额不足",
     ];
@@ -244,6 +247,11 @@ pub fn is_context_limit_error(err_body: &str) -> bool {
         // reported 1213 below for the same body - the gateway failing to take
         // the payload, not a malformed request.
         "未正常接收到prompt参数",
+        // Zhipu wire-size cap: bodies over 16 MiB get 400 "total message size
+        // 18354196 exceeds limit 16777216" - same family as 1261 (this route
+        // can't carry the request), another provider may.
+        "total message size",
+        "message size exceeds",
     ];
     MARKERS.iter().any(|m| lower.contains(m))
 }
@@ -359,6 +367,50 @@ mod tests {
             ),
             FailureClass::Quota
         );
+    }
+
+    #[test]
+    fn test_quota_phrases_beat_rate_type() {
+        // zhipu 1310 (2026-10-09 prod): weekly/monthly cap phrased with
+        // type=rate_limit_error at 429. The cap resets hours later, so a
+        // backoff is pointless — Quota must beat both the wording and the
+        // bare status.
+        assert_eq!(
+            classify_upstream_failure(
+                Some(429),
+                r#"{"type":"error","error":{"type":"rate_limit_error","code":"1310","message":"[1310][您已达到每周/每月使用上限，您的限额将在 2026-10-09 19:57:22 重置。][202610091651527bb47b758ae74196]"},"request_id":"202610091651527bb47b758ae74196"}"#
+            ),
+            FailureClass::Quota
+        );
+        // DeepSeek's monthly cap arrives as 429 with a camel-case code.
+        assert_eq!(
+            classify_upstream_failure(
+                Some(429),
+                r#"{"error":{"code":"AccountQuotaExceeded","message":"You have exceeded the monthly usage quota. It will reset at 2026-10-10 23:59:59 +0800 CST. We recommend upgrading your plan for more quota, or waiting for the reset.","param":"","type":""}"#
+            ),
+            FailureClass::Quota
+        );
+        // A plain per-minute rate error without quota wording stays RateLimit.
+        assert_eq!(
+            classify_upstream_failure(Some(429), r#"{"error":{"message":"Rate limit exceeded: 3000 requests per minute"}}"#),
+            FailureClass::RateLimit
+        );
+    }
+
+    #[test]
+    fn test_wire_size_limit_is_model_access() {
+        // zhipu rejects >16 MiB bodies with 400 "total message size ... exceeds
+        // limit" — same family as 1261 "prompt is too long": this route can't
+        // carry the request, another provider with a higher cap might.
+        assert_eq!(
+            classify_upstream_failure(
+                Some(400),
+                r#"{"error":{"type":"invalid_request_error","message":"total message size 18354196 exceeds limit 16777216"},"type":"error"}"#
+            ),
+            FailureClass::ModelAccess
+        );
+        // And it must not trip the circuit breaker (request-shaped).
+        assert!(!FailureClass::ModelAccess.counts_against_route_health());
     }
 
     #[test]
