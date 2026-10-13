@@ -31,6 +31,8 @@ pub fn run_desktop() {
             restore_claude,
             takeover_codex,
             restore_codex,
+            takeover_claude_desktop,
+            restore_claude_desktop,
             get_takeover_state,
         ])
         .setup(move |app| {
@@ -81,6 +83,7 @@ pub fn run_desktop() {
 struct TakeoverStateCmd {
     claude: bool,
     codex: bool,
+    claude_desktop: bool,
 }
 
 /// Toggle Claude Code on: write ~/.claude/settings.json to route through `server`.
@@ -113,6 +116,23 @@ fn restore_codex() -> Result<bool, String> {
     Ok(false)
 }
 
+/// Toggle Claude Desktop (the app's Code tab) on: write its third-party
+/// inference config to route through `server`. Takes effect at next app
+/// launch — restart the Claude app if it's running.
+#[cfg(feature = "desktop")]
+#[tauri::command(rename_all = "camelCase")]
+fn takeover_claude_desktop(server: String, api_key: String) -> Result<bool, String> {
+    takeover::take_over_claude_desktop_remote(&server, &api_key).map_err(|e| format!("{e:#}"))
+}
+
+/// Toggle Claude Desktop off: restore the backed-up 3p config.
+#[cfg(feature = "desktop")]
+#[tauri::command]
+fn restore_claude_desktop() -> Result<bool, String> {
+    takeover::restore_claude_desktop_remote().map_err(|e| format!("{e:#}"))?;
+    Ok(false)
+}
+
 /// Return current takeover state by inspecting the local config files.
 #[cfg(feature = "desktop")]
 #[tauri::command]
@@ -120,6 +140,7 @@ fn get_takeover_state() -> TakeoverStateCmd {
     TakeoverStateCmd {
         claude: takeover::check_claude_remote_active(),
         codex: takeover::check_codex_remote_active(),
+        claude_desktop: takeover::check_claude_desktop_remote_active(),
     }
 }
 

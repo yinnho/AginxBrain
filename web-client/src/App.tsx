@@ -14,6 +14,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 interface TakeoverState {
   claude: boolean
   codex: boolean
+  claude_desktop: boolean
 }
 
 // ─── Local persistence ─────────────────────────────────────────────────────
@@ -61,7 +62,7 @@ function App() {
   const [connected, setConnected] = useState(false)
   const [connError, setConnError] = useState<string | null>(null)
   const [logs, setLogs] = useState<LogEntry[]>([])
-  const [takeover, setTakeover] = useState<TakeoverState>({ claude: false, codex: false })
+  const [takeover, setTakeover] = useState<TakeoverState>({ claude: false, codex: false, claude_desktop: false })
   const [busy, setBusy] = useState<string | null>(null)
 
   const authHeaders = useCallback(() => ({ Authorization: `Bearer ${apiKey}` }), [apiKey])
@@ -160,6 +161,25 @@ function App() {
     }
   }
 
+  // ─── Toggle Claude Desktop (the app's Code tab) takeover ───
+  // Writes the third-party inference config; the Claude app reads it at
+  // launch, so a restart is needed for it to take effect.
+  const toggleClaudeDesktop = async () => {
+    if (!isTauri) { setConnError('需在桌面应用内操作'); return }
+    setBusy('claude_desktop')
+    try {
+      const active = await invoke<boolean>(
+        takeover.claude_desktop ? 'restore_claude_desktop' : 'takeover_claude_desktop',
+        { server, apiKey }
+      )
+      setTakeover(s => ({ ...s, claude_desktop: active }))
+    } catch (e) {
+      setConnError(`Claude 桌面版接管失败: ${e}`)
+    } finally {
+      setBusy(null)
+    }
+  }
+
   // ─── Setup screen ───
   if (!apiKey) {
     return (
@@ -247,6 +267,13 @@ function App() {
           active={takeover.codex}
           loading={busy === 'codex'}
           onToggle={toggleCodex}
+        />
+        <ToggleCard
+          label="Claude 桌面版"
+          desc={takeover.claude_desktop ? '已接管 · 重启App生效' : '未接管'}
+          active={takeover.claude_desktop}
+          loading={busy === 'claude_desktop'}
+          onToggle={toggleClaudeDesktop}
         />
       </div>
 
