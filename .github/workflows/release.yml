@@ -117,5 +117,5 @@ jobs:
             - **macOS Intel**: `*_x64.dmg`
             - **Windows**: `*_x64-setup.exe` / `*_x64_en-US.msi`
 
-            Usage: open the app, enter your API key from brain.aginx.net, toggle Claude Code/Codex on.
+            Usage: open the app, enter your API key from brain.aginx.net, toggle Claude Code / Codex / Claude 桌面版 on. The Claude 桌面版 toggle takes effect after restarting the Claude app.
           files: release-assets/*
