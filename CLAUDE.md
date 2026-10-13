@@ -33,7 +33,7 @@ aginxbrain/
 │       ├── proxy.rs              # 核心代理逻辑（协议检测、路由、failover）
 │       ├── api.rs                # 管理 REST API（provider/route/tag/config CRUD）
 │       ├── axum_server.rs        # Axum HTTP 服务器启动
-│       ├── takeover.rs           # Codex/Claude Code 接管（写入 config.toml/settings.json）
+│       ├── takeover.rs           # Codex / Claude Code / Claude 桌面版接管（config.toml、settings.json、3p configLibrary）
 │       ├── tray.rs               # 系统托盘
 │       └── convert/              # 协议格式转换
 │           ├── mod.rs                # 模块导出
