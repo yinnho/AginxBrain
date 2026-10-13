@@ -105,6 +105,14 @@ pub async fn start(state: AppState) -> (String, u16) {
         )
         .route("/v1/help", axum::routing::get(crate::proxy::handle_help))
         .route("/v1/models", axum::routing::get(crate::api::get_models))
+        // Anthropic-prefix alias of the models list: Claude Desktop's 3P
+        // inference config resolves GET {base}/v1/models against the same
+        // base URL as /v1/messages, and every other endpoint already has
+        // both spellings — models was the only gap.
+        .route(
+            "/anthropic/v1/models",
+            axum::routing::get(crate::api::get_models),
+        )
         .route("/responses", axum::routing::post(crate::proxy::handle_openai_responses))
         .route("/responses/compact", axum::routing::post(crate::proxy::handle_openai_responses))
         .route("/models", axum::routing::get(crate::api::get_models))
