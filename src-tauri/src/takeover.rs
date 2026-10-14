@@ -685,8 +685,12 @@ pub fn check_claude_desktop_remote_active() -> bool {
         && base.contains("aginx")
 }
 
-/// Restore the Claude desktop app's 3p config from the backups made during
-/// takeover (or drop our entry when there was nothing to back up).
+/// Turn the Claude desktop app's 3p mode OFF: `appliedId` goes null so the app
+/// boots in normal (Anthropic login) mode at next launch. The user's own
+/// configLibrary entries are preserved (restored from the backup) so they can
+/// re-apply one later — only our entry is removed. Re-applying the pre-takeover
+/// `appliedId` verbatim would leave 3p active when the user had configured a
+/// gateway manually before takeover.
 #[cfg(feature = "desktop")]
 pub fn restore_claude_desktop_remote() -> Result<()> {
     // developer_settings.json: restore the pre-takeover copy if we made one.
@@ -700,35 +704,39 @@ pub fn restore_claude_desktop_remote() -> Result<()> {
     let lib_dir = claude_desktop_profile_dir("Claude-3p")?.join("configLibrary");
     let meta_path = lib_dir.join("_meta.json");
     let meta_backup = lib_dir.join("_meta.json.aginxbrain-backup");
-    if meta_backup.exists() {
-        std::fs::copy(&meta_backup, &meta_path)?;
+    // Always drop our own entry file, backup or not.
+    let _ = std::fs::remove_file(lib_dir.join(format!("{CLAUDE_DESKTOP_ENTRY_ID}.json")));
+
+    // Base `_meta` on the backup when we have one (preserves the user's own
+    // entries), else on the current file.
+    let mut meta: Value = if meta_backup.exists() {
+        let restored = std::fs::read_to_string(&meta_backup)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_else(|| serde_json::json!({ "entries": [] }));
         std::fs::remove_file(&meta_backup)?;
+        restored
+    } else if meta_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&meta_path)?)
+            .unwrap_or_else(|_| serde_json::json!({ "entries": [] }))
     } else {
-        // Nothing to restore: drop our entry and rewrite _meta without it.
-        let entry_path = lib_dir.join(format!("{CLAUDE_DESKTOP_ENTRY_ID}.json"));
-        let _ = std::fs::remove_file(&entry_path);
-        if let Ok(content) = std::fs::read_to_string(&meta_path) {
-            if let Ok(mut meta) = serde_json::from_str::<Value>(&content) {
-                if let Some(obj) = meta.as_object_mut() {
-                    if obj
-                        .get("appliedId")
-                        .and_then(|i| i.as_str())
-                        == Some(CLAUDE_DESKTOP_ENTRY_ID)
-                    {
-                        obj.insert("appliedId".to_string(), Value::Null);
-                    }
-                    if let Some(entries) = obj.get_mut("entries").and_then(|e| e.as_array_mut()) {
-                        entries.retain(|e| {
-                            e.get("id").and_then(|i| i.as_str()) != Some(CLAUDE_DESKTOP_ENTRY_ID)
-                        });
-                    }
-                    atomic_write_json(&meta_path, &meta)?;
-                }
-            }
+        serde_json::json!({ "entries": [] })
+    };
+
+    if let Some(obj) = meta.as_object_mut() {
+        // Exit 3p entirely: nothing applied → the app boots in normal mode.
+        obj.insert("appliedId".to_string(), Value::Null);
+        if let Some(entries) = obj.get_mut("entries").and_then(|e| e.as_array_mut()) {
+            entries.retain(|e| {
+                e.get("id").and_then(|i| i.as_str()) != Some(CLAUDE_DESKTOP_ENTRY_ID)
+            });
+        } else {
+            obj.insert("entries".to_string(), serde_json::json!([]));
         }
     }
+    atomic_write_json(&meta_path, &meta)?;
 
-    log::info!("[Takeover] Claude Desktop 3p config restored");
+    log::info!("[Takeover] Claude Desktop 3p config restored (appliedId cleared)");
     Ok(())
 }
 
