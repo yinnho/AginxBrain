@@ -135,10 +135,3 @@ pub struct ProviderHealth {
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
 }
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ErrorEntry {
-    pub timestamp: String,
-    pub error_message: String,
-    pub model: String,
-}
