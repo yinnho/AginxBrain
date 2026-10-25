@@ -10,6 +10,21 @@ use tokio::sync::Mutex;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// 从字节缓冲取出完整行（含换行）拼成 String；残行留在字节缓冲等下一读。
+/// 行内多字节 UTF-8 绝不被上游劈开——per-chunk `from_utf8_lossy` 会把跨
+/// TCP 读边界劈开的汉字变 U+FFFD（长流式中文回复乱码根因，2026-10-25）。
+pub(crate) fn take_complete_lines(pending: &mut Vec<u8>) -> String {
+    let bytes = std::mem::take(pending);
+    let mut out = String::new();
+    let mut rest = bytes.as_slice();
+    while let Some(nl) = rest.iter().position(|b| *b == b'\n') {
+        out.push_str(&String::from_utf8_lossy(&rest[..=nl]));
+        rest = &rest[nl + 1..];
+    }
+    *pending = rest.to_vec();
+    out
+}
+
 fn chrono_like_id() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -119,7 +134,7 @@ pub fn convert_openai_stream_to_anthropic(
         usage_output_tokens: 0,
     }));
 
-    let buffer = Arc::new(Mutex::new(String::new()));
+    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
 
     let stream = upstream.flat_map(move |chunk_result| {
         let state = state.clone();
@@ -134,12 +149,13 @@ pub fn convert_openai_stream_to_anthropic(
                 }
             };
 
-            let text = String::from_utf8_lossy(&chunk);
             let mut local_buf;
             {
                 let mut guard = buffer.lock().await;
-                guard.push_str(&text);
-                local_buf = std::mem::take(&mut *guard);
+                // 字节缓冲+只解码完整行：per-chunk lossy 会把跨 TCP 读劈开的
+                // 多字节 UTF-8 变 U+FFFD（长流式中文回复乱码根因）
+                guard.extend_from_slice(&chunk);
+                local_buf = take_complete_lines(&mut guard);
             }
 
             // Process complete lines
@@ -411,8 +427,7 @@ pub fn convert_openai_stream_to_anthropic(
                 }
             }
 
-            // Save remaining buffer
-            *buffer.lock().await = local_buf;
+            // 残尾已在共享字节缓冲（take_complete_lines 不取无换行尾巴），无需写回
         }
     });
 
@@ -429,7 +444,7 @@ pub fn convert_anthropic_stream_to_openai(
     request_model: String,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     Box::pin(async_stream::stream! {
-        let mut buffer = String::new();
+        let mut pending: Vec<u8> = Vec::new();
         let mut event_type = String::new();
         let mut response_id = String::new();
         let mut model = request_model.clone();
@@ -462,8 +477,8 @@ pub fn convert_anthropic_stream_to_openai(
                 }
             };
 
-            let text = String::from_utf8_lossy(&bytes);
-            buffer.push_str(&text);
+            pending.extend_from_slice(&bytes);
+            let mut buffer = take_complete_lines(&mut pending);
 
             while let Some(newline_pos) = buffer.find('\n') {
                 let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
@@ -693,7 +708,7 @@ pub fn convert_responses_stream_to_anthropic(
         usage_output_tokens: 0,
     }));
 
-    let buffer = Arc::new(Mutex::new(String::new()));
+    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
 
     let stream = upstream.flat_map(move |chunk_result| {
         let state = state.clone();
@@ -708,12 +723,13 @@ pub fn convert_responses_stream_to_anthropic(
                 }
             };
 
-            let text = String::from_utf8_lossy(&chunk);
             let mut local_buf;
             {
                 let mut guard = buffer.lock().await;
-                guard.push_str(&text);
-                local_buf = std::mem::take(&mut *guard);
+                // 字节缓冲+只解码完整行：per-chunk lossy 会把跨 TCP 读劈开的
+                // 多字节 UTF-8 变 U+FFFD（长流式中文回复乱码根因）
+                guard.extend_from_slice(&chunk);
+                local_buf = take_complete_lines(&mut guard);
             }
 
             while let Some(newline_pos) = local_buf.find('\n') {
@@ -1010,7 +1026,7 @@ pub fn convert_responses_stream_to_anthropic(
                 }
             }
 
-            *buffer.lock().await = local_buf;
+            // 残尾已在共享字节缓冲（take_complete_lines 不取无换行尾巴），无需写回
         }
     });
 
@@ -1028,7 +1044,7 @@ pub fn convert_chat_stream_to_responses(
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let request_model = request_model.to_string();
     let stream = async_stream::stream! {
-        let mut buffer = String::new();
+        let mut pending: Vec<u8> = Vec::new();
         let mut state = CodexChatToResponsesState::default();
         // Always report the request model to the client, never the upstream model
         state.model = request_model.clone();
@@ -1040,8 +1056,8 @@ pub fn convert_chat_stream_to_responses(
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    buffer.push_str(&text);
+                    pending.extend_from_slice(&bytes);
+                    let mut buffer = take_complete_lines(&mut pending);
 
                     while let Some(newline_pos) = buffer.find('\n') {
                         let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
@@ -1116,7 +1132,7 @@ pub fn convert_responses_stream_to_chat(
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let request_model = request_model.to_string();
     Box::pin(async_stream::stream! {
-        let mut buffer = String::new();
+        let mut pending: Vec<u8> = Vec::new();
         let mut response_id = String::new();
         let mut created = 0u64;
         let mut model = request_model.clone();
@@ -1135,8 +1151,8 @@ pub fn convert_responses_stream_to_chat(
                 }
             };
 
-            let text = String::from_utf8_lossy(&bytes);
-            buffer.push_str(&text);
+            pending.extend_from_slice(&bytes);
+            let mut buffer = take_complete_lines(&mut pending);
 
             while let Some(newline_pos) = buffer.find('\n') {
                 let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
@@ -1695,7 +1711,7 @@ pub fn convert_anthropic_stream_to_responses(
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let request_model = request_model.to_string();
     let stream = async_stream::stream! {
-        let mut buffer = String::new();
+        let mut pending: Vec<u8> = Vec::new();
         let mut state = CodexAnthropicToResponsesState::default();
         // Always report the request model to the client, never the upstream model
         state.model = request_model.clone();
@@ -1707,8 +1723,8 @@ pub fn convert_anthropic_stream_to_responses(
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    buffer.push_str(&text);
+                    pending.extend_from_slice(&bytes);
+                    let mut buffer = take_complete_lines(&mut pending);
 
                     while let Some(newline_pos) = buffer.find('\n') {
                         let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
@@ -2686,5 +2702,33 @@ mod tests {
         // thinking=0, text=1, tool=2 — three blocks with sequential unique indices
         assert_eq!(starts.len(), 3, "Should have 3 blocks (thinking, text, tool)");
         assert_eq!(starts, vec![0, 1, 2], "All blocks should have sequential unique indices");
+    }
+
+    /// 回归（2026-10-25）：上游 SSE 的多字节 UTF-8 被 TCP 读边界劈开时，
+    /// 转换器不得产出 U+FFFD——字节缓冲+完整行解码之前，长流式中文回复
+    /// 每个 chunk 边界都可能烂一个字（redfin codex rollout 实锤）。
+    #[tokio::test]
+    async fn chunk_boundary_inside_cjk_rune_survives() {
+        let line = format!(
+            "data: {}\n\n",
+            json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"content": "你好世界"}, "finish_reason": null}]
+            })
+        );
+        let full = line + "data: [DONE]\n\n";
+        // 读边界切进「好」的 UTF-8 中间（你=3B，好=3B：offset+4 落在好第 2
+        // 字节）——按字节切，不能用 str::split_at（非字符边界即 panic）
+        let bytes = full.as_bytes();
+        let split = full.find("你好").unwrap() + 4;
+        let stream = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&bytes[..split])),
+            Ok(Bytes::copy_from_slice(&bytes[split..])),
+        ]);
+        let result = convert_chat_stream_to_responses(Box::pin(stream), "gpt-test");
+        let output = collect_stream(result).await;
+        assert!(!output.contains('\u{FFFD}'), "mojibake in output: {output}");
+        assert!(output.contains("你好世界"), "text lost: {output}");
     }
 }

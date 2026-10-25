@@ -2510,7 +2510,7 @@ fn replace_model_in_anthropic_stream(
     upstream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
     request_model: String,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
-    let buffer = Arc::new(Mutex::new(String::new()));
+    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
     // Track which content block indices are currently open
     let open_blocks: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -2528,13 +2528,14 @@ fn replace_model_in_anthropic_stream(
                 }
             };
 
-            let text = String::from_utf8_lossy(&chunk);
             let mut local_buf;
 
             {
                 let mut guard = buffer.lock().await;
-                guard.push_str(&text);
-                local_buf = std::mem::take(&mut *guard);
+                // 字节缓冲+只解码完整行（防跨读劈开的多字节 UTF-8 变 U+FFFD，
+                // 同 convert/streaming.rs::take_complete_lines）
+                guard.extend_from_slice(&chunk);
+                local_buf = crate::convert::streaming::take_complete_lines(&mut guard);
             }
 
             // Buffer for pending `event:` lines. We don't emit them immediately
@@ -2675,8 +2676,7 @@ fn replace_model_in_anthropic_stream(
                 yield Ok(Bytes::from(format!("event: {}\n", ev)));
             }
 
-            // Save remaining buffer
-            *buffer.lock().await = local_buf;
+            // 残尾已在共享字节缓冲（take_complete_lines 不取无换行尾巴），无需写回
         }
     }))
 }
@@ -2778,7 +2778,7 @@ fn strip_reasoning_from_openai_delta(value: &mut Value) -> bool {
 fn strip_reasoning_from_openai_stream(
     upstream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
 ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
-    let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+    let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
     Box::pin(async_stream::stream! {
         let mut upstream = upstream;
         while let Some(chunk_result) = upstream.next().await {
@@ -2786,12 +2786,12 @@ fn strip_reasoning_from_openai_stream(
                 Ok(c) => c,
                 Err(e) => { yield Err(e); return; }
             };
-            let text = String::from_utf8_lossy(&chunk);
             let mut local_buf;
             {
                 let mut guard = buffer.lock().await;
-                guard.push_str(&text);
-                local_buf = std::mem::take(&mut *guard);
+                // 字节缓冲+只解码完整行（防跨读劈开的多字节 UTF-8 变 U+FFFD）
+                guard.extend_from_slice(&chunk);
+                local_buf = crate::convert::streaming::take_complete_lines(&mut guard);
             }
             while let Some(newline_pos) = local_buf.find('\n') {
                 let line = local_buf[..newline_pos].to_string();
@@ -2819,10 +2819,7 @@ fn strip_reasoning_from_openai_stream(
                     yield Ok(Bytes::from(format!("{}\n", line)));
                 }
             }
-            if !local_buf.is_empty() {
-                let mut guard = buffer.lock().await;
-                guard.push_str(&local_buf);
-            }
+            // 残尾已在共享字节缓冲（take_complete_lines 不取无换行尾巴），无需写回
         }
     })
 }
