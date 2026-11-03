@@ -205,16 +205,20 @@ WantedBy=multi-user.target
 ```
 </details>
 
-### Option B — Desktop thin client
+### Option B — Desktop app (local gateway + remote client)
 
 Grab the installer for your platform from [**Releases**](https://github.com/yinnho/AginxBrain/releases) (macOS / Windows / Linux), or build it:
 
 ```bash
+cd web && pnpm install && pnpm build && cd ..        # admin dashboard (embedded at compile time)
 cd web-client && pnpm install && pnpm build && cd ..
 cd src-tauri && cargo tauri build
 ```
 
-Launch it, enter your server URL + caller API key to log in. You can then monitor all calls through the dashboard, and **takeover** Claude Code or Codex with one click — the app rewrites the local config so your CLI flows through the gateway.
+The desktop app does two things:
+
+1. **Runs the full gateway locally** on `host:port` from `~/.aginxbrain/config.yaml` (default `127.0.0.1:8083`). Manage it in a browser at `http://127.0.0.1:8083/` — first launch creates the admin account, then add providers/routes/keys in the dashboard. Set `host: 0.0.0.0` to share the gateway on the LAN (colleagues point their Claude Code / Codex at `http://<your-lan-ip>:8083` with a caller API key; the app shows ready-to-copy onboarding snippets). Restart the app after changing `host`/`port`.
+2. **Thin client to any AginxBrain server** — enter a server URL + caller API key to monitor calls and **takeover** Claude Code or Codex with one click (works for the local gateway too: use `http://127.0.0.1:8083` + a local key).
 
 ### Connect a client
 
@@ -247,6 +251,8 @@ providers:               # name + key + auth only (no base_url here)
     name: DeepSeek
     api_key: sk-your-key
     auth_type: bearer    # bearer | x_api_key | x_goog_api_key
+    # proxy: http://127.0.0.1:8118   # optional: ONLY this provider's upstream
+    #                                 # requests go through this proxy (http/https)
 
 routes:                  # base_url lives on the route
   - base_url: https://api.deepseek.com

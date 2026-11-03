@@ -1,5 +1,5 @@
 use crate::config::AppState;
-#[cfg(all(not(debug_assertions), feature = "server"))]
+#[cfg(not(debug_assertions))]
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
@@ -12,13 +12,14 @@ use tower_sessions::cookie::SameSite;
 use tower_sessions::{Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
 
-// Embed the admin dashboard frontend at compile time (server release builds
-// only). The desktop client never serves a frontend — it's a thin client that
-// connects to a remote AginxBrain server — so it doesn't need web/dist.
-#[cfg(all(not(debug_assertions), feature = "server"))]
+// Embed the admin dashboard frontend at compile time (release builds — both
+// `--server` and desktop). The desktop app runs the same gateway locally and
+// is managed via this dashboard in a browser at http://<host>:<port>/.
+// Dev builds keep the JSON 404 fallback and serve the UI via `pnpm dev`.
+#[cfg(not(debug_assertions))]
 use rust_embed::RustEmbed;
 
-#[cfg(all(not(debug_assertions), feature = "server"))]
+#[cfg(not(debug_assertions))]
 #[derive(RustEmbed)]
 #[folder = "../web/dist/"]
 struct Asset;
@@ -351,7 +352,7 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
             .into_response();
     }
 
-    #[cfg(all(not(debug_assertions), feature = "server"))]
+    #[cfg(not(debug_assertions))]
     {
         let file_path = uri.path().trim_start_matches('/');
         let file_path = if file_path.is_empty() { "index.html" } else { file_path };
@@ -388,10 +389,10 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
             .into_response()
     }
 
-    #[cfg(not(all(not(debug_assertions), feature = "server")))]
+    #[cfg(debug_assertions)]
     {
-        // Dev mode (Vite serves frontend) or desktop build (no embedded
-        // frontend — the desktop client connects to a remote server).
+        // Dev mode: Vite serves the frontend on its own port; the gateway
+        // only answers API routes.
         (
             StatusCode::NOT_FOUND,
             [("content-type", "application/json")],

@@ -14,10 +14,15 @@ mod takeover;
 mod tray;
 
 use config::load_config;
+#[cfg(feature = "desktop")]
+use tauri::Manager;
 
-/// Desktop mode: thin client. No local proxy server — the window loads the
-/// bundled minimal client frontend directly, and config files are written via
-/// Tauri commands to point Claude Code / Codex at a remote AginxBrain server.
+/// Desktop mode: local gateway + thin client. On launch we start the full
+/// proxy engine on the configured host:port (default 127.0.0.1:8083; set
+/// `host: 0.0.0.0` in ~/.aginxbrain/config.yaml to share on the LAN) — the
+/// admin UI lives at http://<host>:<port>/. The window keeps the remote-client
+/// flow (point Claude/Codex at any AginxBrain server, including this one via
+/// server=http://127.0.0.1:<port>).
 #[cfg(feature = "desktop")]
 pub fn run_desktop() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -34,6 +39,7 @@ pub fn run_desktop() {
             takeover_claude_desktop,
             restore_claude_desktop,
             get_takeover_state,
+            gateway_status,
         ])
         .setup(move |app| {
             // Create main window. The frontend (web-client) is bundled via
@@ -62,6 +68,29 @@ pub fn run_desktop() {
             // System tray
             tray::setup_tray(app)?;
 
+            // Start the local gateway on Tauri's own tokio runtime (no second
+            // runtime, no block_on). Thin-client remote mode keeps working even
+            // if this fails — the status card in the window shows the error.
+            let status = std::sync::Arc::new(std::sync::Mutex::new(GatewayStatus::default()));
+            app.manage(status.clone());
+            tauri::async_runtime::spawn(async move {
+                let s = match bootstrap_gateway().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!("[Gateway] failed to start local gateway: {e:#}");
+                        GatewayStatus {
+                            running: false,
+                            lan_ip: detect_lan_ip(),
+                            error: Some(format!("{e:#}")),
+                            ..Default::default()
+                        }
+                    }
+                };
+                if let Ok(mut guard) = status.lock() {
+                    *guard = s;
+                }
+            });
+
             Ok(())
         })
         .run(tauri::generate_context!());
@@ -77,6 +106,72 @@ pub fn run_desktop() {
 //
 // Command names match what the web-client frontend invokes (`invoke('takeover_claude')`).
 // `rename_all = "camelCase"` lets Rust `api_key` bind to the JS `apiKey` argument.
+
+// ─── Local gateway (desktop) ─────────────────────────────────────────────────
+
+#[cfg(feature = "desktop")]
+#[derive(serde::Serialize, Clone, Default)]
+pub struct GatewayStatus {
+    pub running: bool,
+    pub host: String,
+    pub port: u16,
+    pub lan_ip: Option<String>,
+    pub error: Option<String>,
+}
+
+#[cfg(feature = "desktop")]
+async fn bootstrap_gateway() -> anyhow::Result<GatewayStatus> {
+    let t0 = std::time::Instant::now();
+    let app_config = load_config()?;
+    let state = config::AppState::new(app_config).await?;
+    config::spawn_config_watcher(state.config.clone());
+    let (host, port) = axum_server::start(state).await;
+
+    // axum_server::start swallows bind errors (logs, returns anyway), so probe
+    // the listener to tell "running" from "port in use / permission denied".
+    let probe_host = if host == "0.0.0.0" || host.is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        host.clone()
+    };
+    let running = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect((probe_host.as_str(), port)),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    let error = (!running).then(|| {
+        format!("本地网关未在 {}:{} 监听（端口被占用或无权限？）", host, port)
+    });
+    if running {
+        log::info!(
+            "[Gateway] local gateway up on {}:{} in {:?} (admin UI: http://{}:{}/)",
+            host, port, t0.elapsed(), probe_host, port
+        );
+    }
+    Ok(GatewayStatus { running, host, port, lan_ip: detect_lan_ip(), error })
+}
+
+/// LAN IP without extra deps: a UDP connect picks the default-route interface
+/// without sending any packet. None when offline.
+#[cfg(feature = "desktop")]
+fn detect_lan_ip() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() => Some(ip.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+fn gateway_status(
+    status: tauri::State<'_, std::sync::Arc<std::sync::Mutex<GatewayStatus>>>,
+) -> GatewayStatus {
+    status.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
 
 #[cfg(feature = "desktop")]
 #[derive(serde::Serialize)]

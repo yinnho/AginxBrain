@@ -1312,8 +1312,18 @@ async fn handle_proxy(
     );
     log::info!("[Proxy] forwarding to {} (model={})", url, route.model);
 
-    // 6. Build headers
-    let mut req_builder = state.http_client.post(&url);
+    // 6. Build headers. Provider-level outbound proxy: resolve the reqwest
+    //    client before dialing (invalid/down proxy URL fails this route and
+    //    falls through to the next candidate).
+    let http = match crate::config::client_for_provider(&state, provider).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("[Proxy] provider '{}' unusable, skipping: {}", route.provider, e);
+            last_error = Some(ProxyError::Upstream(e));
+            continue;
+        }
+    };
+    let mut req_builder = http.post(&url);
 
     // DEBUG: log the forwarded body (size + truncated preview) to help diagnose
     // validation and token-count issues.
@@ -2192,7 +2202,14 @@ async fn handle_count_tokens(
     );
     log::info!("[Proxy] count_tokens forwarding to {}", url);
 
-    let mut req_builder = state.http_client.post(&url);
+    let http = match crate::config::client_for_provider(&state, provider).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("[Proxy] count_tokens provider '{}' unusable, skipping: {}", route.provider, e);
+            continue;
+        }
+    };
+    let mut req_builder = http.post(&url);
     req_builder = req_builder.header(
         provider.auth_type.header_name(),
         provider.auth_type.header_value(&provider.api_key),
@@ -3916,7 +3933,10 @@ async fn send_image_post(
     body: &Value,
     extra_headers: &[(&str, &str)],
 ) -> Result<Value, ProxyError> {
-    let mut builder = state.http_client
+    let http = crate::config::client_for_provider(state, provider)
+        .await
+        .map_err(ProxyError::Upstream)?;
+    let mut builder = http
         .post(url)
         .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key));
     for (k, v) in extra_headers {
@@ -3936,7 +3956,10 @@ async fn send_image_post(
 }
 
 async fn send_image_get(state: &AppState, provider: &Provider, url: &str) -> Result<Value, ProxyError> {
-    let resp = state.http_client.get(url)
+    let http = crate::config::client_for_provider(state, provider)
+        .await
+        .map_err(ProxyError::Upstream)?;
+    let resp = http.get(url)
         .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key))
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -4353,10 +4376,25 @@ async fn send_test_to_route(
         log::info!("[Test] forwarding body: {}", truncated);
     }
 
-    // Send request
+    // Send request (per-provider outbound proxy: resolve client first so a bad
+    // proxy URL shows up in the admin UI Test result instead of a generic error)
     let start = std::time::Instant::now();
-    let resp = match state
-        .http_client
+    let http = match crate::config::client_for_provider(state, provider).await {
+        Ok(c) => c,
+        Err(e) => {
+            return TestResult {
+                success: false,
+                tag: tag.to_string(),
+                provider: provider.name.clone(),
+                model: route.model.clone(),
+                format: format!("{:?}", route.format),
+                latency_ms: 0,
+                error: Some(e),
+                response: None,
+            };
+        }
+    };
+    let resp = match http
         .post(&url)
         .header(
             provider.auth_type.header_name(),

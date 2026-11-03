@@ -17,6 +17,16 @@ interface TakeoverState {
   claude_desktop: boolean
 }
 
+interface GatewayStatus {
+  running: boolean
+  host: string
+  port: number
+  lan_ip: string | null
+  error: string | null
+}
+
+const isLocalServer = (s: string) => /^https?:\/\/(127\.0\.0\.1|localhost)(:|$)/.test(s)
+
 // ─── Local persistence ─────────────────────────────────────────────────────
 const SERVER_KEY = 'aginxbrain_server'
 const APIKEY_KEY = 'aginxbrain_api_key'
@@ -64,6 +74,8 @@ function App() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [takeover, setTakeover] = useState<TakeoverState>({ claude: false, codex: false, claude_desktop: false })
   const [busy, setBusy] = useState<string | null>(null)
+  const [gateway, setGateway] = useState<GatewayStatus | null>(null)
+  const [localHint, setLocalHint] = useState<string | null>(null)
 
   const authHeaders = useCallback(() => ({ Authorization: `Bearer ${apiKey}` }), [apiKey])
 
@@ -99,14 +111,25 @@ function App() {
     }
   }, [])
 
+  // ─── Local gateway status (only meaningful in the desktop app) ───
+  const refreshGateway = useCallback(async () => {
+    if (!isTauri) return
+    try {
+      setGateway(await invoke<GatewayStatus>('gateway_status'))
+    } catch {
+      /* ignore — command unavailable in older builds */
+    }
+  }, [])
+
   useEffect(() => {
     if (apiKey && server) {
       refresh()
       refreshTakeover()
-      const i = setInterval(() => { refresh(); refreshTakeover() }, 5000)
+      refreshGateway()
+      const i = setInterval(() => { refresh(); refreshTakeover(); refreshGateway() }, 5000)
       return () => clearInterval(i)
     }
-  }, [apiKey, server, refresh, refreshTakeover])
+  }, [apiKey, server, refresh, refreshTakeover, refreshGateway])
 
   // ─── Connect (save server + key) ───
   const handleConnect = () => {
@@ -180,6 +203,40 @@ function App() {
     }
   }
 
+  // ─── Use local gateway (fill server field from the in-app gateway) ───
+  const handleUseLocal = async () => {
+    try {
+      const s = await invoke<GatewayStatus>('gateway_status')
+      if (!s.running || !s.port) {
+        setLocalHint(`本地网关未就绪：${s.error || '启动中…稍等片刻再试'}`)
+        return
+      }
+      const url = `http://127.0.0.1:${s.port}`
+      setTempServer(url)
+      try {
+        const r = await fetch(`${url}/api/status`)
+        const j = await r.json()
+        setLocalHint(j.setup_required
+          ? `首次使用：先打开管理界面（${url}）创建管理员，再在「API Keys」页生成 Key 粘贴到上面`
+          : `已填入本地网关地址，请粘贴本地 API Key（管理台「API Keys」页创建）`)
+      } catch {
+        setLocalHint(`已填入 ${url}，请粘贴本地 API Key`)
+      }
+    } catch (e) {
+      setLocalHint(`无法获取本地网关状态: ${e}`)
+    }
+  }
+
+  // ─── Open the admin dashboard in the system browser ───
+  const openAdmin = async () => {
+    try {
+      const { open } = await import('@tauri-apps/plugin-shell')
+      await open(server)
+    } catch (e) {
+      setConnError(`打开管理界面失败: ${e}`)
+    }
+  }
+
   // ─── Setup screen ───
   if (!apiKey) {
     return (
@@ -218,6 +275,22 @@ function App() {
             连接
           </button>
 
+          {isTauri && (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '18px 0 14px' }}>
+                <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>或</span>
+                <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+              </div>
+              <button onClick={handleUseLocal} style={secondaryBtn}>使用本地网关</button>
+              {localHint && (
+                <p style={{ fontSize: 12, color: 'var(--text-secondary)', textAlign: 'center', marginTop: 12, lineHeight: 1.6 }}>
+                  {localHint}
+                </p>
+              )}
+            </>
+          )}
+
           <p style={{ fontSize: 12, color: 'var(--text-muted)', textAlign: 'center', marginTop: 16 }}>
             在 <a href="https://brain.aginx.net" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)' }}>brain.aginx.net</a> 获取 API Key
           </p>
@@ -250,6 +323,11 @@ function App() {
 
       {connError && (
         <div style={errorBanner}>{connError}</div>
+      )}
+
+      {/* Local gateway card (desktop app, connected to the in-app gateway) */}
+      {isTauri && isLocalServer(server) && (
+        <LocalGatewayCard status={gateway} apiKey={apiKey} onOpenAdmin={openAdmin} />
       )}
 
       {/* Toggle switches */}
@@ -390,6 +468,74 @@ function MiniCard({ label, value }: { label: string; value: string }) {
   )
 }
 
+function copyText(text: string) {
+  navigator.clipboard?.writeText(text).catch(() => {})
+}
+
+// Status + share card for the gateway embedded in the desktop app.
+// When bound to 0.0.0.0 it also shows colleague onboarding snippets.
+function LocalGatewayCard({ status, apiKey, onOpenAdmin }: {
+  status: GatewayStatus | null
+  apiKey: string
+  onOpenAdmin: () => void
+}) {
+  if (!status) {
+    return (
+      <div style={{ ...localCard, marginBottom: 20 }}>
+        <div style={{ fontSize: 13, fontWeight: 600 }}>本地网关</div>
+        <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>读取状态中…</div>
+      </div>
+    )
+  }
+  const sharing = status.host === '0.0.0.0'
+  const base = sharing && status.lan_ip ? `http://${status.lan_ip}:${status.port}` : null
+  return (
+    <div style={{ ...localCard, marginBottom: 20 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>本地网关</div>
+          <div style={{ fontSize: 12, marginTop: 4, color: status.running ? 'var(--success)' : 'var(--danger)' }}>
+            {status.running
+              ? `运行中 · ${status.host}:${status.port}${sharing ? '（局域网共享已开）' : ''}`
+              : `未运行${status.error ? ` · ${status.error}` : ''}`}
+          </div>
+        </div>
+        <button onClick={onOpenAdmin} style={ghostBtn}>打开管理界面</button>
+      </div>
+
+      {sharing && !status.lan_ip && (
+        <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 10 }}>
+          已绑定 0.0.0.0，但未探测到局域网 IP（可能离线）
+        </div>
+      )}
+
+      {base && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>分享给同事</div>
+
+          <div style={shareBlock}>
+            <div style={shareLabel}>同事的 Claude Code（环境变量）</div>
+            <pre style={preStyle}>{`export ANTHROPIC_BASE_URL=${base}/anthropic\nexport ANTHROPIC_AUTH_TOKEN=${apiKey}`}</pre>
+            <button style={copyBtn} onClick={() => copyText(`export ANTHROPIC_BASE_URL=${base}/anthropic\nexport ANTHROPIC_AUTH_TOKEN=${apiKey}`)}>复制</button>
+          </div>
+
+          <div style={shareBlock}>
+            <div style={shareLabel}>同事的 Codex（~/.codex/config.toml）</div>
+            <pre style={preStyle}>{`model = "gpt-5.5"\nmodel_provider = "aginxbrain"\n\n[model_providers.aginxbrain]\nname = "AginxBrain"\nbase_url = "${base}"\nwire_api = "responses"`}</pre>
+            <button style={copyBtn} onClick={() => copyText(`model = "gpt-5.5"\nmodel_provider = "aginxbrain"\n\n[model_providers.aginxbrain]\nname = "AginxBrain"\nbase_url = "${base}"\nwire_api = "responses"`)}>复制</button>
+          </div>
+
+          <div style={shareBlock}>
+            <div style={shareLabel}>同事的 ~/.codex/auth.json</div>
+            <pre style={preStyle}>{`{"OPENAI_API_KEY": "${apiKey}"}`}</pre>
+            <button style={copyBtn} onClick={() => copyText(`{"OPENAI_API_KEY": "${apiKey}"}`)}>复制</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Styles ─────────────────────────────────────────────────────────────────
 const centerWrap: React.CSSProperties = {
   minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -407,6 +553,11 @@ const primaryBtn = (disabled: boolean): React.CSSProperties => ({
   background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 8,
   cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.5 : 1,
 })
+const secondaryBtn: React.CSSProperties = {
+  width: '100%', padding: '11px 16px', fontSize: 14, fontWeight: 600,
+  background: 'transparent', color: 'var(--text-secondary)',
+  border: '1px solid var(--border)', borderRadius: 8, cursor: 'pointer',
+}
 const ghostBtn: React.CSSProperties = {
   background: 'transparent', color: 'var(--text-secondary)',
   border: '1px solid var(--border)', borderRadius: 6,
@@ -424,6 +575,30 @@ const emptyState: React.CSSProperties = {
 const tagBadge: React.CSSProperties = {
   display: 'inline-block', padding: '2px 8px', borderRadius: 10,
   fontSize: 11, fontWeight: 600,
+}
+const localCard: React.CSSProperties = {
+  background: 'var(--bg-card)', border: '1px solid var(--border)',
+  borderRadius: 10, padding: 16,
+}
+const shareBlock: React.CSSProperties = {
+  position: 'relative', marginBottom: 10,
+  background: 'var(--bg-input)', border: '1px solid var(--border)',
+  borderRadius: 8, padding: '8px 10px',
+}
+const shareLabel: React.CSSProperties = {
+  fontSize: 11, color: 'var(--text-muted)', marginBottom: 6,
+}
+const preStyle: React.CSSProperties = {
+  margin: 0, padding: 0, fontSize: 11, lineHeight: 1.6,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+  color: 'var(--text-secondary)',
+}
+const copyBtn: React.CSSProperties = {
+  position: 'absolute', top: 6, right: 6,
+  fontSize: 11, padding: '2px 8px', cursor: 'pointer',
+  background: 'var(--bg-card)', color: 'var(--text-muted)',
+  border: '1px solid var(--border)', borderRadius: 6,
 }
 
 export default App

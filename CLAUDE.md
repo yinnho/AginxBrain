@@ -27,8 +27,8 @@ Aginx 生态中的定位：
 aginxbrain/
 ├── src-tauri/               # Rust 后端
 │   └── src/
-│       ├── main.rs              # Tauri 入口
-│       ├── lib.rs                # 应用初始化（tray、axum server、takeover）
+│       ├── main.rs              # 入口：默认桌面模式，--server 走 run_server
+│       ├── lib.rs                # run_desktop（内嵌网关启动+tray+takeover 命令）与 run_server
 │       ├── config.rs             # 配置加载（providers、routes、tags）
 │       ├── proxy.rs              # 核心代理逻辑（协议检测、路由、failover）
 │       ├── api.rs                # 管理 REST API（provider/route/tag/config CRUD）
@@ -85,22 +85,36 @@ Provider（DeepSeek / 智谱 / Kimi / ...）
 - 修改 VS Code `settings.json`，将 API base URL 指向 AginxBrain
 - 使用 `gpt-5.5` 作为虚拟模型名（Codex 目录中存在该模型，确保完整元数据支持）
 
+### 桌面双模式（2026-11-03 起）
+
+桌面 App 不再是纯瘦客户端，启动时**内嵌完整网关**（`run_desktop` 里
+`tauri::async_runtime::spawn(bootstrap_gateway)`：load_config → AppState →
+axum_server::start，默认 `127.0.0.1:8083`，config `host: 0.0.0.0` 开局域网
+共享）。管理台 = 浏览器打开 `http://127.0.0.1:8083/`（release 构建嵌入
+web/dist，托盘「打开管理界面」）；窗口（web-client）保留 remote 模式并新增
+「使用本地网关」。本地接管 = remote takeover 函数 + `127.0.0.1:port` +
+真实 ab_ key（legacy 本地变体写 `PROXY_MANAGED` 已 401，勿用）。host/port
+改动重启 App 生效。
+
 ## 配置
 
 ### `~/.aginxbrain/config.yaml`
 
 ```yaml
 port: 8083                    # 监听端口
+host: 127.0.0.1               # 0.0.0.0 = 局域网共享（桌面模式重启生效）
 
-providers:                    # AI 提供商（真实 Key 在这里）
+providers:                    # AI 提供商（真实 Key 在这里；只放凭据）
   deepseek:
     name: DeepSeek
-    base_url: https://api.deepseek.com
     api_key: sk-real-key
     auth_type: bearer
+    # proxy: http://127.0.0.1:8118  # 可选：仅该 provider 的上游走此代理
+    #                                # （http/https；如 OpenAI 走美国出口）
 
-routes:                       # 路由规则
-  - model: deepseek-v4-pro
+routes:                       # 路由规则（base_url 在 route 上）
+  - base_url: https://api.deepseek.com
+    model: deepseek-v4-pro
     provider: deepseek
     tags: [sonnet, auto]
     format: openai
@@ -130,17 +144,22 @@ management_key: aginxbrain-local  # 管理 API 密钥
 ## 构建
 
 ```bash
-# 前端
+# 管理台前端（release 构建会嵌入 src-tauri/../web/dist，必须先构建）
 cd web && pnpm install && pnpm build
 
-# 开发模式
-cd src-tauri && cargo tauri dev
+# 桌面窗口前端
+cd ../web-client && pnpm install && pnpm build
 
-# 生产构建
+# 开发模式
+cd ../src-tauri && cargo tauri dev
+
+# 生产构建（桌面 dmg/app/msi；此时 web/dist 已就绪，rust_embed 才能编译）
 cd src-tauri && cargo tauri build
 ```
 
-注意：`beforeBuildCommand` 配置为 `npm --prefix ../web run build`，如果系统没有 npm，需要先手动 `cd web && pnpm build`，然后临时清空 `beforeBuildCommand`。
+注意：`beforeBuildCommand` 为空——两个前端都要手动先 build。release 桌面构建
+依赖 `web/dist` 存在（rust_embed 编译期嵌入），缺失会编译失败；debug 构建不嵌
+（`/` 返回 JSON 404，用 `cd web && pnpm dev` 起管理台）。
 
 ## 部署
 

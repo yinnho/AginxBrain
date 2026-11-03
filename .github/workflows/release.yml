@@ -55,11 +55,19 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: web-client/pnpm-lock.yaml
+          cache-dependency-path: |
+            web-client/pnpm-lock.yaml
+            web/pnpm-lock.yaml
 
       - name: Build desktop client frontend
         run: pnpm install --frozen-lockfile && pnpm build
         working-directory: web-client
+
+      # Release desktop builds embed web/dist (admin dashboard) via rust_embed
+      # — the desktop app runs the full gateway and serves its admin UI.
+      - name: Build admin dashboard frontend
+        run: pnpm install --frozen-lockfile && pnpm build
+        working-directory: web
 
       - name: Install macOS targets
         if: matrix.platform == 'macos-latest'

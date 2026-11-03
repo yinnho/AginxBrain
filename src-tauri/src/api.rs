@@ -385,6 +385,9 @@ fn validate_config(config: &AppConfig) -> Result<(), String> {
         if provider.api_key.contains("***") {
             return Err(format!("provider '{}' has masked api_key — provide the full key", id));
         }
+        if let Some(proxy) = provider.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            crate::config::build_proxy(proxy, id)?;
+        }
     }
 
     for (i, route) in config.routes.iter().enumerate() {
@@ -770,6 +773,9 @@ fn validate_provider(provider: &crate::config::Provider) -> Result<(), String> {
     }
     if provider.api_key == "your-key-here" || provider.api_key.starts_with("sk-your-") {
         return Err("provider has placeholder api_key — please set a real API key".to_string());
+    }
+    if let Some(proxy) = provider.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        crate::config::build_proxy(proxy, &provider.name)?;
     }
     Ok(())
 }

@@ -62,6 +62,11 @@ export function ProvidersPage({ config, onConfigChange }: { config: AppConfig; o
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
                   <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.auth_type}</span>
+                  {p.proxy && (
+                    <span className="mono" style={{ fontSize: 10, color: 'var(--text-muted)', border: '1px solid var(--border)', borderRadius: 4, padding: '1px 6px' }} title={`upstream via ${p.proxy}`}>
+                      proxy
+                    </span>
+                  )}
                   <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
                     {showKeys[id] ? p.api_key : p.api_key}
                   </span>
@@ -119,6 +124,7 @@ function ProviderForm({ initial, onSave, onCancel }: {
   const [name, setName] = useState(initial?.name || '');
   const [apiKey, setApiKey] = useState(initial?.api_key || '');
   const [authType, setAuthType] = useState(initial?.auth_type || 'bearer');
+  const [proxy, setProxy] = useState(initial?.proxy || '');
 
   const valid = id && name && apiKey;
 
@@ -132,12 +138,16 @@ function ProviderForm({ initial, onSave, onCancel }: {
           <option value="x_api_key">x-api-key</option>
           <option value="x_goog_api_key">x-goog-api-key</option>
         </Select>
+        <Input label="Outbound Proxy (optional)" value={proxy} onChange={e => setProxy(e.target.value)} placeholder="http://127.0.0.1:8118" />
         <div style={{ gridColumn: '1 / -1' }}>
           <Input label="API Key" value={apiKey} onChange={e => setApiKey(e.target.value)} type="password" placeholder={initial ? "Leave masked value unchanged to keep existing key" : undefined} />
         </div>
       </div>
+      <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-muted)' }}>
+        Outbound proxy: only this provider's upstream requests go through it (http/https only). Leave empty for direct connection.
+      </div>
       <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
-        <Button variant="primary" disabled={!valid} onClick={() => onSave(id, { name, api_key: apiKey, auth_type: authType as any })}>Save</Button>
+        <Button variant="primary" disabled={!valid} onClick={() => onSave(id, { name, api_key: apiKey, auth_type: authType as any, proxy: proxy.trim() || undefined })}>Save</Button>
         <Button variant="ghost" onClick={onCancel}>Cancel</Button>
       </div>
     </Card>

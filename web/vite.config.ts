@@ -5,8 +5,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/api': 'http://127.0.0.1:8082',
-      '/v1': 'http://127.0.0.1:8082',
+      // Gateway default port (config.rs default_port = 8083)
+      '/api': 'http://127.0.0.1:8083',
+      '/v1': 'http://127.0.0.1:8083',
     },
   },
 })

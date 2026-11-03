@@ -52,6 +52,11 @@ pub struct Provider {
     pub api_key: String,
     #[serde(default = "default_auth_type")]
     pub auth_type: AuthType,
+    /// Optional outbound HTTP proxy (e.g. "http://127.0.0.1:8118"). Only this
+    /// provider's upstream requests go through it; everything else stays
+    /// direct. http/https schemes only (reqwest built without `socks`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -258,13 +263,13 @@ fn default_auth_type() -> AuthType {
 fn default_providers() -> HashMap<String, Provider> {
     let mut m = HashMap::new();
     let key = "your-key-here".to_string();
-    m.insert("deepseek".into(), Provider { name: "DeepSeek".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("zhipu".into(), Provider { name: "Zhipu GLM".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("baidu".into(), Provider { name: "Baidu ERNIE".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("kimi".into(), Provider { name: "Kimi".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("dashscope".into(), Provider { name: "Qwen (DashScope)".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("dashscope_media".into(), Provider { name: "DashScope Media".into(), api_key: key.clone(), auth_type: AuthType::Bearer });
-    m.insert("minimax".into(), Provider { name: "MiniMax".into(), api_key: key, auth_type: AuthType::Bearer });
+    m.insert("deepseek".into(), Provider { name: "DeepSeek".into(), api_key: key.clone(), auth_type: AuthType::Bearer, proxy: None });
+    m.insert("zhipu".into(), Provider { name: "Zhipu GLM".into(), api_key: key.clone(), auth_type: AuthType::Bearer, proxy: None });
+    m.insert("baidu".into(), Provider { name: "Baidu ERNIE".into(), api_key: key.clone(), auth_type: AuthType::Bearer, proxy: None });
+    m.insert("kimi".into(), Provider { name: "Kimi".into(), api_key: key.clone(), auth_type: AuthType::Bearer, proxy: None });
+    m.insert("dashscope".into(), Provider { name: "Qwen (DashScope)".into(), api_key: key.clone(), auth_type: AuthType::Bearer, proxy: None });
+    m.insert("dashscope_media".into(), Provider { name: "DashScope Media".into(), api_key: key.clone(), auth_type: AuthType::Bearer, proxy: None });
+    m.insert("minimax".into(), Provider { name: "MiniMax".into(), api_key: key, auth_type: AuthType::Bearer, proxy: None });
     m
 }
 
@@ -555,6 +560,11 @@ impl Default for CircuitState {
 pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub http_client: reqwest::Client,
+    /// Cached reqwest clients for providers that set an outbound `proxy`.
+    /// Keyed by proxy URL (not provider id) because some dial sites only see
+    /// `&Provider`. Entries are never invalidated — a changed proxy URL just
+    /// leaves an idle connection pool behind.
+    pub proxy_clients: Arc<tokio::sync::RwLock<HashMap<String, reqwest::Client>>>,
     pub db: sqlx::SqlitePool,
     pub smart_routing_cache: Arc<RwLock<crate::smart_routing::SessionCache>>,
     pub circuit_breaker: Arc<RwLock<std::collections::HashMap<String, CircuitState>>>,
@@ -577,6 +587,7 @@ impl AppState {
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
             http_client,
+            proxy_clients: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             db,
             smart_routing_cache: Arc::new(RwLock::new(
                 crate::smart_routing::SessionCache::new(cache_max),
@@ -584,6 +595,50 @@ impl AppState {
             circuit_breaker: Arc::new(RwLock::new(std::collections::HashMap::new())),
         })
     }
+}
+
+/// Validate + parse a provider's outbound proxy URL. Shared by the request
+/// path (`client_for_provider`) and config validation so both reject the same
+/// URLs. http/https only — reqwest is built without the `socks` feature.
+pub fn build_proxy(url: &str, provider_name: &str) -> Result<reqwest::Proxy, String> {
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return Err(format!(
+            "provider '{}' proxy '{}': only http:// and https:// proxies are supported",
+            provider_name, url
+        ));
+    }
+    reqwest::Proxy::all(url)
+        .map_err(|e| format!("provider '{}' proxy '{}': invalid ({})", provider_name, url, e))
+}
+
+/// Pick the reqwest client for dialing `provider`'s upstream: the shared
+/// direct client, or a per-proxy-URL cached client when the provider sets an
+/// outbound `proxy`. Builder options mirror the shared client exactly.
+pub async fn client_for_provider(
+    state: &AppState,
+    provider: &Provider,
+) -> Result<reqwest::Client, String> {
+    let url = provider.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let Some(url) = url else {
+        return Ok(state.http_client.clone());
+    };
+    if let Some(c) = state.proxy_clients.read().await.get(url) {
+        return Ok(c.clone());
+    }
+    let proxy = build_proxy(url, &provider.name)?;
+    // Build OUTSIDE the write lock — a concurrent miss may also build one;
+    // last write wins, both clients are equivalent.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(crate::proxy::CONNECT_TIMEOUT))
+        .timeout(std::time::Duration::from_secs(3600))
+        .http1_only()
+        .proxy(proxy)
+        .build()
+        .map_err(|e| format!("provider '{}': failed to build proxied client ({})", provider.name, e))?;
+    state.proxy_clients.write().await.insert(url.to_string(), client.clone());
+    Ok(client)
 }
 
 /// Watch the config file directory for changes and auto-reload.
@@ -752,5 +807,32 @@ mod tests {
     #[test]
     fn test_management_key_default() {
         assert_eq!(default_management_key(), "aginxbrain-local");
+    }
+
+    #[test]
+    fn test_provider_proxy_serde_roundtrip() {
+        // present
+        let p: Provider = serde_yaml::from_str(
+            "name: OpenAI\napi_key: sk-x\nauth_type: bearer\nproxy: http://127.0.0.1:8118\n",
+        )
+        .unwrap();
+        assert_eq!(p.proxy.as_deref(), Some("http://127.0.0.1:8118"));
+        let back = serde_yaml::to_string(&p).unwrap();
+        assert!(back.contains("proxy: http://127.0.0.1:8118"));
+
+        // absent → None, and skipped on serialize
+        let p: Provider = serde_yaml::from_str("name: X\napi_key: k\n").unwrap();
+        assert!(p.proxy.is_none());
+        assert!(!serde_yaml::to_string(&p).unwrap().contains("proxy"));
+    }
+
+    #[test]
+    fn test_build_proxy_accepts_http_and_rejects_others() {
+        assert!(build_proxy("http://127.0.0.1:8118", "p").is_ok());
+        assert!(build_proxy("  https://proxy.example.com:3128  ", "p").is_ok());
+        // socks needs the reqwest `socks` feature, which we don't build with
+        for bad in ["socks5://127.0.0.1:1080", "127.0.0.1:8118", "not a url"] {
+            assert!(build_proxy(bad, "p").is_err(), "should reject: {}", bad);
+        }
     }
 }

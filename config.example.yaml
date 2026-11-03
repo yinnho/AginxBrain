@@ -6,6 +6,14 @@ providers:
     name: DeepSeek
     api_key: your-deepseek-key
     auth_type: bearer
+  # Provider-level outbound proxy: only this provider's upstream requests go
+  # through it (http/https proxies). Typical use: api.openai.com via a local
+  # US-exit proxy.
+  openai:
+    name: OpenAI
+    api_key: your-openai-key
+    auth_type: bearer
+    # proxy: http://127.0.0.1:8118
   zhipu:
     name: Zhipu GLM
     api_key: your-zhipu-key
@@ -71,6 +79,16 @@ routes:
     provider: deepseek
     tags: [gpt-5.5, codex]
     format: openai
+
+  # Real GPT via the platform key (Responses pass-through, Codex-native):
+  # swap the placeholder above for this route once the openai provider has a
+  # real key + proxy.
+  #
+  # - base_url: https://api.openai.com
+  #   model: gpt-5.5
+  #   provider: openai
+  #   tags: [gpt-5.5, codex]
+  #   format: openai_responses
 
   # ─── Multimodal routes ────────────────────────────────────────────────
   # The request path is derived from the format (e.g. openai → /v1/chat/completions).

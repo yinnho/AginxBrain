@@ -4,6 +4,8 @@ export interface Provider {
   name: string;
   api_key: string;
   auth_type: 'bearer' | 'x_api_key' | 'x_goog_api_key';
+  /** Optional outbound proxy (http/https) — only this provider's upstream requests go through it. */
+  proxy?: string;
 }
 
 export type RouteFormat =
