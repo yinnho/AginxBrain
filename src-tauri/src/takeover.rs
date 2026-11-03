@@ -252,11 +252,14 @@ pub fn take_over_codex(port: u16, default_model: &str) -> Result<String> {
     // requires_openai_auth = true + OPENAI_API_KEY in auth.json matches the
     // working v1 format.  Codex sends Authorization: Bearer PROXY_MANAGED with
     // every request; the proxy ignores auth and routes by tag regardless.
+    //
+    // No preferred_auth_method / disable_response_storage: current Codex
+    // (>= 0.14) ignores both and prints an "unrecognized configuration
+    // settings" warning on startup; requires_openai_auth + auth.json already
+    // cover what they used to do.
     let config_toml = format!(
         r#"model = "{model}"
 model_provider = "aginxbrain"
-preferred_auth_method = "apikey"
-disable_response_storage = true
 
 [model_providers.aginxbrain]
 name = "AginxBrain"
@@ -479,8 +482,6 @@ pub fn take_over_codex_remote(server: &str, api_key: &str) -> Result<bool> {
         r#"{marker}
 model = "gpt-5.5"
 model_provider = "aginxbrain"
-preferred_auth_method = "apikey"
-disable_response_storage = true
 
 [model_providers.aginxbrain]
 name = "AginxBrain"
