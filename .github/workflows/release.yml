@@ -125,5 +125,16 @@ jobs:
             - **macOS Intel**: `*_x64.dmg`
             - **Windows**: `*_x64-setup.exe` / `*_x64_en-US.msi`
 
-            Usage: open the app, enter your API key from brain.aginx.net, toggle Claude Code / Codex / Claude 桌面版 on. The Claude 桌面版 toggle takes effect after restarting the Claude app.
+            Usage: the app now runs the full gateway locally (manage it at `http://127.0.0.1:8083/` — create the admin account on first launch, then add providers/routes in the dashboard). Or keep using a remote server: enter your brain.aginx.net API key. Set `host: 0.0.0.0` in `~/.aginxbrain/config.yaml` and restart to share the gateway on the LAN — the app shows ready-to-copy onboarding snippets for colleagues.
+
+            **v0.5.0 changes**
+
+            桌面版从「瘦客户端」升级为「本地网关 + 瘦客户端」双模式：
+
+            - 桌面 App 启动即内嵌完整网关（默认 `127.0.0.1:8083`，托盘可打开管理台）；远程模式（brain.aginx.net + key）照旧可用
+            - Provider 级出站代理：每个 provider 可单独设 `proxy`（http/https），例如 OpenAI 走本地美国出口、其余国内 provider 直连
+            - `host: 0.0.0.0` 局域网共享：同事的 Claude Code / Codex 接入配置在 App 内一键复制
+            - fix: Codex 接管不再写 `preferred_auth_method` / `disable_response_storage`（新版 Codex 已废弃并启动告警）；已有配置删掉这两行即可
+
+            > macOS 未签名：dmg 打开后若提示「已损坏」，运行 `xattr -cr /Applications/AginxBrain.app` 后再启动。
           files: release-assets/*
