@@ -4657,6 +4657,46 @@ pub async fn pixmax_poll_task(
     if !mapped.is_empty() {
         let _ = crate::db::update_video_usage_by_task_id(&state.db, task_id, Some(mapped.into()), None, None).await;
     }
+    // Zombie-dispatch detection: pixmax occasionally accepts a task that its
+    // scheduler never picks up — the record is BORN at RUNNING/99 and never
+    // moves (observed 2026-11-09: two tasks wedged >1h, generate/cancel also
+    // refused them). Healthy tasks climb 2%→…→100 and only pass 99 briefly,
+    // and even their `updateTime` stays frozen, so age-at-99 is the only
+    // reliable signature. After PIXMAX_STUCK_SECS at 99 with zero completions,
+    // report failure so callers stop polling and resubmit instead of waiting
+    // forever.
+    const PIXMAX_STUCK_SECS: i64 = 900;
+    let progress = item.get("progress").and_then(|p| p.as_i64()).unwrap_or(0);
+    let completed = item.get("completedCount").and_then(|c| c.as_i64()).unwrap_or(0);
+    let created = item
+        .get("createTime")
+        .and_then(|c| c.as_i64())
+        .or_else(|| item.get("createTime").and_then(|c| c.as_str()).and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if status == "RUNNING" && progress >= 99 && completed == 0 && created > 0 && now - created > PIXMAX_STUCK_SECS {
+        log::warn!(
+            "[Proxy] pixmax task {} wedged (RUNNING/99 since creation, {}s old, cancel-refused upstream) — reporting failed",
+            task_id,
+            now - created
+        );
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("status".into(), Value::String("FAILED".into()));
+            obj.insert(
+                "providerErrorMsg".into(),
+                Value::String(
+                    "pixmax task wedged: accepted but never dispatched (stuck at 99% >15min); \
+                     please resubmit"
+                        .into(),
+                ),
+            );
+            obj.insert("stuck".into(), Value::Bool(true));
+        }
+        let _ = crate::db::update_video_usage_by_task_id(&state.db, task_id, Some("failed".into()), None, None).await;
+    }
     if let Some(obj) = item.as_object_mut() {
         obj.insert("task_id".into(), Value::String(task_id.to_string()));
         obj.insert("code".into(), Value::String("Success".into()));

@@ -372,6 +372,7 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 
 > - `webUrl` 已被服务端补全为 OSS 绝对地址（原始响应是相对路径 + `ossDomain`）。
 > - 480P 样片约 **1 分钟**出片；1080P 成片常要几分钟，轮询间隔建议 5–10s。
+> - **卡死检测**：pixmax 偶发「收了任务但调度器不执行」——任务出生即 `RUNNING/99` 且永不更新（2026-11-09 实测两条卡 1h+，连 cancel 都拒）。AginxBrain 在轮询侧识别：`RUNNING` + 99% + 零完成 + 创建超 15 分钟 → 返回 `FAILED` + `stuck: true` + `providerErrorMsg`（此时重提一次即可）。
 > - `PIXDANCE_2_5_DRAFT` 产出 `videoStage: "DRAFT"` 样片；成片需在 pixmax 网页端一键放大（CLI 的 generate-final 链路暂未接入）。
 > - 任务消耗 pixmax 账户余额（不是 token 计费），用量以 pixmax 后台为准。
 
