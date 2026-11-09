@@ -297,7 +297,7 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 
 ### 3.5 Pixmax（聚合视频 SaaS：Kling / Seedance / Vidu / Hailuo / Wan / PixVerse / MiniMax）
 
-还接入了 **Pixmax**（app.pixmax.cn，视频聚合平台）的画布协议后端，用独立的 `pixmax` 标签（或管理员配置的其他 tag）。同一套接口可切换平台上的全部视频模型——`route.model` 填 pixmax 模型代码：
+还接入了 **Pixmax**（app.pixmax.cn，视频聚合平台）的画布协议后端，用独立的 `pixmax` 标签（或管理员配置的其他 tag；brain.aginx.net 生产上 pixmax 路由同时挂了 `video` 标签并设为第一优先级——外部直接 `model: "video"` 即走 pixmax，wanx 兜底）。同一套接口可切换平台上的全部视频模型——`route.model` 填 pixmax 模型代码：
 
 | model 代码 | 说明 |
 |-----------|------|
