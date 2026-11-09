@@ -111,6 +111,12 @@ providers:                    # AI 提供商（真实 Key 在这里；只放凭�
     auth_type: bearer
     # proxy: http://127.0.0.1:8118  # 可选：仅该 provider 的上游走此代理
     #                                # （http/https；如 OpenAI 走美国出口）
+  # pixmax（视频聚合 SaaS，format: pixmax_video 的 provider）：api_key 放
+  # "subuser:{账号}:{密码}:{mainUserUuid}"（子账号登录链接 URL 里的 uuid），
+  # 引擎会 RSA 登录换 15 天 bearer token 并自动续期；也可直接放 token。
+  # 国内服务，直连即可（不要配 proxy）。route.model 填模型代码
+  # （PIXDANCE_2_5_DRAFT / KLING_4 / HAILUO_23 / WAN3_0 ...）。详见
+  # MULTIMODAL_USAGE.md §3.5。
 
 routes:                       # 路由规则（base_url 在 route 上）
   - base_url: https://api.deepseek.com

@@ -17,7 +17,7 @@
 | 服务地址 | `https://brain.aginx.net`（本地为 `http://127.0.0.1:8083`） |
 | 鉴权 | `Authorization: Bearer <caller_key>`（在管理后台创建的调用密钥） |
 | 统一入口 | `POST /v1/chat/completions`（OpenAI Chat 格式） |
-| 模型名 | 用**标签名**当 model：`tts` / `audio` / `video` / `ppt` / `seedance` / `seedream` / `seedream-lite`（AginxBrain 内部解析到具体后端模型） |
+| 模型名 | 用**标签名**当 model：`tts` / `audio` / `video` / `ppt` / `seedance` / `seedream` / `seedream-lite` / `pixmax`（AginxBrain 内部解析到具体后端模型） |
 
 四项能力**都复用 OpenAI Chat 接口**——把要处理的"内容"放在 `messages` 里，靠 `model` 字段区分走哪条管道：
 
@@ -25,7 +25,7 @@
 curl https://brain.aginx.net/v1/chat/completions \
   -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" \
-  -d '{ "model": "<tts|audio|video|ppt|seedance|seedream|seedream-lite>", "messages": [...] }'
+  -d '{ "model": "<tts|audio|video|ppt|seedance|seedream|seedream-lite|pixmax>", "messages": [...] }'
 ```
 
 `$KEY` 是你的 caller key。下文每节给出完整示例。
@@ -295,7 +295,82 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 > - `video_url` 是火山 TOS 签名链接，24h 有效，拿到后用 GET 下载。
 > - 换 Fast 版（更快更便宜）把 route 的 model 改成 `doubao-seedance-2-0-fast-260128` 即可。
 
-### 3.5 Seedream 5.0 文生图（火山方舟，配 Seedance 做图生视频）
+### 3.5 Pixmax（聚合视频 SaaS：Kling / Seedance / Vidu / Hailuo / Wan / PixVerse / MiniMax）
+
+还接入了 **Pixmax**（app.pixmax.cn，视频聚合平台）的画布协议后端，用独立的 `pixmax` 标签（或管理员配置的其他 tag）。同一套接口可切换平台上的全部视频模型——`route.model` 填 pixmax 模型代码：
+
+| model 代码 | 说明 |
+|-----------|------|
+| `PIXDANCE_2_5` / `PIXDANCE_2_5_DRAFT` | Seedance 2.5 成片 / 样片（样片便宜，先出样再出成片） |
+| `KLING_4` / `KLING_V3` / `KLING_2_6` | 可灵系列 |
+| `VIDU_Q4_PREVIEW` / `VIDU_Q3_PRO` | Vidu 系列 |
+| `HAILUO_23` / `HAILUO_02` | 海螺（MiniMax）系列 |
+| `WAN3_0` / `WAN2_6` | 万相系列 |
+| `PIXVERSE_V6` / `MINIMAX_H3` | PixVerse / MiniMax H3 |
+
+**提交**（文生视频，参数命名与 seedance 一致）：
+
+```bash
+curl -X POST https://brain.aginx.net/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "pixmax",
+    "messages": [
+      { "role": "user", "content": "一只红纸灯笼缓缓升上夜空，雪花轻落，电影感" }
+    ],
+    "resolution": "480p",
+    "ratio": "auto",
+    "duration": 5,
+    "generate_audio": false,
+    "count": 1
+  }'
+```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `resolution` | `480p` / `720p` / `1080p`（按模型支持） | `720p` |
+| `ratio` | `16:9` / `9:16` / `1:1` / `auto`（自适应） | `auto` |
+| `duration` | 秒数（按模型支持） | `5` |
+| `generate_audio` | 是否生成音频 | `true` |
+| `count` | 出几条（`1`/`2`/`4`） | `1` |
+
+> **暂不支持图生视频**（i2v 需要资产上传链路）；带 `image_url` 的请求会直接报错。
+
+**提交响应**（与 wanx / seedance 同 shape）：
+```json
+{ "code": "Success", "task_id": "062ecc6e-84b0-4f41-8479-6583db1c526e", "task_status": "queue", "tag": "pixmax" }
+```
+
+**轮询**：`GET /v1/tasks/pixmax/{task_id}`。返回 pixmax 原生任务对象（`task_id` 即提交返回的 nodeUuid）：
+
+```json
+{
+  "taskUuid": "1f1dc295-...",
+  "nodeUuid": "062ecc6e-...",
+  "task_id": "062ecc6e-...",
+  "code": "Success",
+  "status": "COMPLETE",
+  "progress": 100,
+  "resultAssets": [
+    {
+      "webUrl": "https://pixmax-prod.oss-accelerate.aliyuncs.com/static/video/....mp4",
+      "ossDomain": "https://pixmax-prod.oss-accelerate.aliyuncs.com",
+      "videoStage": "DRAFT",
+      "metaData": { "duration": 5.0, "width": 864, "height": 496 }
+    }
+  ]
+}
+```
+
+`status` 取值：`QUEUE` / `WAITING_CONCURRENCY` / `RUNNING`（进行中）→ `COMPLETE`（成功，取 `resultAssets[].webUrl`）/ `FAILED` / `ABORTED`（失败，看 `providerErrorMsg`）。
+
+> - `webUrl` 已被服务端补全为 OSS 绝对地址（原始响应是相对路径 + `ossDomain`）。
+> - 480P 样片约 **1 分钟**出片；1080P 成片常要几分钟，轮询间隔建议 5–10s。
+> - `PIXDANCE_2_5_DRAFT` 产出 `videoStage: "DRAFT"` 样片；成片需在 pixmax 网页端一键放大（CLI 的 generate-final 链路暂未接入）。
+> - 任务消耗 pixmax 账户余额（不是 token 计费），用量以 pixmax 后台为准。
+
+### 3.6 Seedream 5.0 文生图（火山方舟，配 Seedance 做图生视频）
 
 Seedance 会**拒识「真人」首帧**（photograph of a real human）。绕过办法：用 **Seedream 5.0**（字节文生图）生成首帧--AI 生成的图被当作非真人，Seedance 放行。两个 tag：
 
@@ -329,7 +404,7 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 ] }
 ```
 
-### 3.6 短剧完整链路（short-drama -> seedream -> seedance）
+### 3.7 短剧完整链路（short-drama -> seedream -> seedance）
 
 把上面三块串起来就是短剧生成流水线：
 

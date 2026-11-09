@@ -110,6 +110,12 @@ pub enum ProviderFormat {
     Seedance,
     #[serde(rename = "minimax_image")]
     MinimaxImage,
+    /// Pixmax (app.pixmax.cn) canvas video generation. Session-cookie SaaS:
+    /// provider.api_key carries packed credentials (see CLAUDE.md), requests
+    /// go to {base}/user/api/* — agent-canvas-v1 protocol (node create →
+    /// generate submit → progress poll).
+    #[serde(rename = "pixmax_video")]
+    PixmaxVideo,
 }
 
 fn default_format() -> ProviderFormat {
@@ -139,6 +145,7 @@ impl ProviderFormat {
             ProviderFormat::Kling => "/v1/videos/text2video",
             ProviderFormat::Seedance => "/api/v3/contents/generations/tasks",
             ProviderFormat::MinimaxImage => "/v1/image_generation",
+            ProviderFormat::PixmaxVideo => "/user/api/generate/batch",
         }
     }
 }

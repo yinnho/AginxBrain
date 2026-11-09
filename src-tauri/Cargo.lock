@@ -30,6 +30,7 @@ dependencies = [
  "notify",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "rsa",
  "rust-embed",
  "serde",
  "serde_json",

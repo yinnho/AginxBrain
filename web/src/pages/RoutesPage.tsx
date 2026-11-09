@@ -18,7 +18,9 @@ function formatDefaultPath(fmt: RouteFormat): string {
     dashscope_tts: '/api/v1/services/aigc/text-to-speech/stream',
     dashscope_asr: '/v1/chat/completions',
     kling: '/v1/videos/text2video',
+    seedance: '/api/v3/contents/generations/tasks',
     minimax_image: '/v1/image_generation',
+    pixmax_video: '/user/api/generate/batch',
   };
   return paths[fmt] || '';
 }
@@ -396,6 +398,8 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
           <option value="dashscope_asr">DashScope ASR</option>
           <option value="kling">Kling</option>
           <option value="minimax_image">MiniMax Image</option>
+          <option value="seedance">Seedance (Volcano Ark Video)</option>
+          <option value="pixmax_video">Pixmax Video</option>
         </Select>
         <Input label="Path" value={path} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPath(e.target.value)} placeholder={formatDefaultPath(format)} />
         {endpoint && <div style={{ gridColumn: '1 / -1', fontSize: 12, background: 'var(--bg-surface)', padding: '6px 10px', borderRadius: 6, fontFamily: 'monospace' }}>Endpoint: <span style={{ color: 'var(--accent)' }}>{endpoint}</span></div>}

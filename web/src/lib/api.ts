@@ -19,7 +19,9 @@ export type RouteFormat =
   | 'dashscope_asr'
   | 'dashscope_chat_image'
   | 'kling'
-  | 'minimax_image';
+  | 'seedance'
+  | 'minimax_image'
+  | 'pixmax_video';
 
 export interface Route {
   id: string;

@@ -235,6 +235,13 @@ pub async fn handle_task_poll(
                 route.provider
             )));
         }
+
+        // Pixmax polls via an authenticated POST, not a plain GET passthrough.
+        if matches!(route.format, ProviderFormat::PixmaxVideo) {
+            let item = pixmax_poll_task(&state, &provider, route, &task_id).await?;
+            return Ok(Json(item).into_response());
+        }
+
         let task_url = task_poll_url(route, &task_id);
         (task_url, provider)
     };
@@ -1122,6 +1129,16 @@ async fn handle_proxy(
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
                             log::warn!("[Proxy] seedance route failed: {}", e);
+                            if is_retryable(&e) { last_error = Some(e); continue; }
+                            return Err(e);
+                        }
+                    }
+                }
+                ProviderFormat::PixmaxVideo => {
+                    match handle_pixmax_video_request(state.clone(), caller_key_id, route, provider, &body, start).await {
+                        Ok(resp) => return Ok(resp),
+                        Err(e) => {
+                            log::warn!("[Proxy] pixmax route failed: {}", e);
                             if is_retryable(&e) { last_error = Some(e); continue; }
                             return Err(e);
                         }
@@ -3456,6 +3473,7 @@ fn format_string(format: &ProviderFormat) -> String {
         ProviderFormat::Kling => "kling",
         ProviderFormat::Seedance => "seedance",
         ProviderFormat::MinimaxImage => "minimax_image",
+        ProviderFormat::PixmaxVideo => "pixmax_video",
     }.to_string()
 }
 
@@ -3782,6 +3800,715 @@ async fn handle_seedance_video_request(
         "code": "Success"
     });
     Ok(Json(resp).into_response())
+}
+
+// ─── Pixmax (app.pixmax.cn) video generation ─────────────────────────────────
+//
+// Pixmax is a video SaaS with no OpenAPI for this account, so we drive the
+// browser-facing /user/api with the agent-canvas-v1 protocol (reverse-engineered
+// from the official pixmax-cli skill): one shared canvas file holds
+// GENERATE_VIDEO nodes; a submit = canvas get (revision) → node/batch create →
+// generate/batch; the poll = generate/progress keyed by nodeUuid.
+//
+// Auth is a 15-day bearer token. provider.api_key carries either the bare
+// token, or packed renew credentials "subuser:{account}:{password}:{mainUserUuid}"
+// (RSA-encrypted sub-user login renews the token automatically).
+
+/// Pixmax site RSA system public key (X.509 SPKI, base64) — the web app's
+/// VITE_PIXMAX_RSA_SYSTEM_PUB, mirrored in pixmax-cli's config.py.
+const PIXMAX_RSA_PUB: &str = "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDrJMmCeIkfaRK2JCvTVGPxd3kpO1MVanc+89XShiOFAWRcXFIx7X+nC5m5Z0bNM3OnP4Cz/Xl9w//Ib12cE9cjj16Hc3eHsUe8ImX5RQugEhpyb8aHECqqjG83RMEjPiBflr+/RnKiyjX6vTlSRc63moCzMB2zXBntmPdpB2yMhwIDAQAB";
+
+/// Canvas label on every node AginxBrain creates — identifies our nodes for
+/// garbage collection on the shared canvas.
+const PIXMAX_NODE_LABEL: &str = "AginxBrain";
+
+#[derive(Clone, Debug)]
+struct PixmaxSession {
+    token: String,
+    /// Enterprise sub-account current team — required as a cookie on every
+    /// /user/api call (errCode Enterprise.TeamUuid.Required otherwise).
+    team_uuid: String,
+    /// Canvas file all video nodes live in.
+    file_uuid: String,
+}
+
+static PIXMAX_SESSIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PixmaxSession>>> =
+    std::sync::OnceLock::new();
+
+fn pixmax_sessions() -> &'static std::sync::Mutex<std::collections::HashMap<String, PixmaxSession>> {
+    PIXMAX_SESSIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Resolve the /user/api base from the route's base_url. Accepts both
+/// "https://app.pixmax.cn" and "https://app.pixmax.cn/user/api" spellings.
+fn pixmax_api_base(route: &Route) -> String {
+    let base = route.base_url.trim_end_matches('/');
+    let base = base.strip_suffix("/user/api").unwrap_or(base);
+    format!("{}/user/api", base)
+}
+
+/// provider.api_key is either a bare bearer token or packed renewal
+/// credentials. Split into (token, login credentials).
+fn pixmax_credentials(provider: &Provider) -> (Option<String>, Option<[String; 3]>) {
+    let key = provider.api_key.trim();
+    if let Some(rest) = key.strip_prefix("subuser:") {
+        let parts: Vec<&str> = rest.splitn(3, ':').collect();
+        if parts.len() == 3 && parts.iter().all(|p| !p.is_empty()) {
+            return (
+                None,
+                Some([parts[0].into(), parts[1].into(), parts[2].into()]),
+            );
+        }
+    }
+    if key.is_empty() {
+        (None, None)
+    } else {
+        (Some(key.to_string()), None)
+    }
+}
+
+/// PKCS#1 v1.5-encrypt the password with the site key (JSEncrypt-compatible).
+fn pixmax_encrypt_password(password: &str) -> Result<String, ProxyError> {
+    use base64::Engine;
+    use rsa::pkcs8::DecodePublicKey;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(PIXMAX_RSA_PUB)
+        .map_err(|e| ProxyError::Upstream(format!("pixmax rsa key decode: {}", e)))?;
+    let key = rsa::RsaPublicKey::from_public_key_der(&der)
+        .map_err(|e| ProxyError::Upstream(format!("pixmax rsa key parse: {}", e)))?;
+    let mut rng = rand::thread_rng();
+    let ct = key
+        .encrypt(&mut rng, rsa::Pkcs1v15Encrypt, password.as_bytes())
+        .map_err(|e| ProxyError::Upstream(format!("pixmax rsa encrypt: {}", e)))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(ct))
+}
+
+/// Raw pixmax POST — Bearer token + team cookie. Returns the parsed envelope
+/// (business success flag included; callers check it).
+async fn pixmax_post_raw(
+    state: &AppState,
+    provider: &Provider,
+    url: &str,
+    token: &str,
+    team_uuid: &str,
+    body: &Value,
+) -> Result<Value, ProxyError> {
+    let http = crate::config::client_for_provider(state, provider)
+        .await
+        .map_err(ProxyError::Upstream)?;
+    let mut builder = http
+        .post(url)
+        .header("authorization", format!("Bearer {}", token))
+        .header("origin", "https://app.pixmax.cn")
+        .header("referer", "https://app.pixmax.cn/");
+    if !team_uuid.is_empty() {
+        builder = builder.header("cookie", format!("pixmax-current-team-uuid={}", team_uuid));
+    }
+    let resp = builder
+        .json(body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+    // Pixmax signals business failures (including auth) as JSON envelopes, at
+    // any HTTP status — return the envelope so callers can retry on auth races
+    // instead of losing the errCode. Only non-JSON bodies stay errors.
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("pixmax read body: {}", e)))?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) if v.get("success").is_some() || v.get("errCode").is_some() => Ok(v),
+        Ok(v) if status.is_success() => Ok(v),
+        _ => Err(ProxyError::Upstream(format!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            truncate_chars(&text, 300)
+        ))),
+    }
+}
+
+/// True when the pixmax envelope indicates the bearer token died — re-login
+/// and retry once. Token lifetime is ~15 days; errCodes seen/expected carry
+/// Login/Auth/Token fragments, and an HTTP 401 body reaches here as text.
+fn pixmax_is_auth_error(envelope: &Value) -> bool {
+    let code = envelope.get("errCode").and_then(|v| v.as_str()).unwrap_or("");
+    let msg = envelope
+        .get("errMessage")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let hay = format!("{} {}", code, msg).to_lowercase();
+    hay.contains("login") || hay.contains("token") || hay.contains("auth") || hay.contains("401")
+}
+
+/// Get the session (token + team + canvas file), logging in and bootstrapping
+/// the canvas on first use. Cached per provider name.
+async fn pixmax_ensure_session(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+) -> Result<PixmaxSession, ProxyError> {
+    if let Some(s) = pixmax_sessions().lock().unwrap().get(&provider.name) {
+        return Ok(s.clone());
+    }
+    let base = pixmax_api_base(route);
+    let (bare_token, creds) = pixmax_credentials(provider);
+    if bare_token.is_none() && creds.is_none() {
+        return Err(ProxyError::Upstream(format!(
+            "pixmax provider '{}' has no api_key (set a bearer token or subuser:{{account}}:{{password}}:{{mainUserUuid}})",
+            provider.name
+        )));
+    }
+
+    // 1. Token: bare if given, else sub-user RSA login.
+    let token = match bare_token {
+        Some(t) => t,
+        None => {
+            let [account, password, main_user_uuid] = creds.unwrap();
+            let enc = pixmax_encrypt_password(&password)?;
+            let login = pixmax_post_raw(
+                state,
+                provider,
+                &format!("{}/sub-user/login", base),
+                "",
+                "",
+                &json!({
+                    "mainUserUuid": main_user_uuid,
+                    "subUserAccount": account,
+                    "password": enc
+                }),
+            )
+            .await?;
+            let token = login
+                .get("data")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .ok_or_else(|| {
+                    ProxyError::Upstream(format!(
+                        "pixmax login failed: {}",
+                        truncate_chars(&login.to_string(), 200)
+                    ))
+                })?;
+            // A token minted moments ago can be rejected once before its
+            // session propagates — give it a head start (observed seconds).
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            token
+        }
+    };
+
+    // 2. Team: sub-accounts must pin the current team as a cookie.
+    let teams = pixmax_post_raw(
+        state,
+        provider,
+        &format!("{}/enterprise/team/current-sub-user/list", base),
+        &token,
+        "",
+        &json!({}),
+    )
+    .await?;
+    let team_uuid = teams
+        .pointer("/data/0/teamUuid")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| ProxyError::Upstream("pixmax: no team found for account".into()))?;
+
+    // 3. Canvas: find or create the dedicated project + file.
+    let file_uuid = pixmax_ensure_canvas_file(state, provider, &base, &token, &team_uuid).await?;
+
+    let session = PixmaxSession {
+        token,
+        team_uuid,
+        file_uuid,
+    };
+    pixmax_sessions()
+        .lock()
+        .unwrap()
+        .insert(provider.name.clone(), session.clone());
+    log::info!(
+        "[Proxy] pixmax session ready: provider={} file_uuid={}",
+        provider.name,
+        session.file_uuid
+    );
+    Ok(session)
+}
+
+/// Find or create project "AginxBrain" and its "video" canvas file. Returns
+/// the fileUuid.
+async fn pixmax_ensure_canvas_file(
+    state: &AppState,
+    provider: &Provider,
+    base: &str,
+    token: &str,
+    team_uuid: &str,
+) -> Result<String, ProxyError> {
+    // Project: search by keyword, create when missing.
+    let list = pixmax_post_raw(state, provider, &format!("{}/project/list", base), token, team_uuid, &json!({"pageIndex": 1, "pageSize": 20, "keyword": PIXMAX_NODE_LABEL})).await?;
+    let project_uuid = (list.pointer("/data/data").and_then(|v| v.as_array()).cloned().unwrap_or_default())
+        .iter()
+        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some(PIXMAX_NODE_LABEL))
+        .and_then(|p| p.get("uuid").and_then(|u| u.as_str()).map(String::from));
+    let project_uuid = match project_uuid {
+        Some(u) => u,
+        None => {
+            let created = pixmax_post_raw(state, provider, &format!("{}/project/createOrUpdate", base), token, team_uuid, &json!({"name": PIXMAX_NODE_LABEL, "projectType": "PERSONAL"})).await?;
+            created.get("data").and_then(|v| v.as_str()).map(String::from).ok_or_else(|| {
+                ProxyError::Upstream(format!(
+                    "pixmax: project create failed: {}",
+                    truncate_chars(&created.to_string(), 200)
+                ))
+            })?
+        }
+    };
+
+    // File: walk the project tree for a FILE named "video", create when missing.
+    let tree = pixmax_post_raw(state, provider, &format!("{}/project/file/tree", base), token, team_uuid, &json!({"projectUuid": project_uuid})).await?;
+    fn find_video_file(items: &[Value]) -> Option<String> {
+        for item in items {
+            if item.get("type").and_then(|t| t.as_str()) == Some("FILE")
+                && item.get("name").and_then(|n| n.as_str()) == Some("video")
+            {
+                if let Some(u) = item.get("uuid").and_then(|u| u.as_str()) {
+                    return Some(u.to_string());
+                }
+            }
+            if let Some(children) = item.get("children").and_then(|c| c.as_array()) {
+                if let Some(found) = find_video_file(children) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    let tree_items = tree.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    if let Some(found) = find_video_file(&tree_items) {
+        return Ok(found);
+    }
+    let created = pixmax_post_raw(state, provider, &format!("{}/project/file/create", base), token, team_uuid, &json!({"projectUuid": project_uuid, "name": "video", "type": "FILE"})).await?;
+    created.get("data").and_then(|v| v.as_str()).map(String::from).ok_or_else(|| {
+        ProxyError::Upstream(format!(
+            "pixmax: file create failed: {}",
+            truncate_chars(&created.to_string(), 200)
+        ))
+    })
+}
+
+/// Authenticated pixmax call, resilient to two observed flakiness modes:
+/// 1. A token minted seconds ago can be rejected once ("UNAUTHORIZED / No
+///    login" or a bare "System Error") before the session propagates — retry
+///    the same token after a short backoff.
+/// 2. A genuinely expired token (~15 days) — drop the cached session,
+///    re-login (when renewal credentials are packed in api_key), retry once.
+async fn pixmax_call(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    endpoint: &str,
+    body: &Value,
+) -> Result<Value, ProxyError> {
+    let base = pixmax_api_base(route);
+    let session = pixmax_ensure_session(state, provider, route).await?;
+    // endpoints arrive with a leading slash; don't double it — pixmax routes
+    // "/user/api//x" to an auth catch-all (observed as 401 No login).
+    let url = format!("{}/{}", base, endpoint.trim_start_matches('/'));
+    let mut result = pixmax_post_raw(state, provider, &url, &session.token, &session.team_uuid, body).await?;
+
+    if !pixmax_succeeded(&result) && pixmax_is_transient(&result) {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        result = pixmax_post_raw(state, provider, &url, &session.token, &session.team_uuid, body).await?;
+    }
+    if !pixmax_succeeded(&result) && pixmax_is_auth_error(&result) {
+        pixmax_sessions().lock().unwrap().remove(&provider.name);
+        let session = pixmax_ensure_session(state, provider, route).await?;
+        result = pixmax_post_raw(state, provider, &url, &session.token, &session.team_uuid, body).await?;
+    }
+
+    if !pixmax_succeeded(&result) {
+        return Err(ProxyError::Upstream(format!(
+            "pixmax {}: {}",
+            result.get("errCode").and_then(|v| v.as_str()).unwrap_or("?"),
+            result
+                .get("errMessage")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
+        )));
+    }
+    Ok(result)
+}
+
+fn pixmax_succeeded(envelope: &Value) -> bool {
+    envelope.get("success").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Auth failures plus bare "System Error" 500s — both observed as one-shot
+/// rejections right after a fresh login that clear on retry.
+fn pixmax_is_transient(envelope: &Value) -> bool {
+    if pixmax_is_auth_error(envelope) {
+        return true;
+    }
+    envelope.get("errCode").and_then(|v| v.as_str()) == Some("500")
+}
+
+/// Client body (OpenAI chat, mirroring the seedance contract):
+///   messages: [{role:user, content:"<prompt>"}]
+///   resolution: "480p"|"720p"|"1080p"   (default "720p")
+///   ratio:      "16:9"|"9:16"|...|"auto" (default "auto" → pixmax "adaptive")
+///   duration:   seconds                   (default 5)
+///   generate_audio: bool                  (default true)
+///   n / count:  1|2|4                     (default 1)
+/// route.model is the pixmax modelCode (PIXDANCE_2_5, KLING_4, HAILUO_23, ...).
+/// Image-to-video is not supported (needs the asset upload + BASE_IMAGE node
+/// chain); v1 is text-to-video only.
+///
+/// Submit = canvas get → node/batch create → generate/batch. task_id returned
+/// to the client is the nodeUuid (generate/progress is keyed by node).
+async fn handle_pixmax_video_request(
+    state: AppState,
+    caller_key_id: Option<i64>,
+    route: &Route,
+    provider: &Provider,
+    body: &Value,
+    start: std::time::Instant,
+) -> Result<Response, ProxyError> {
+    let prompt = last_user_text(body)
+        .ok_or_else(|| ProxyError::Upstream("pixmax: no text prompt found in messages".into()))?;
+    if find_first_image_url(body).is_some() {
+        return Err(ProxyError::Upstream(
+            "pixmax: image-to-video is not supported yet (text-to-video only)".into(),
+        ));
+    }
+    let tag = route.tags.first().cloned().unwrap_or_else(|| "pixmax".to_string());
+
+    // pixmax wants every param as a string.
+    let resolution = body
+        .get("resolution")
+        .and_then(|v| v.as_str())
+        .unwrap_or("720p")
+        .to_uppercase(); // "720p" → "720P"
+    let ratio = body.get("ratio").and_then(|v| v.as_str()).unwrap_or("auto");
+    let aspect_ratio = match ratio {
+        "auto" | "" => "adaptive",
+        other => other,
+    }
+    .to_string();
+    let duration = body
+        .get("duration")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .to_string();
+    let count = body
+        .get("count")
+        .or_else(|| body.get("n"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .to_string();
+    let include_audio = if body.get("generate_audio").and_then(|v| v.as_bool()) == Some(false) {
+        "false"
+    } else {
+        "true"
+    };
+
+    log::info!(
+        "[Proxy] pixmax → {} (model={}, prompt {} chars)",
+        provider.name,
+        route.model,
+        prompt.len()
+    );
+
+    let session = pixmax_ensure_session(&state, provider, route).await?;
+
+    // Canvas read: revision for the optimistic-concurrency batch, plus the
+    // node list for occasional garbage collection of our old nodes.
+    let canvas = pixmax_call(
+        &state,
+        provider,
+        route,
+        "/canvas/get",
+        &json!({"fileUuid": session.file_uuid}),
+    )
+    .await?;
+    let canvas_data = canvas.get("data").cloned().unwrap_or(Value::Null);
+    let mut revision = canvas_data
+        .get("revision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Non-fatal GC: above 200 of our nodes, delete all but the newest 50 in a
+    // separate batch (a failure here must never block a generation).
+    let nodes = canvas_data
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .cloned()
+        .unwrap_or_default();
+    pixmax_gc_nodes(&state, provider, route, &session, &nodes).await;
+
+    // Create the GENERATE_VIDEO node. Retry on revision conflict /
+    // duplicate-submission (5s per-file dedup lock) with fresh revision,
+    // mirroring the CLI's ≤3 attempts.
+    let node_uuid = uuid::Uuid::new_v4().to_string();
+    let meta = json!({
+        "data": {"label": PIXMAX_NODE_LABEL, "workflow": "text-to-video"},
+        "position": {"x": 0, "y": 0}
+    })
+    .to_string();
+    let node = json!({
+        "uuid": node_uuid,
+        "fileUuid": session.file_uuid,
+        "type": "GENERATE_VIDEO",
+        "isGenerateNode": true,
+        "metaData": meta,
+        "defaultAssetUuid": "",
+        "params": {
+            "model": route.model,
+            "prompt": prompt,
+            "resolution": resolution,
+            "aspectRatio": aspect_ratio,
+            "duration": duration,
+            "referModel": "textToVideo",
+            "includeAudio": include_audio,
+            "count": count
+        },
+        "prevNodeUuids": []
+    });
+    let mut created = Err(ProxyError::Upstream("pixmax: node create not attempted".into()));
+    for attempt in 0..3 {
+        let batch = json!({
+            "fileUuid": session.file_uuid,
+            "baseRevision": revision,
+            "create": [node],
+            "update": [],
+            "delete": []
+        });
+        created = pixmax_call(&state, provider, route, "/canvas/node/batch", &batch).await;
+        match &created {
+            Ok(_) => break,
+            Err(e) if attempt < 2 && pixmax_is_batch_retryable(e) => {
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                let canvas = pixmax_call(
+                    &state,
+                    provider,
+                    route,
+                    "/canvas/get",
+                    &json!({"fileUuid": session.file_uuid}),
+                )
+                .await?;
+                revision = canvas
+                    .pointer("/data/revision")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+            Err(_) => break,
+        }
+    }
+    created?;
+
+    // Submit the generation task.
+    let gen = pixmax_call(
+        &state,
+        provider,
+        route,
+        "/generate/batch",
+        &json!({"fileUuid": session.file_uuid, "nodeUuids": [node_uuid], "nodes": [node_uuid]}),
+    )
+    .await?;
+    let task_status = gen
+        .pointer("/data/0/status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("QUEUE")
+        .to_lowercase();
+
+    log::info!(
+        "[Proxy] pixmax task submitted: task_id={} status={} latency={}ms",
+        node_uuid,
+        task_status,
+        start.elapsed().as_millis()
+    );
+
+    let usage_id = crate::db::insert_usage_log(
+        &state.db,
+        crate::db::UsageInsert {
+            caller_key_id,
+            tag: tag.clone(),
+            provider: provider.name.clone(),
+            model: route.model.clone(),
+            request_model: route.model.clone(),
+            modality: "video_generation".into(),
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: start.elapsed().as_millis() as i64,
+            status: "submitted".into(),
+            error_message: None,
+        },
+    )
+    .await;
+    if let Ok(id) = usage_id {
+        let _ = crate::db::set_usage_task_id(&state.db, id, &node_uuid).await;
+    }
+
+    let resp = json!({
+        "task_id": node_uuid,
+        "task_status": task_status,
+        "tag": tag,
+        "code": "Success"
+    });
+    Ok(Json(resp).into_response())
+}
+
+/// Batch-write rejections that are safe to retry with the same payload:
+/// revision CAS conflict and the per-file 5s duplicate-submission lock.
+fn pixmax_is_batch_retryable(e: &ProxyError) -> bool {
+    let msg = e.to_string();
+    msg.contains("Canvas.Revision.Conflict") || msg.contains("DUPLICATE_SUBMISSION")
+}
+
+/// Delete our oldest canvas nodes once they pile up, keeping the newest 50.
+/// Runs only past a 200-node threshold, as its own batch call so a GC failure
+/// never blocks the generation path. Errors are logged and swallowed.
+async fn pixmax_gc_nodes(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    session: &PixmaxSession,
+    nodes: &[Value],
+) {
+    let mut ours: Vec<&Value> = nodes.iter().filter(|n| pixmax_is_our_node(n)).collect();
+    if ours.len() < 200 {
+        return;
+    }
+    // Newest last (updateTime epoch string) — drop all but the newest 50.
+    ours.sort_by_key(|n| {
+        n.get("updateTime")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0)
+    });
+    let doomed: Vec<String> = ours[..ours.len() - 50]
+        .iter()
+        .filter_map(|n| n.get("uuid").and_then(|u| u.as_str()).map(String::from))
+        .collect();
+
+    let canvas = match pixmax_call(
+        state,
+        provider,
+        route,
+        "/canvas/get",
+        &json!({"fileUuid": session.file_uuid}),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("[Proxy] pixmax gc: canvas read failed (skipping): {}", e);
+            return;
+        }
+    };
+    let revision = match canvas.pointer("/data/revision").and_then(|v| v.as_str()) {
+        Some(r) => r.to_string(),
+        None => {
+            log::warn!("[Proxy] pixmax gc: no revision, skipping");
+            return;
+        }
+    };
+    let batch = json!({
+        "fileUuid": session.file_uuid,
+        "baseRevision": revision,
+        "create": [],
+        "update": [],
+        "delete": doomed
+    });
+    match pixmax_call(state, provider, route, "/canvas/node/batch", &batch).await {
+        Ok(_) => log::info!("[Proxy] pixmax gc: trimmed old nodes"),
+        Err(e) => log::warn!("[Proxy] pixmax gc failed (ignored): {}", e),
+    }
+}
+
+/// A node is ours when its metaData label is the AginxBrain label. metaData is
+/// a JSON string on the wire; tolerate unparsable values (never GC those).
+fn pixmax_is_our_node(node: &Value) -> bool {
+    let meta = node.get("metaData").and_then(|m| m.as_str()).unwrap_or("");
+    serde_json::from_str::<Value>(meta)
+        .ok()
+        .and_then(|m| m.pointer("/data/label").cloned())
+        .and_then(|l| l.as_str().map(String::from))
+        .map(|l| l == PIXMAX_NODE_LABEL)
+        .unwrap_or(false)
+}
+
+/// Absolutize a pixmax asset URL: results carry a relative webUrl plus the
+/// OSS domain it lives on ("/static/video/..." + "https://pixmax-prod.oss...").
+fn pixmax_absolutize(asset: &mut Value) {
+    let domain = asset
+        .get("ossDomain")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_string();
+    if domain.is_empty() {
+        return;
+    }
+    for key in ["webUrl", "previewWebUrl", "thumbnailWebUrl", "thumbnailVideoWebUrl"] {
+        let url = asset
+            .get(key)
+            .and_then(|u| u.as_str())
+            .map(String::from)
+            .filter(|u| !u.starts_with("http://") && !u.starts_with("https://"));
+        if let Some(url) = url {
+            if let Some(obj) = asset.as_object_mut() {
+                obj.insert(
+                    key.to_string(),
+                    Value::String(format!("{}/{}", domain, url.trim_start_matches('/'))),
+                );
+            }
+        }
+    }
+}
+
+/// Poll a pixmax video task: POST /generate/progress {nodeUuids:[task_id]}.
+/// Returns the task item with absolutized result asset URLs, flattened to the
+/// top level (status / progress / resultAssets / providerErrorMsg).
+pub async fn pixmax_poll_task(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    task_id: &str,
+) -> Result<Value, ProxyError> {
+    let result = pixmax_call(
+        state,
+        provider,
+        route,
+        "/generate/progress",
+        &json!({"nodeUuids": [task_id]}),
+    )
+    .await?;
+    let mut item = result
+        .pointer("/data/0")
+        .cloned()
+        .ok_or_else(|| ProxyError::Upstream("pixmax: no task in progress response".into()))?;
+    if let Some(assets) = item.get_mut("resultAssets").and_then(|a| a.as_array_mut()) {
+        for asset in assets.iter_mut() {
+            pixmax_absolutize(asset);
+        }
+    }
+    // Map pixmax statuses onto the shared async-task vocabulary so the usage
+    // log rows line up with wanx/seedance history.
+    let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    let mapped = match status {
+        "COMPLETE" => "succeeded",
+        "FAILED" => "failed",
+        "ABORTED" => "cancelled",
+        _ => "",
+    };
+    if !mapped.is_empty() {
+        let _ = crate::db::update_video_usage_by_task_id(&state.db, task_id, Some(mapped.into()), None, None).await;
+    }
+    if let Some(obj) = item.as_object_mut() {
+        obj.insert("task_id".into(), Value::String(task_id.to_string()));
+        obj.insert("code".into(), Value::String("Success".into()));
+    }
+    Ok(item)
 }
 
 /// TTS: call DashScope text-to-speech, save audio bytes to disk, return a
@@ -4327,6 +5054,77 @@ async fn test_image_route(
     }
 }
 
+/// Pixmax-route variant of the admin Test request: bootstrap the full session
+/// (login → team → canvas) and read the credit balance. Read-only — no node,
+/// no generation, no credits spent.
+async fn test_pixmax_route(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    tag: &str,
+) -> TestResult {
+    let start = std::time::Instant::now();
+    let base = TestResult {
+        success: false,
+        tag: tag.to_string(),
+        provider: provider.name.clone(),
+        model: route.model.clone(),
+        format: "PixmaxVideo".to_string(),
+        latency_ms: 0,
+        error: None,
+        response: None,
+    };
+    let session = match pixmax_ensure_session(state, provider, route).await {
+        Ok(s) => s,
+        Err(e) => {
+            return TestResult { error: Some(format!("{}", e)), latency_ms: start.elapsed().as_millis() as u64, ..base }
+        }
+    };
+    // GET /credit/balance (this endpoint rejects POST with a System Error).
+    let balance = async {
+        let http = crate::config::client_for_provider(state, provider)
+            .await
+            .map_err(ProxyError::Upstream)?;
+        let resp = http
+            .get(format!("{}/credit/balance", pixmax_api_base(route)))
+            .header("authorization", format!("Bearer {}", session.token))
+            .header("cookie", format!("pixmax-current-team-uuid={}", session.team_uuid))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        parse_image_response(resp).await
+    }
+    .await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+    match balance {
+        Ok(b) if b.get("success").and_then(|v| v.as_bool()) == Some(true) => TestResult {
+            success: true,
+            latency_ms,
+            response: Some(json!({
+                "session": "ok",
+                "file_uuid": truncate_chars(&session.file_uuid, 40),
+                "quota_balance": b.pointer("/data/quotaBalance"),
+                "recharge_balance": b.pointer("/data/rechargeCreditBalance"),
+            })),
+            ..base
+        },
+        Ok(b) => TestResult {
+            error: Some(format!(
+                "session ok, credit check failed: {}",
+                truncate_chars(&b.to_string(), 200)
+            )),
+            latency_ms,
+            ..base
+        },
+        Err(e) => TestResult {
+            error: Some(format!("session ok, credit check failed: {}", e)),
+            latency_ms,
+            ..base
+        },
+    }
+}
+
 /// Send a test request to a single specific route (no failover).
 /// Returns the TestResult directly — either success or the specific error.
 async fn send_test_to_route(
@@ -4374,6 +5172,12 @@ async fn send_test_to_route(
     // path below.
     if is_image_format(&route.format) {
         return test_image_route(state, provider, route, tag).await;
+    }
+
+    // Pixmax: no cheap chat request exists — verify the session end-to-end
+    // (login + team + canvas bootstrap) and report the credit balance.
+    if matches!(route.format, ProviderFormat::PixmaxVideo) {
+        return test_pixmax_route(state, provider, route, tag).await;
     }
 
     if !is_chat_format(&route.format) {
