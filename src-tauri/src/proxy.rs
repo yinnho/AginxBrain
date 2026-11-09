@@ -4000,7 +4000,9 @@ async fn generate_openai_images(
         "model": route.model,
         "prompt": prompt,
         "n": req.n.max(1),
-        "response_format": "url",
+        // No "response_format": dall-e-2/3 default to url anyway, while
+        // gpt-image-* only return b64_json and reject the parameter outright
+        // (HTTP 400 unknown_parameter). parse_openai_images handles both shapes.
     });
     if let Some(size) = &req.size {
         body["size"] = Value::String(size.clone());
