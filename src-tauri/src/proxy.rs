@@ -193,6 +193,27 @@ fn task_poll_url(route: &Route, task_id: &str) -> String {
     }
 }
 
+/// api.openai.com's newer models (gpt-5+/gpt-6/o-series) reject `max_tokens`
+/// on /v1/chat/completions: "Use 'max_completion_tokens' instead". Rename it
+/// when — and only when — the upstream host is OpenAI itself: third-party
+/// OpenAI-compatible providers (DeepSeek/zhipu/kimi) still speak max_tokens
+/// and may not know the new name. If the caller sent both, the explicit
+/// max_completion_tokens wins and max_tokens is dropped (sending both 400s).
+fn openai_rename_max_tokens(body: &mut Value, route: &Route) {
+    let base = route
+        .base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    if !base.starts_with("api.openai.com") {
+        return;
+    }
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(mt) = obj.remove("max_tokens") {
+            obj.entry("max_completion_tokens").or_insert(mt);
+        }
+    }
+}
+
 /// GET /v1/help - return the multimodal usage guide (embedded markdown) so an
 /// agent with a caller key can discover how to use each tag at runtime: which
 /// tags exist, their endpoints, params, and special contracts (ppt needs a
@@ -1197,7 +1218,11 @@ async fn handle_proxy(
             // understand it, but keep the thinking blocks in messages for
             // conversion to reasoning_content.
             if let Some(obj) = b.as_object_mut() { obj.remove("thinking"); }
-            convert::anthropic_to_openai_request(&b, &route.model)
+            let mut out = convert::anthropic_to_openai_request(&b, &route.model);
+            // Anthropic requires max_tokens, so every request carries it —
+            // rename for OpenAI's newer models or they 400.
+            openai_rename_max_tokens(&mut out, route);
+            out
         }
         ("anthropic", ProviderFormat::OpenaiResponses) => {
             // Anthropic → OpenAI Responses API
@@ -1212,6 +1237,7 @@ async fn handle_proxy(
             // OpenAI Chat → OpenAI Chat: passthrough
             let mut b = body.clone();
             b["model"] = Value::String(route.model.clone());
+            openai_rename_max_tokens(&mut b, route);
             b
         }
         ("openai", ProviderFormat::OpenaiResponses) => {
@@ -1230,7 +1256,9 @@ async fn handle_proxy(
         }
         ("openai_responses", ProviderFormat::Openai) => {
             // Codex Responses → OpenAI Chat Completions provider
-            convert::responses_to_chat_request(&body, &route.model)
+            let mut b = convert::responses_to_chat_request(&body, &route.model);
+            openai_rename_max_tokens(&mut b, route);
+            b
         }
         ("openai_responses", ProviderFormat::Anthropic) => {
             // Codex Responses → Anthropic Messages provider
@@ -6525,5 +6553,43 @@ mod tests {
         let mut b = json!({});
         enable_anthropic_thinking(&mut b, 5000);
         assert_eq!(b["max_tokens"], 11000);
+    }
+
+    #[test]
+    fn test_openai_rename_max_tokens() {
+        let route = |base: &str| Route {
+            id: "r".into(), base_url: base.into(), ws_url: None, model: "gpt-6.1-sol".into(),
+            provider: "chatgpt".into(), tags: vec![], format: ProviderFormat::Openai,
+            path: String::new(), enabled: true, tool_mode: crate::config::ToolMode::Native,
+        };
+
+        // OpenAI host + max_tokens → renamed
+        let mut b = json!({"model": "gpt-6.1-sol", "max_tokens": 512});
+        openai_rename_max_tokens(&mut b, &route("https://api.openai.com/"));
+        assert_eq!(b["max_completion_tokens"], 512);
+        assert!(b.get("max_tokens").is_none());
+
+        // trailing-slash-free and http variants still match
+        let mut b = json!({"max_tokens": 512});
+        openai_rename_max_tokens(&mut b, &route("https://api.openai.com"));
+        assert!(b.get("max_completion_tokens").is_some());
+
+        // third-party OpenAI-compatible provider → untouched
+        let mut b = json!({"max_tokens": 512});
+        openai_rename_max_tokens(&mut b, &route("https://api.deepseek.com"));
+        assert_eq!(b["max_tokens"], 512);
+        assert!(b.get("max_completion_tokens").is_none());
+
+        // both sent → explicit max_completion_tokens wins, max_tokens dropped
+        let mut b = json!({"max_tokens": 100, "max_completion_tokens": 200});
+        openai_rename_max_tokens(&mut b, &route("https://api.openai.com/"));
+        assert_eq!(b["max_completion_tokens"], 200);
+        assert!(b.get("max_tokens").is_none());
+
+        // no token fields → no-op
+        let mut b = json!({"model": "gpt-6.1-sol"});
+        openai_rename_max_tokens(&mut b, &route("https://api.openai.com/"));
+        assert!(b.get("max_tokens").is_none());
+        assert!(b.get("max_completion_tokens").is_none());
     }
 }
