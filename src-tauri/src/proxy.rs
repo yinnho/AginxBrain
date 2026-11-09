@@ -4262,6 +4262,71 @@ pub struct TestResult {
     pub response: Option<Value>,
 }
 
+/// Image-route variant of the admin Test request: run one real, minimal
+/// image generation through the same dispatch the proxy uses (submit + poll
+/// for async providers) and report a compact summary instead of raw bytes.
+async fn test_image_route(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    tag: &str,
+) -> TestResult {
+    let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.effective_path());
+    log::info!("[Test] testing image route tag={} → {} {} (format={:?})", tag, url, route.model, route.format);
+
+    let prompt = "a small solid red circle on a white background";
+    let req = GenerateImageRequest {
+        tag: Some(tag.to_string()),
+        prompt: prompt.to_string(),
+        size: None, // provider default size — keep the test footprint minimal
+        n: 1,
+        extra: std::collections::HashMap::new(),
+    };
+
+    let start = std::time::Instant::now();
+    let result = match &route.format {
+        ProviderFormat::OpenaiImages => generate_openai_images(state, provider, route, &url, prompt, &req).await,
+        ProviderFormat::DashscopeImage => generate_dashscope_image(state, provider, route, &url, prompt, &req).await,
+        ProviderFormat::DashscopeChatImage => generate_dashscope_chat_image(state, provider, route, &url, prompt, &req).await,
+        ProviderFormat::MinimaxImage => generate_minimax_image(state, provider, route, &url, prompt, &req).await,
+        other => Err(ProxyError::Upstream(format!("format {:?} is not an image format", other))),
+    };
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    let base = TestResult {
+        success: false,
+        tag: tag.to_string(),
+        provider: provider.name.clone(),
+        model: route.model.clone(),
+        format: format!("{:?}", route.format),
+        latency_ms,
+        error: None,
+        response: None,
+    };
+    match result {
+        Ok(images) if !images.is_empty() => TestResult {
+            success: true,
+            response: Some(json!({
+                "images": images.len(),
+                "first": if let Some(u) = &images[0].url {
+                    json!({"kind": "url", "url": truncate_chars(u, 120)})
+                } else {
+                    json!({"kind": "b64_png", "bytes": images[0].base64.len()})
+                }
+            })),
+            ..base
+        },
+        Ok(_) => TestResult {
+            error: Some("provider returned no images".to_string()),
+            ..base
+        },
+        Err(e) => TestResult {
+            error: Some(format!("{}", e)),
+            ..base
+        },
+    }
+}
+
 /// Send a test request to a single specific route (no failover).
 /// Returns the TestResult directly — either success or the specific error.
 async fn send_test_to_route(
@@ -4271,22 +4336,6 @@ async fn send_test_to_route(
     tag: &str,
     prompt: &str,
 ) -> TestResult {
-    if !is_chat_format(&route.format) {
-        return TestResult {
-            success: false,
-            tag: tag.to_string(),
-            provider: String::new(),
-            model: route.model.clone(),
-            format: format!("{:?}", route.format),
-            latency_ms: 0,
-            error: Some(format!(
-                "route format {:?} is not yet supported by the chat test endpoint",
-                route.format
-            )),
-            response: None,
-        };
-    }
-
     let provider = match config.providers.get(&route.provider) {
         Some(p) => p,
         None => {
@@ -4315,6 +4364,29 @@ async fn send_test_to_route(
             error: Some(format!(
                 "provider '{}' has no valid API key",
                 route.provider,
+            )),
+            response: None,
+        };
+    }
+
+    // Image formats go through the real generation pipeline (one minimal
+    // image request, submit + poll for async providers) instead of the chat
+    // path below.
+    if is_image_format(&route.format) {
+        return test_image_route(state, provider, route, tag).await;
+    }
+
+    if !is_chat_format(&route.format) {
+        return TestResult {
+            success: false,
+            tag: tag.to_string(),
+            provider: provider.name.clone(),
+            model: route.model.clone(),
+            format: format!("{:?}", route.format),
+            latency_ms: 0,
+            error: Some(format!(
+                "route format {:?} is not yet supported by the chat test endpoint",
+                route.format
             )),
             response: None,
         };
