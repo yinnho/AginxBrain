@@ -329,11 +329,16 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `resolution` | `480p` / `720p` / `1080p`（按模型支持） | `720p` |
+| `resolution` | `480p` / `720p` / `1080p`（按模型支持） | 模型目录默认（如 draft=480P） |
 | `ratio` | `16:9` / `9:16` / `1:1` / `auto`（自适应） | `auto` |
-| `duration` | 秒数（按模型支持） | `5` |
-| `generate_audio` | 是否生成音频 | `true` |
+| `duration` | 秒数（按模型支持） | 模型目录默认（多为 `5`） |
+| `generate_audio` | 是否生成音频 | 模型目录默认（多为 `true`） |
 | `count` | 出几条（`1`/`2`/`4`） | `1` |
+
+> **参数按模型目录自动校验**：AginxBrain 拉取 pixmax 模型目录（`/canvas/modelConfig`，缓存 1h），
+> 客户端传了模型不支持的值（如给 `PIXDANCE_2_5_DRAFT` 传 `720p`——draft 只有 480P/1080P）
+> 会自动回落到该模型的目录默认值并记 warn 日志，而不是上游报 `parameter illegal`。
+> 不传参数时也用目录默认。模型没有的参数（如 kling 无 `includeAudio`、无 `adaptive` 比例）自动省略/回落。
 
 > **暂不支持图生视频**（i2v 需要资产上传链路）；带 `image_url` 的请求会直接报错。
 

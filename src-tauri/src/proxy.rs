@@ -4150,6 +4150,132 @@ fn pixmax_is_transient(envelope: &Value) -> bool {
     envelope.get("errCode").and_then(|v| v.as_str()) == Some("500")
 }
 
+/// Canvas model catalog, cached per provider for 1h. (provider name → fetched-at, data)
+static PIXMAX_CATALOGS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
+> = std::sync::OnceLock::new();
+
+fn pixmax_catalogs(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>> {
+    PIXMAX_CATALOGS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Param specs (name → (default, allowed option values)) for route.model from
+/// the pixmax model catalog. Models vary wildly — PIXDANCE_2_5_DRAFT has no
+/// 720P, KLING_4 has no adaptive ratio and no includeAudio — so client params
+/// are validated against this. Returns an empty map when the catalog can't be
+/// fetched (callers then fall back to conservative hardcoded defaults).
+async fn pixmax_model_params(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+) -> std::collections::HashMap<String, (String, Vec<String>)> {
+    let fresh = {
+        let cache = pixmax_catalogs().lock().unwrap();
+        cache
+            .get(&provider.name)
+            .map(|(t, _)| t.elapsed().as_secs() < 3600)
+            .unwrap_or(false)
+    };
+    if !fresh {
+        match pixmax_call(state, provider, route, "/canvas/modelConfig", &json!({})).await {
+            Ok(envelope) => {
+                let data = envelope.get("data").cloned().unwrap_or(Value::Null);
+                pixmax_catalogs()
+                    .lock()
+                    .unwrap()
+                    .insert(provider.name.clone(), (std::time::Instant::now(), data));
+            }
+            Err(e) => log::warn!(
+                "[Proxy] pixmax modelConfig fetch failed ({}), using fallback defaults",
+                e
+            ),
+        }
+    }
+    let catalog = {
+        let cache = pixmax_catalogs().lock().unwrap();
+        cache
+            .get(&provider.name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Null)
+    };
+
+    let mut out = std::collections::HashMap::new();
+    let Some(groups) = catalog.as_array() else {
+        return out;
+    };
+    'outer: for group in groups {
+        let Some(models) = group.get("nodeConfig").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for m in models {
+            let matches = m.get("modelCode").and_then(|v| v.as_str()) == Some(route.model.as_str())
+                || m.get("modelCodeAlias").and_then(|v| v.as_str()) == Some(route.model.as_str());
+            if !matches {
+                continue;
+            }
+            if let Some(params) = m.pointer("/modelConfig/params").and_then(|v| v.as_array()) {
+                for p in params {
+                    let Some(name) = p.get("name").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let default = p
+                        .get("default")
+                        .map(|v| match v {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_default();
+                    let options = p
+                        .get("options")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|o| o.get("value").and_then(|v| v.as_str()))
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    out.insert(name.to_string(), (default, options));
+                }
+            }
+            break 'outer;
+        }
+    }
+    out
+}
+
+/// Resolve one client param against the catalog spec: keep the client value
+/// when the model allows it (or when there is no spec), else snap to the
+/// model default instead of failing the generation with "parameter illegal".
+fn pixmax_resolve_param(
+    specs: &std::collections::HashMap<String, (String, Vec<String>)>,
+    name: &str,
+    client: Option<String>,
+    fallback: &str,
+) -> String {
+    let Some((default, options)) = specs.get(name) else {
+        return client.unwrap_or_else(|| fallback.to_string());
+    };
+    if let Some(v) = client {
+        if options.is_empty() || options.contains(&v) {
+            return v;
+        }
+        log::warn!(
+            "[Proxy] pixmax {} '{}': not supported by this model (options {:?}), using default '{}'",
+            name,
+            v,
+            options,
+            default
+        );
+        return default.clone();
+    }
+    if default.is_empty() {
+        return fallback.to_string();
+    }
+    default.clone()
+}
+
 /// Client body (OpenAI chat, mirroring the seedance contract):
 ///   messages: [{role:user, content:"<prompt>"}]
 ///   resolution: "480p"|"720p"|"1080p"   (default "720p")
@@ -4180,34 +4306,59 @@ async fn handle_pixmax_video_request(
     }
     let tag = route.tags.first().cloned().unwrap_or_else(|| "pixmax".to_string());
 
-    // pixmax wants every param as a string.
-    let resolution = body
-        .get("resolution")
-        .and_then(|v| v.as_str())
-        .unwrap_or("720p")
-        .to_uppercase(); // "720p" → "720P"
-    let ratio = body.get("ratio").and_then(|v| v.as_str()).unwrap_or("auto");
-    let aspect_ratio = match ratio {
-        "auto" | "" => "adaptive",
-        other => other,
-    }
-    .to_string();
-    let duration = body
-        .get("duration")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5)
-        .to_string();
-    let count = body
-        .get("count")
-        .or_else(|| body.get("n"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1)
-        .to_string();
-    let include_audio = if body.get("generate_audio").and_then(|v| v.as_bool()) == Some(false) {
-        "false"
-    } else {
-        "true"
+    // pixmax wants every param as a string. Defaults and allowed values come
+    // from the per-model catalog (draft models have no 720P; kling has no
+    // adaptive ratio and no audio flag), so illegal client values snap to the
+    // model default instead of failing the generation with "parameter illegal".
+    let specs = pixmax_model_params(&state, provider, route).await;
+    let resolution = pixmax_resolve_param(
+        &specs,
+        "resolution",
+        body.get("resolution")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_uppercase()),
+        "720P",
+    );
+    // "auto" ratio → pixmax "adaptive" where the model supports it (pixdance);
+    // models without adaptive (kling) fall back to their catalog default.
+    let aspect_ratio = match body.get("ratio").and_then(|v| v.as_str()) {
+        Some("") | None => {
+            let has_adaptive = specs
+                .get("aspectRatio")
+                .map(|(_, options)| options.iter().any(|o| o == "adaptive"))
+                .unwrap_or(true);
+            if has_adaptive {
+                "adaptive".to_string()
+            } else {
+                pixmax_resolve_param(&specs, "aspectRatio", None, "adaptive")
+            }
+        }
+        Some(other) => pixmax_resolve_param(&specs, "aspectRatio", Some(other.to_string()), "adaptive"),
     };
+    let duration = pixmax_resolve_param(
+        &specs,
+        "duration",
+        body.get("duration").and_then(|v| v.as_u64()).map(|d| d.to_string()),
+        "5",
+    );
+    let count = pixmax_resolve_param(
+        &specs,
+        "count",
+        body.get("count")
+            .or_else(|| body.get("n"))
+            .and_then(|v| v.as_u64())
+            .map(|c| c.to_string()),
+        "1",
+    );
+    let include_audio = pixmax_resolve_param(
+        &specs,
+        "includeAudio",
+        body.get("generate_audio").map(|v| v.as_bool().unwrap_or(true).to_string()),
+        "true",
+    );
+    // kling-style models have no includeAudio param at all — omit rather than
+    // risk a rejection (specs empty = catalog unavailable, keep sending it).
+    let send_include_audio = specs.is_empty() || specs.contains_key("includeAudio");
 
     log::info!(
         "[Proxy] pixmax → {} (model={}, prompt {} chars)",
@@ -4253,7 +4404,7 @@ async fn handle_pixmax_video_request(
         "position": {"x": 0, "y": 0}
     })
     .to_string();
-    let node = json!({
+    let mut node = json!({
         "uuid": node_uuid,
         "fileUuid": session.file_uuid,
         "type": "GENERATE_VIDEO",
@@ -4267,11 +4418,13 @@ async fn handle_pixmax_video_request(
             "aspectRatio": aspect_ratio,
             "duration": duration,
             "referModel": "textToVideo",
-            "includeAudio": include_audio,
             "count": count
         },
         "prevNodeUuids": []
     });
+    if send_include_audio {
+        node["params"]["includeAudio"] = json!(include_audio);
+    }
     let mut created = Err(ProxyError::Upstream("pixmax: node create not attempted".into()));
     for attempt in 0..3 {
         let batch = json!({
