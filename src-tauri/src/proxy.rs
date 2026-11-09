@@ -5562,7 +5562,7 @@ async fn send_test_to_route(
     });
 
     // Convert based on provider format
-    let fwd_body = match route.format {
+    let mut fwd_body = match route.format {
         ProviderFormat::Anthropic => {
             let mut b = anthropic_body.clone();
             b["model"] = Value::String(route.model.clone());
@@ -5572,7 +5572,11 @@ async fn send_test_to_route(
         ProviderFormat::Openai => {
             let mut b = anthropic_body.clone();
             normalize_roles(&mut b);
-            convert::anthropic_to_openai_request(&b, &route.model)
+            let mut out = convert::anthropic_to_openai_request(&b, &route.model);
+            // Same fixup as the live proxy path: OpenAI's newer models reject
+            // max_tokens (the test template always sends it).
+            openai_rename_max_tokens(&mut out, route);
+            out
         }
         ProviderFormat::OpenaiResponses => {
             let mut b = anthropic_body.clone();
