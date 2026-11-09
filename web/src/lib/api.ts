@@ -13,6 +13,7 @@ export type RouteFormat =
   | 'anthropic'
   | 'openai_responses'
   | 'openai_images'
+  | 'openai_image_edit'
   | 'dashscope_image'
   | 'dashscope_video'
   | 'dashscope_tts'

@@ -402,13 +402,27 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 
 > Seedream 出图较慢（pro ~60–70s），AginxBrain 图片生成超时已放到 180s。
 
-**图生图 / 编辑**（image-to-image）：在 `messages` 的 user 内容里加一个 `image_url` 块作为参考图。AginxBrain 按格式分流：**Seedream 系**把 URL 作为 `image` 参数透传给 generations；**openai_images（gpt-image 系）走 `/v1/images/edits`**——参考图下载后以 multipart 文件上传（generations 没有图片参数，直接传会被上游 400 拒绝）。参考图支持 http(s) URL 或 data:base64。可配合 `size`（支持 `2K` 等别名）、`output_format`、`watermark` 等参数：
+**图生图 / 编辑**（image-to-image）：在 `messages` 的 user 内容里加一个 `image_url` 块作为参考图。AginxBrain 按格式分流：**Seedream 系**把 URL 作为 `image` 参数透传给 generations；**gpt-image 系走 `/v1/images/edits`**——参考图下载后以 multipart 文件上传（generations 没有图片参数，直接传会被上游 400 拒绝）。参考图支持 http(s) URL 或 data:base64。可配合 `size`（支持 `2K` 等别名）、`output_format`、`watermark` 等参数：
 ```json
 { "role": "user", "content": [
     { "type": "text", "text": "在左下角加一摞杂志，移除草图线条，保持构图" },
     { "type": "image_url", "image_url": { "url": "https://.../sketch.png" } }
-] }
+  ] }
 ```
+
+gpt-image 系有两种配置方式：
+
+- **`openai_image_edit` 格式（显式编辑路由，推荐）**：路由的 format 直接写
+  `openai_image_edit`，path 固定 `/v1/images/edits`。该路由只吃带参考图的
+  请求（不带参考图报错，提示用 `openai_images`）；Test 按钮会内嵌一张
+  微型参考图，真实走一次 multipart edits。
+- **`openai_images` 格式（自动分流，保留）**：请求带 `image_url` 参考图时
+  自动切到同 base 的 `/v1/images/edits`，不带参考图走 generations——一条
+  路由同时服务文生图和图生图。
+
+显式格式的意义：图生图可以指向独立的模型/provider（比如 image-edit 标签
+单独指向 gpt-image-2.6-flare，而文生图的 image2 标签仍指向别的模型），
+不必和文生图共享一条路由。
 
 ### 3.7 短剧完整链路（short-drama -> seedream -> seedance）
 

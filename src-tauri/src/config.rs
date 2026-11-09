@@ -93,6 +93,12 @@ pub enum ProviderFormat {
     OpenaiResponses,
     #[serde(rename = "openai_images")]
     OpenaiImages,
+    /// OpenAI image edit / image-to-image: POST /v1/images/edits with the
+    /// reference image as a multipart file part. Separate format so an edit
+    /// route can point at its own model/provider (openai_images with a
+    /// reference image also auto-switches to edits for convenience).
+    #[serde(rename = "openai_image_edit")]
+    OpenaiImageEdit,
     #[serde(rename = "dashscope_image")]
     DashscopeImage,
     #[serde(rename = "dashscope_video")]
@@ -138,6 +144,7 @@ impl ProviderFormat {
             ProviderFormat::Anthropic => "/v1/messages",
             ProviderFormat::OpenaiResponses => "/v1/responses",
             ProviderFormat::OpenaiImages => "/v1/images/generations",
+            ProviderFormat::OpenaiImageEdit => "/v1/images/edits",
             ProviderFormat::DashscopeImage => "/api/v1/services/aigc/image-generation/generation",
             ProviderFormat::DashscopeChatImage => "/chat/completions",
             ProviderFormat::DashscopeVideo => "/api/v1/services/aigc/video-generation/video-synthesis",

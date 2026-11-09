@@ -12,6 +12,7 @@ function formatDefaultPath(fmt: RouteFormat): string {
     anthropic: '/v1/messages',
     openai_responses: '/v1/responses',
     openai_images: '/v1/images/generations',
+    openai_image_edit: '/v1/images/edits',
     dashscope_image: '/api/v1/services/aigc/multimodal-generation/generation',
     dashscope_chat_image: '/chat/completions',
     dashscope_video: '/api/v1/services/aigc/video-generation/video-synthesis',
@@ -391,6 +392,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
           <option value="anthropic">Anthropic</option>
           <option value="openai_responses">OpenAI Responses</option>
           <option value="openai_images">OpenAI Images</option>
+          <option value="openai_image_edit">OpenAI Image Edit (图生图)</option>
           <option value="dashscope_image">DashScope Image</option>
           <option value="dashscope_chat_image">DashScope Chat Image</option>
           <option value="dashscope_video">DashScope Video</option>

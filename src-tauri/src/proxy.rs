@@ -644,6 +644,7 @@ fn is_image_format(format: &ProviderFormat) -> bool {
     matches!(
         format,
         ProviderFormat::OpenaiImages
+            | ProviderFormat::OpenaiImageEdit
             | ProviderFormat::DashscopeImage
             | ProviderFormat::DashscopeChatImage
             | ProviderFormat::MinimaxImage
@@ -1082,6 +1083,7 @@ async fn handle_proxy(
         if !is_chat_format(provider_format) {
             match provider_format {
                 ProviderFormat::OpenaiImages
+                | ProviderFormat::OpenaiImageEdit
                 | ProviderFormat::DashscopeImage
                 | ProviderFormat::DashscopeChatImage
                 | ProviderFormat::MinimaxImage => {
@@ -3385,6 +3387,11 @@ pub async fn generate_image(state: &AppState, req: GenerateImageRequest) -> Gene
             ProviderFormat::DashscopeImage => generate_dashscope_image(state, provider, route, &url, &prompt, &req).await,
             ProviderFormat::DashscopeChatImage => generate_dashscope_chat_image(state, provider, route, &url, &prompt, &req).await,
             ProviderFormat::MinimaxImage => generate_minimax_image(state, provider, route, &url, &prompt, &req).await,
+            ProviderFormat::OpenaiImages => generate_openai_images(state, provider, route, &url, &prompt, &req).await,
+            ProviderFormat::OpenaiImageEdit => match req.extra.get("image").and_then(|v| v.as_str()) {
+                Some(image_ref) => generate_openai_image_edit(state, provider, route, &url, &prompt, &req, image_ref).await,
+                None => Err(ProxyError::Upstream("image edit: reference image required — set extra.image (url or data url)".into())),
+            },
             _ => Err(ProxyError::Upstream(format!("format {:?} is not an image generation format", route.format))),
         };
         let latency_ms = start.elapsed().as_millis() as u64;
@@ -3465,6 +3472,7 @@ fn format_string(format: &ProviderFormat) -> String {
         ProviderFormat::Openai => "openai",
         ProviderFormat::OpenaiResponses => "openai_responses",
         ProviderFormat::OpenaiImages => "openai_images",
+        ProviderFormat::OpenaiImageEdit => "openai_image_edit",
         ProviderFormat::DashscopeImage => "dashscope_image",
         ProviderFormat::DashscopeChatImage => "dashscope_chat_image",
         ProviderFormat::DashscopeVideo => "dashscope_video",
@@ -3533,6 +3541,20 @@ async fn handle_image_request(
 
     let images: Vec<GeneratedImage> = match &route.format {
         ProviderFormat::OpenaiImages => generate_openai_images(&state, provider, route, &url, &prompt, &req).await?,
+        ProviderFormat::OpenaiImageEdit => {
+            // Explicit edit route: /v1/images/edits only makes sense with a
+            // reference image; without one the request belongs on openai_images.
+            let image_ref = req
+                .extra
+                .get("image")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ProxyError::Upstream(
+                        "image edit: reference image required — add an image_url block to the last user message, or use the openai_images format for text-to-image".into(),
+                    )
+                })?;
+            generate_openai_image_edit(&state, provider, route, &url, &prompt, &req, image_ref).await?
+        }
         ProviderFormat::DashscopeImage => generate_dashscope_image(&state, provider, route, &url, &prompt, &req).await?,
         ProviderFormat::DashscopeChatImage => generate_dashscope_chat_image(&state, provider, route, &url, &prompt, &req).await?,
         ProviderFormat::MinimaxImage => generate_minimax_image(&state, provider, route, &url, &prompt, &req).await?,
@@ -4920,7 +4942,11 @@ async fn generate_openai_images(
     // parameter and gpt-image-* rejects unknown fields, so sending the
     // reference there 400s ("upstream rejects the reference image").
     if let Some(image_ref) = req.extra.get("image").and_then(|v| v.as_str()) {
-        return generate_openai_image_edit(state, provider, route, url, prompt, req, image_ref).await;
+        let edits_url = match url.strip_suffix("/generations") {
+            Some(base) => format!("{}/edits", base),
+            None => format!("{}{}", url.trim_end_matches('/'), "/edits"),
+        };
+        return generate_openai_image_edit(state, provider, route, &edits_url, prompt, req, image_ref).await;
     }
     let mut body = json!({
         "model": route.model,
@@ -4942,21 +4968,18 @@ async fn generate_openai_images(
 /// image as a multipart file part (data URLs decode directly; http(s) URLs are
 /// fetched with the shared client — reference URLs are client-side and
 /// anonymous, like inline_anthropic_image_urls). gpt-image-* replies with
-/// b64_json, same shape as generations.
+/// b64_json, same shape as generations. `edits_url` is the final endpoint —
+/// openai_images auto-switch derives it from its generations URL, explicit
+/// openai_image_edit routes pass route.effective_path() as-is.
 async fn generate_openai_image_edit(
     state: &AppState,
     provider: &Provider,
     route: &Route,
-    generations_url: &str,
+    edits_url: &str,
     prompt: &str,
     req: &GenerateImageRequest,
     image_ref: &str,
 ) -> Result<Vec<GeneratedImage>, ProxyError> {
-    let edits_url = match generations_url.strip_suffix("/generations") {
-        Some(base) => format!("{}/edits", base),
-        None => format!("{}{}", generations_url.trim_end_matches('/'), "/edits"),
-    };
-
     // (bytes, mime) — data URLs decode locally, remote URLs ride the shared
     // client's fetch path (30s timeout, 10MB cap, generous logging).
     let (bytes, mime) = if let Some(rest) = image_ref.strip_prefix("data:") {
@@ -5017,7 +5040,7 @@ async fn generate_openai_image_edit(
         .await
         .map_err(ProxyError::Upstream)?;
     let resp = http
-        .post(&edits_url)
+        .post(edits_url)
         .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key))
         .timeout(std::time::Duration::from_secs(180))
         .multipart(form)
@@ -5302,6 +5325,15 @@ async fn test_image_route(
     let start = std::time::Instant::now();
     let result = match &route.format {
         ProviderFormat::OpenaiImages => generate_openai_images(state, provider, route, &url, prompt, &req).await,
+        ProviderFormat::OpenaiImageEdit => {
+            // Edits need a reference image; embed a tiny 8x8 red PNG so the
+            // Test button exercises the real multipart /edits pipeline.
+            const TINY_REF_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC";
+            let mut extra = std::collections::HashMap::new();
+            extra.insert("image".to_string(), Value::String(TINY_REF_PNG.to_string()));
+            let edit_req = GenerateImageRequest { extra, ..req.clone() };
+            generate_openai_image_edit(state, provider, route, &url, prompt, &edit_req, TINY_REF_PNG).await
+        }
         ProviderFormat::DashscopeImage => generate_dashscope_image(state, provider, route, &url, prompt, &req).await,
         ProviderFormat::DashscopeChatImage => generate_dashscope_chat_image(state, provider, route, &url, prompt, &req).await,
         ProviderFormat::MinimaxImage => generate_minimax_image(state, provider, route, &url, prompt, &req).await,
