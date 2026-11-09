@@ -3676,10 +3676,13 @@ async fn handle_video_request(
         let _ = crate::db::set_usage_task_id(&state.db, id, &task_id).await;
     }
 
-    // Truly async — return the task ID immediately. The client polls.
+    // Truly async — return the task ID immediately. The client polls
+    // poll_url (self-describing: no guessing the task-query path).
+    let poll_url = format!("/v1/tasks/{}/{}", tag, task_id);
     let resp = json!({
         "task_id": task_id,
         "task_status": task_status,
+        "poll_url": poll_url,
         "tag": tag,
         "code": "Success"
     });
@@ -3814,10 +3817,12 @@ async fn handle_seedance_video_request(
     }
 
     // Truly async — return the task ID immediately (same shape as the DashScope
-    // video response); the client polls GET /v1/tasks/{tag}/{task_id}.
+    // video response); the client polls poll_url.
+    let poll_url = format!("/v1/tasks/{}/{}", tag, task_id);
     let resp = json!({
         "task_id": task_id,
         "task_status": "queued",
+        "poll_url": poll_url,
         "tag": tag,
         "code": "Success"
     });
@@ -4523,9 +4528,11 @@ async fn handle_pixmax_video_request(
         let _ = crate::db::set_usage_task_id(&state.db, id, &node_uuid).await;
     }
 
+    let poll_url = format!("/v1/tasks/{}/{}", tag, node_uuid);
     let resp = json!({
         "task_id": node_uuid,
         "task_status": task_status,
+        "poll_url": poll_url,
         "tag": tag,
         "code": "Success"
     });

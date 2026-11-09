@@ -18,6 +18,7 @@
 | 鉴权 | `Authorization: Bearer <caller_key>`（在管理后台创建的调用密钥） |
 | 统一入口 | `POST /v1/chat/completions`（OpenAI Chat 格式） |
 | 模型名 | 用**标签名**当 model：`tts` / `audio` / `video` / `ppt` / `seedance` / `seedream` / `seedream-lite` / `pixmax`（AginxBrain 内部解析到具体后端模型） |
+| 本文档 | `GET /v1/help`（同一鉴权）实时返回本文，agent 可在运行时自发现契约；打错 `/v1/*` 路径会收到 JSON 404 并提示此端点 |
 
 四项能力**都复用 OpenAI Chat 接口**——把要处理的"内容"放在 `messages` 里，靠 `model` 字段区分走哪条管道：
 
@@ -29,6 +30,14 @@ curl https://brain.aginx.net/v1/chat/completions \
 ```
 
 `$KEY` 是你的 caller key。下文每节给出完整示例。
+
+> **异步任务（video / seedance / pixmax）的提交响应自带 `poll_url`**：
+> `{"task_id":"…","task_status":"queue","poll_url":"/v1/tasks/<tag>/<task_id>","tag":"…","code":"Success"}`
+> ——拿到 `poll_url` 直接 `GET`（同一鉴权）轮询即可，**不需要猜查询路径**。
+> 轮询响应 `status`：`PENDING`/`RUNNING`/`COMPLETE`/`FAILED`/`ABORTED`，
+> 成片在 `resultAssets[].webUrl`（pixmax）或 `output.video_url`（wanx）或
+> `content.video_url`（seedance）。任务卡 `RUNNING/99` 超 15 分钟会被网关
+> 标记为 `FAILED`（`stuck:true`），此时应重新提交而不是继续轮询。
 
 ---
 

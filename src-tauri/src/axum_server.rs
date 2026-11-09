@@ -352,6 +352,23 @@ async fn fallback_handler(method: Method, uri: Uri) -> impl IntoResponse {
             .into_response();
     }
 
+    // API-ish paths must never fall through to the SPA: an agent that mistypes
+    // an endpoint would get HTTP 200 + index.html and conclude the endpoint
+    // doesn't exist. Answer with a JSON 404 pointing at the help doc instead.
+    let path = uri.path();
+    if path.starts_with("/v1/") || path.starts_with("/anthropic/") || path.starts_with("/api/") {
+        return (
+            StatusCode::NOT_FOUND,
+            [("content-type", "application/json")],
+            serde_json::json!({
+                "error": format!("not found: {} {}", method, path),
+                "hint": "GET /v1/help (same caller-key auth) returns the full multimodal contract: tags, endpoints, submit+poll syntax."
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
+
     #[cfg(not(debug_assertions))]
     {
         let file_path = uri.path().trim_start_matches('/');
