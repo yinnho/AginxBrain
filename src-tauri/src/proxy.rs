@@ -193,6 +193,106 @@ fn task_poll_url(route: &Route, task_id: &str) -> String {
     }
 }
 
+/// Build the upstream request body for a client-protocol × provider-format
+/// conversion. THE single source of truth: the live proxy path (handle_proxy)
+/// and the admin Test button (test_route) both call this, so what Test
+/// exercises is the same conversion real traffic gets. (Lesson from
+/// 2026-11-09: a duplicated copy in test_route drifted — the live path
+/// renamed max_tokens for gpt-6 models, Test kept sending it and 400ed.)
+fn build_fwd_body(
+    client_protocol: &str,
+    provider_format: &ProviderFormat,
+    body: &Value,
+    route: &Route,
+) -> Result<Value, ProxyError> {
+    Ok(match (client_protocol, provider_format) {
+        ("anthropic", ProviderFormat::Anthropic) => {
+            // Anthropic → Anthropic: passthrough with fixes
+            // Note: don't strip_thinking here — Anthropic-compatible providers
+            // like Zhipu support thinking blocks
+            let mut b = body.clone();
+            b["model"] = Value::String(route.model.clone());
+            normalize_roles(&mut b);
+            // Z.ai server-tool blocks (opencarrier analyze_image/webReader) are
+            // malformed for Anthropic-compatible providers like Kimi K3; strip
+            // them (their call+result are duplicated as text). Then repair any
+            // orphan/misplaced regular tool_use pairs from context truncation.
+            strip_server_tool_use(&mut b);
+            repair_anthropic_tool_pairs(&mut b);
+            strip_anthropic_specific_fields(&mut b);
+            inject_reasoning_content(&mut b);
+            if route.tool_mode == crate::config::ToolMode::ReactXml {
+                inject_react_xml_tools(&mut b);
+            }
+            b
+        }
+        ("anthropic", ProviderFormat::Openai) => {
+            // Anthropic → OpenAI Chat Completions.
+            // Don't strip_thinking here — anthropic_to_openai_request converts
+            // thinking blocks to reasoning_content which providers like DeepSeek
+            // require to be echoed back when thinking mode is active.
+            let mut b = body.clone();
+            normalize_roles(&mut b);
+            strip_anthropic_specific_fields(&mut b);
+            // Remove the top-level thinking config — OpenAI providers don't
+            // understand it, but keep the thinking blocks in messages for
+            // conversion to reasoning_content.
+            if let Some(obj) = b.as_object_mut() { obj.remove("thinking"); }
+            let mut out = convert::anthropic_to_openai_request(&b, &route.model);
+            // Anthropic requires max_tokens, so every request carries it —
+            // rename for OpenAI's newer models or they 400.
+            openai_rename_max_tokens(&mut out, route);
+            out
+        }
+        ("anthropic", ProviderFormat::OpenaiResponses) => {
+            // Anthropic → OpenAI Responses API
+            let mut b = body.clone();
+            normalize_roles(&mut b);
+            strip_anthropic_specific_fields(&mut b);
+            strip_thinking(&mut b);
+            if let Some(obj) = b.as_object_mut() { obj.remove("thinking"); }
+            convert::anthropic_to_responses_request(&b, &route.model)
+        }
+        ("openai", ProviderFormat::Openai) => {
+            // OpenAI Chat → OpenAI Chat: passthrough
+            let mut b = body.clone();
+            b["model"] = Value::String(route.model.clone());
+            openai_rename_max_tokens(&mut b, route);
+            b
+        }
+        ("openai", ProviderFormat::OpenaiResponses) => {
+            // OpenAI Chat → OpenAI Responses
+            convert::openai_to_responses_request(body, &route.model)
+        }
+        ("openai", ProviderFormat::Anthropic) => {
+            // OpenAI Chat → Anthropic Messages
+            convert::openai_to_anthropic_request(body, &route.model)
+        }
+        ("openai_responses", ProviderFormat::OpenaiResponses) => {
+            // Responses → Responses: passthrough
+            let mut b = body.clone();
+            b["model"] = Value::String(route.model.clone());
+            b
+        }
+        ("openai_responses", ProviderFormat::Openai) => {
+            // Codex Responses → OpenAI Chat Completions provider
+            let mut b = convert::responses_to_chat_request(body, &route.model);
+            openai_rename_max_tokens(&mut b, route);
+            b
+        }
+        ("openai_responses", ProviderFormat::Anthropic) => {
+            // Codex Responses → Anthropic Messages provider
+            convert::responses_to_anthropic_request(body, &route.model)
+        }
+        _ => {
+            return Err(ProxyError::Upstream(format!(
+                "unsupported protocol conversion: {} → {:?}",
+                client_protocol, provider_format
+            )));
+        }
+    })
+}
+
 /// api.openai.com's newer models (gpt-5+/gpt-6/o-series) reject `max_tokens`
 /// on /v1/chat/completions: "Use 'max_completion_tokens' instead". Rename it
 /// when — and only when — the upstream host is OpenAI itself: third-party
@@ -1185,92 +1285,7 @@ async fn handle_proxy(
     );
 
     // 4. Build forwarded request body based on protocol conversion
-    let mut fwd_body = match (client_protocol, provider_format) {
-        ("anthropic", ProviderFormat::Anthropic) => {
-            // Anthropic → Anthropic: passthrough with fixes
-            // Note: don't strip_thinking here — Anthropic-compatible providers
-            // like Zhipu support thinking blocks
-            let mut b = body.clone();
-            b["model"] = Value::String(route.model.clone());
-            normalize_roles(&mut b);
-            // Z.ai server-tool blocks (opencarrier analyze_image/webReader) are
-            // malformed for Anthropic-compatible providers like Kimi K3; strip
-            // them (their call+result are duplicated as text). Then repair any
-            // orphan/misplaced regular tool_use pairs from context truncation.
-            strip_server_tool_use(&mut b);
-            repair_anthropic_tool_pairs(&mut b);
-            strip_anthropic_specific_fields(&mut b);
-            inject_reasoning_content(&mut b);
-            if route.tool_mode == crate::config::ToolMode::ReactXml {
-                inject_react_xml_tools(&mut b);
-            }
-            b
-        }
-        ("anthropic", ProviderFormat::Openai) => {
-            // Anthropic → OpenAI Chat Completions.
-            // Don't strip_thinking here — anthropic_to_openai_request converts
-            // thinking blocks to reasoning_content which providers like DeepSeek
-            // require to be echoed back when thinking mode is active.
-            let mut b = body.clone();
-            normalize_roles(&mut b);
-            strip_anthropic_specific_fields(&mut b);
-            // Remove the top-level thinking config — OpenAI providers don't
-            // understand it, but keep the thinking blocks in messages for
-            // conversion to reasoning_content.
-            if let Some(obj) = b.as_object_mut() { obj.remove("thinking"); }
-            let mut out = convert::anthropic_to_openai_request(&b, &route.model);
-            // Anthropic requires max_tokens, so every request carries it —
-            // rename for OpenAI's newer models or they 400.
-            openai_rename_max_tokens(&mut out, route);
-            out
-        }
-        ("anthropic", ProviderFormat::OpenaiResponses) => {
-            // Anthropic → OpenAI Responses API
-            let mut b = body.clone();
-            normalize_roles(&mut b);
-            strip_anthropic_specific_fields(&mut b);
-            strip_thinking(&mut b);
-            if let Some(obj) = b.as_object_mut() { obj.remove("thinking"); }
-            convert::anthropic_to_responses_request(&b, &route.model)
-        }
-        ("openai", ProviderFormat::Openai) => {
-            // OpenAI Chat → OpenAI Chat: passthrough
-            let mut b = body.clone();
-            b["model"] = Value::String(route.model.clone());
-            openai_rename_max_tokens(&mut b, route);
-            b
-        }
-        ("openai", ProviderFormat::OpenaiResponses) => {
-            // OpenAI Chat → OpenAI Responses
-            convert::openai_to_responses_request(&body, &route.model)
-        }
-        ("openai", ProviderFormat::Anthropic) => {
-            // OpenAI Chat → Anthropic Messages
-            convert::openai_to_anthropic_request(&body, &route.model)
-        }
-        ("openai_responses", ProviderFormat::OpenaiResponses) => {
-            // Responses → Responses: passthrough
-            let mut b = body.clone();
-            b["model"] = Value::String(route.model.clone());
-            b
-        }
-        ("openai_responses", ProviderFormat::Openai) => {
-            // Codex Responses → OpenAI Chat Completions provider
-            let mut b = convert::responses_to_chat_request(&body, &route.model);
-            openai_rename_max_tokens(&mut b, route);
-            b
-        }
-        ("openai_responses", ProviderFormat::Anthropic) => {
-            // Codex Responses → Anthropic Messages provider
-            convert::responses_to_anthropic_request(&body, &route.model)
-        }
-        _ => {
-            return Err(ProxyError::Upstream(format!(
-                "unsupported protocol conversion: {} → {:?}",
-                client_protocol, provider_format
-            )));
-        }
-    };
+    let mut fwd_body = build_fwd_body(client_protocol, provider_format, &body, route)?;
 
     // 4b. For OpenAI Chat format, ensure reasoning_content is present on all
     //     assistant messages when thinking mode is active. Clients like
@@ -5561,41 +5576,20 @@ async fn send_test_to_route(
         ]
     });
 
-    // Convert based on provider format
-    let mut fwd_body = match route.format {
-        ProviderFormat::Anthropic => {
-            let mut b = anthropic_body.clone();
-            b["model"] = Value::String(route.model.clone());
-            normalize_roles(&mut b);
-            b
-        }
-        ProviderFormat::Openai => {
-            let mut b = anthropic_body.clone();
-            normalize_roles(&mut b);
-            let mut out = convert::anthropic_to_openai_request(&b, &route.model);
-            // Same fixup as the live proxy path: OpenAI's newer models reject
-            // max_tokens (the test template always sends it).
-            openai_rename_max_tokens(&mut out, route);
-            out
-        }
-        ProviderFormat::OpenaiResponses => {
-            let mut b = anthropic_body.clone();
-            normalize_roles(&mut b);
-            strip_thinking(&mut b);
-            convert::anthropic_to_responses_request(&b, &route.model)
-        }
-        _ => {
+    // Convert using the SAME code as the live proxy path (build_fwd_body is
+    // the single source of truth — the template above is an Anthropic
+    // Messages request, so client_protocol is "anthropic").
+    let mut fwd_body = match build_fwd_body("anthropic", &route.format, &anthropic_body, route) {
+        Ok(b) => b,
+        Err(e) => {
             return TestResult {
                 success: false,
                 tag: tag.to_string(),
-                provider: String::new(),
+                provider: provider.name.clone(),
                 model: route.model.clone(),
                 format: format!("{:?}", route.format),
                 latency_ms: 0,
-                error: Some(format!(
-                    "route format {:?} is not yet supported by the chat test endpoint",
-                    route.format
-                )),
+                error: Some(format!("route format not supported by the chat test endpoint: {}", e)),
                 response: None,
             };
         }
