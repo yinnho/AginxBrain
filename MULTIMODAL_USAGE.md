@@ -402,7 +402,7 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 
 > Seedream 出图较慢（pro ~60–70s），AginxBrain 图片生成超时已放到 180s。
 
-**图生图 / 编辑**（image-to-image）：在 `messages` 的 user 内容里加一个 `image_url` 块作为参考图，AginxBrain 会把它作为 `image` 参数透传给 Seedream。可配合 `size`（支持 `2K` 等别名）、`output_format`、`watermark` 等参数：
+**图生图 / 编辑**（image-to-image）：在 `messages` 的 user 内容里加一个 `image_url` 块作为参考图。AginxBrain 按格式分流：**Seedream 系**把 URL 作为 `image` 参数透传给 generations；**openai_images（gpt-image 系）走 `/v1/images/edits`**——参考图下载后以 multipart 文件上传（generations 没有图片参数，直接传会被上游 400 拒绝）。参考图支持 http(s) URL 或 data:base64。可配合 `size`（支持 `2K` 等别名）、`output_format`、`watermark` 等参数：
 ```json
 { "role": "user", "content": [
     { "type": "text", "text": "在左下角加一摞杂志，移除草图线条，保持构图" },

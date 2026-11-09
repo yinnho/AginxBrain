@@ -4916,6 +4916,12 @@ async fn generate_openai_images(
     prompt: &str,
     req: &GenerateImageRequest,
 ) -> Result<Vec<GeneratedImage>, ProxyError> {
+    // Reference image present → /v1/images/edits. generations has no image
+    // parameter and gpt-image-* rejects unknown fields, so sending the
+    // reference there 400s ("upstream rejects the reference image").
+    if let Some(image_ref) = req.extra.get("image").and_then(|v| v.as_str()) {
+        return generate_openai_image_edit(state, provider, route, url, prompt, req, image_ref).await;
+    }
     let mut body = json!({
         "model": route.model,
         "prompt": prompt,
@@ -4929,6 +4935,96 @@ async fn generate_openai_images(
     }
     merge_extra(&mut body, &req.extra, &["model", "prompt"]);
     let result = send_image_post(state, provider, url, &body, &[]).await?;
+    parse_openai_images(&result).ok_or_else(|| ProxyError::Upstream("No images in OpenAI Images response".to_string()))
+}
+
+/// Image editing / image-to-image: POST /v1/images/edits with the reference
+/// image as a multipart file part (data URLs decode directly; http(s) URLs are
+/// fetched with the shared client — reference URLs are client-side and
+/// anonymous, like inline_anthropic_image_urls). gpt-image-* replies with
+/// b64_json, same shape as generations.
+async fn generate_openai_image_edit(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    generations_url: &str,
+    prompt: &str,
+    req: &GenerateImageRequest,
+    image_ref: &str,
+) -> Result<Vec<GeneratedImage>, ProxyError> {
+    let edits_url = match generations_url.strip_suffix("/generations") {
+        Some(base) => format!("{}/edits", base),
+        None => format!("{}{}", generations_url.trim_end_matches('/'), "/edits"),
+    };
+
+    // (bytes, mime) — data URLs decode locally, remote URLs ride the shared
+    // client's fetch path (30s timeout, 10MB cap, generous logging).
+    let (bytes, mime) = if let Some(rest) = image_ref.strip_prefix("data:") {
+        let (meta, data) = rest
+            .split_once(',')
+            .ok_or_else(|| ProxyError::Upstream("image: malformed data URL reference".into()))?;
+        let mime = meta.split(';').next().unwrap_or("image/png").to_string();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| ProxyError::Upstream(format!("image: invalid base64 reference: {}", e)))?;
+        (bytes, mime)
+    } else {
+        let (mime, b64) = fetch_image_to_base64(&state.http_client, image_ref)
+            .await
+            .ok_or_else(|| ProxyError::Upstream(format!("image: failed to fetch reference image {}", image_ref)))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .map_err(|e| ProxyError::Upstream(format!("image: reference decode: {}", e)))?;
+        (bytes, mime)
+    };
+    let ext = mime.strip_prefix("image/").unwrap_or("png");
+    log::info!(
+        "[Proxy] image edit → {} (model={}, {} byte reference as {})",
+        edits_url,
+        route.model,
+        bytes.len(),
+        mime
+    );
+
+    let mut form = reqwest::multipart::Form::new()
+        .text("model", route.model.clone())
+        .text("prompt", prompt.to_string())
+        .text("n", req.n.max(1).to_string());
+    if let Some(size) = &req.size {
+        form = form.text("size", size.clone());
+    }
+    // Pass through client extras (quality / background / input_fidelity / …)
+    // as form fields; "image" itself is the file part below.
+    for (k, v) in &req.extra {
+        if k == "image" {
+            continue;
+        }
+        let text = match v {
+            Value::String(s) => s.clone(),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(num) => num.to_string(),
+            _ => continue,
+        };
+        form = form.text(k.clone(), text);
+    }
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(format!("reference.{}", ext))
+        .mime_str(&mime)
+        .map_err(|e| ProxyError::Upstream(format!("image: bad reference mime {}: {}", mime, e)))?;
+    form = form.part("image", part);
+
+    let http = crate::config::client_for_provider(state, provider)
+        .await
+        .map_err(ProxyError::Upstream)?;
+    let resp = http
+        .post(&edits_url)
+        .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key))
+        .timeout(std::time::Duration::from_secs(180))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+    let result = parse_image_response(resp).await?;
     parse_openai_images(&result).ok_or_else(|| ProxyError::Upstream("No images in OpenAI Images response".to_string()))
 }
 
