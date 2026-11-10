@@ -38,6 +38,8 @@ curl https://brain.aginx.net/v1/chat/completions \
 > 成片在 `resultAssets[].webUrl`（pixmax）或 `output.video_url`（wanx）或
 > `content.video_url`（seedance）。任务卡 `RUNNING/99` 超 15 分钟会被网关
 > 标记为 `FAILED`（`stuck:true`），此时应重新提交而不是继续轮询。
+> **参考图（首帧）驱动的图生视频目前只有 `seedance` 标签支持**；
+> `video` / `pixmax` 标签是纯文生视频，请求带 `image_url` 会直接报错。
 
 ---
 
@@ -349,7 +351,10 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 > 会自动回落到该模型的目录默认值并记 warn 日志，而不是上游报 `parameter illegal`。
 > 不传参数时也用目录默认。模型没有的参数（如 kling 无 `includeAudio`、无 `adaptive` 比例）自动省略/回落。
 
-> **暂不支持图生视频**（i2v 需要资产上传链路）；带 `image_url` 的请求会直接报错。
+> **本标签仅文生视频，不支持参考图**：请求带 `image_url` 会直接报错
+> （"image-to-video is not supported yet"）。pixmax 的 i2v 需要资产上传
+> 链路，暂未接入。**需要首帧图生视频请用 `seedance` 标签**（见 3.4 节，
+> 支持首帧 `image_url` + 多模态参考）。
 
 **提交响应**（与 wanx / seedance 同 shape）：
 ```json
