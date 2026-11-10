@@ -339,49 +339,69 @@ pub async fn handle_task_poll(
     Path((tag, task_id)): Path<(String, String)>,
     _request: Request,
 ) -> Result<Response, ProxyError> {
-    let (task_url, provider) = {
-        let config = state.config.read().await;
-        let candidates = find_candidate_routes(&config.routes, &tag, &config.tags);
-        let (_, route) = candidates
-            .first()
-            .ok_or_else(|| ProxyError::Upstream(format!("no route found for tag '{}'", tag)))?;
-        let provider = config
-            .providers
-            .get(&route.provider)
-            .cloned()
-            .ok_or_else(|| ProxyError::Upstream(format!("provider '{}' not found", route.provider)))?;
+    let config = state.config.read().await.clone();
+    let candidates = find_candidate_routes(&config.routes, &tag, &config.tags);
+    if candidates.is_empty() {
+        return Err(ProxyError::Upstream(format!("no route found for tag '{}'", tag)));
+    }
+
+    // Mirror the submit-side failover: a task may have been serviced by a
+    // lower-priority candidate (e.g. dashscope wanx after the pixmax leg
+    // failed), and the poll URL only carries the tag. Ask candidates in the
+    // same order; a candidate that doesn't know the task (pixmax NotFound,
+    // GET poll error) defers to the next instead of failing the whole poll.
+    let mut last_error: Option<ProxyError> = None;
+    for (_, route) in &candidates {
+        let Some(provider) = config.providers.get(&route.provider) else {
+            continue;
+        };
         if provider.api_key.is_empty() {
-            return Err(ProxyError::Upstream(format!(
-                "provider '{}' has no API key configured",
-                route.provider
-            )));
+            continue;
         }
 
         // Pixmax polls via an authenticated POST, not a plain GET passthrough.
         if matches!(route.format, ProviderFormat::PixmaxVideo) {
-            let item = pixmax_poll_task(&state, &provider, route, &task_id).await?;
-            return Ok(Json(item).into_response());
+            match pixmax_poll_task(&state, provider, route, &task_id).await {
+                Ok(item) => return Ok(Json(item).into_response()),
+                Err(e) => {
+                    // Unknown here ≠ broken everywhere: another candidate may
+                    // own this task. Other pixmax errors are definitive.
+                    if !e.to_string().contains("NotFound") {
+                        return Err(e);
+                    }
+                    last_error = Some(e);
+                    continue;
+                }
+            }
         }
 
         let task_url = task_poll_url(route, &task_id);
-        (task_url, provider)
-    };
+        log::info!(
+            "[Proxy] task poll: tag={} task_id={} url={}",
+            tag,
+            task_id,
+            task_url
+        );
+        match send_image_get(&state, provider, &task_url).await {
+            Ok(result) => {
+                // Capture authoritative token usage for async tasks that report
+                // it in the completion response (Seedance bills by
+                // completion_tokens). Updates the submit-time usage_log row
+                // matched by task_id; no-op for tasks/providers whose poll
+                // response carries no usage (e.g. DashScope wanx video).
+                capture_async_task_usage(&state.db, &task_id, &result).await;
+                return Ok(Json(result).into_response());
+            }
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        }
+    }
 
-    log::info!(
-        "[Proxy] task poll: tag={} task_id={} url={}",
-        tag,
-        task_id,
-        task_url
-    );
-    let result = send_image_get(&state, &provider, &task_url).await?;
-
-    // Capture authoritative token usage for async tasks that report it in the
-    // completion response (Seedance bills by completion_tokens). Updates the
-    // submit-time usage_log row matched by task_id; no-op for tasks/providers
-    // whose poll response carries no usage (e.g. DashScope wanx video).
-    capture_async_task_usage(&state.db, &task_id, &result).await;
-
-    Ok(Json(result).into_response())
+    Err(last_error.unwrap_or_else(|| {
+        ProxyError::Upstream(format!("no usable route to poll task '{}' for tag '{}'", task_id, tag))
+    }))
 }
 
 /// Update the submit-time usage_log row for an async generation task with the
