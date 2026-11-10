@@ -38,8 +38,11 @@ curl https://brain.aginx.net/v1/chat/completions \
 > 成片在 `resultAssets[].webUrl`（pixmax）或 `output.video_url`（wanx）或
 > `content.video_url`（seedance）。任务卡 `RUNNING/99` 超 15 分钟会被网关
 > 标记为 `FAILED`（`stuck:true`），此时应重新提交而不是继续轮询。
-> **首帧图生视频**：`seedance`（3.4）和 `video` / `pixmax`（3.5）都支持——
+> **图生视频**：`seedance`（3.4）和 `video` / `pixmax`（3.5）都支持——
 > user 消息里加 `image_url` 块即可（http(s) URL 或 data:base64）。
+> **多参考图**（pixmax）：`image_url` 块可放多个——2+ 张自动按模型能力选
+> `imageRefer`（多图参考，KLING/VIDU/HappyHorse 系）或 `firstAndLastFrame`
+> （首尾帧，第 1 张=首帧第 2 张=尾帧），详见 3.5。
 
 ---
 
@@ -363,6 +366,26 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 ```
 
 参考图支持 http(s) URL 或 data:base64（与图片生成/编辑的参考图同一约定）。
+
+**多参考图**（`image_url` 块放多个，按顺序）——网关按模型目录能力自动选模式：
+
+| 图数 | 自动模式 | 说明 |
+|---|---|---|
+| 1 | `imageToVideo` | 首帧图生视频（所有图生视频模型） |
+| 2 | `imageRefer` > `firstAndLastFrame` | 模型有 `imageRefer`（KLING / VIDU / HappyHorse 系）就用多图参考；否则恰好 2 张走首尾帧（第 1 张=首帧，第 2 张=尾帧，如 PIXDANCE 系） |
+| ≥3 | `imageRefer` | 仅多图参考模型支持；不支持的模型会返回明确错误（列出该模型的模式） |
+
+```json
+{ "model": "video",
+  "messages": [{ "role": "user", "content": [
+    { "type": "text", "text": "让画面中的角色转身走向镜头" },
+    { "type": "image_url", "image_url": { "url": "https://.../char_front.png" } },
+    { "type": "image_url", "image_url": { "url": "https://.../char_side.png" } }
+  ]}],
+  "resolution": "480p", "duration": 5 }
+```
+
+显式覆盖：body 顶层加 `"referModel": "imageRefer"`（或 `firstAndLastFrame` / `keyFrames` 等，需为该模型目录合法值）。
 
 **提交响应**（与 wanx / seedance 同 shape）：
 ```json

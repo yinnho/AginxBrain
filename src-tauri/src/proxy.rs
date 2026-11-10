@@ -3771,7 +3771,16 @@ async fn handle_video_request(
 /// Find the first image_url anywhere in messages (for image-to-video first
 /// frame). Handles both `{"image_url":"..."}` and `{"image_url":{"url":"..."}}`.
 fn find_first_image_url(body: &Value) -> Option<String> {
-    let messages = body.get("messages").and_then(|m| m.as_array())?;
+    collect_image_urls(body, 1).into_iter().next()
+}
+
+/// Collect every image_url in messages, in order (multi-reference video).
+/// Same block shapes as find_first_image_url; capped by `max`.
+fn collect_image_urls(body: &Value, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+        return out;
+    };
     for msg in messages {
         let Some(arr) = msg.get("content").and_then(|c| c.as_array()) else {
             continue;
@@ -3785,11 +3794,63 @@ fn find_first_image_url(body: &Value) -> Option<String> {
                 }
             });
             if let Some(u) = url {
-                return Some(u);
+                out.push(u);
+                if out.len() >= max {
+                    return out;
+                }
             }
         }
     }
-    None
+    out
+}
+
+/// Choose the pixmax `referModel` for the number of reference images the client
+/// sent, based on the model's catalog options:
+///   0 images → textToVideo
+///   1 image  → imageToVideo
+///   ≥2       → imageRefer (KLING/VIDU/HappyHorse multi-reference), else
+///              firstAndLastFrame when exactly 2 (first image = first frame,
+///              second = last frame)
+/// An explicit client referModel (a valid catalog option) always wins.
+/// Returns None when the model has no mode for that many images — the caller
+/// errors with guidance instead of submitting a doomed generation.
+fn pixmax_refer_mode(
+    specs: &std::collections::HashMap<String, (String, Vec<String>)>,
+    image_count: usize,
+    client_refer_model: Option<&str>,
+) -> Option<String> {
+    let options = specs.get("referModel").map(|(_, o)| o.clone());
+    let has = |mode: &str| options.iter().flatten().any(|x| x == mode);
+    if let Some(v) = client_refer_model {
+        let valid = options.as_ref().map(|o| o.is_empty() || o.iter().any(|x| x == v)).unwrap_or(true);
+        if valid {
+            return Some(v.to_string());
+        }
+        log::warn!(
+            "[Proxy] pixmax referModel '{}': not a catalog option ({:?}), choosing automatically",
+            v,
+            options.clone().unwrap_or_default()
+        );
+    }
+    match image_count {
+        0 if has("textToVideo") || options.is_none() => Some("textToVideo".to_string()),
+        1 if has("imageToVideo") || options.is_none() => Some("imageToVideo".to_string()),
+        n if n >= 2 => {
+            if has("imageRefer") {
+                Some("imageRefer".to_string())
+            } else if n == 2 && has("firstAndLastFrame") {
+                Some("firstAndLastFrame".to_string())
+            } else if options.is_none() {
+                // Catalog unavailable — be optimistic and let pixmax's own
+                // validation speak if the model lacks the mode (failover
+                // still applies).
+                Some("imageRefer".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Seedance (Volcano Ark) video generation: submit an async task and return the
@@ -4513,14 +4574,17 @@ fn pixmax_resolve_param(
 
 /// Client body (OpenAI chat, mirroring the seedance contract):
 ///   messages: [{role:user, content:"<prompt>"}]
+///   + image_url blocks in the content array = reference images, in order:
+///     1 image  → imageToVideo (first frame)
+///     ≥2       → imageRefer (multi-reference) or firstAndLastFrame (exactly 2,
+///                first→首帧 second→尾帧), chosen from the model's catalog
+///                options; explicit body-level `referModel` overrides
 ///   resolution: "480p"|"720p"|"1080p"   (default "720p")
 ///   ratio:      "16:9"|"9:16"|...|"auto" (default "auto" → pixmax "adaptive")
 ///   duration:   seconds                   (default 5)
 ///   generate_audio: bool                  (default true)
 ///   n / count:  1|2|4                     (default 1)
 /// route.model is the pixmax modelCode (PIXDANCE_2_5, KLING_4, HAILUO_23, ...).
-/// Image-to-video is not supported (needs the asset upload + BASE_IMAGE node
-/// chain); v1 is text-to-video only.
 ///
 /// Submit = canvas get → node/batch create → generate/batch. task_id returned
 /// to the client is the nodeUuid (generate/progress is keyed by node).
@@ -4534,9 +4598,12 @@ async fn handle_pixmax_video_request(
 ) -> Result<Response, ProxyError> {
     let prompt = last_user_text(body)
         .ok_or_else(|| ProxyError::Upstream("pixmax: no text prompt found in messages".into()))?;
-    // First image_url in messages = image-to-video first frame (uploaded to
-    // pixmax as a canvas asset below); no image = text-to-video.
-    let image_ref = find_first_image_url(body);
+    // Every image_url in messages = reference images, in order:
+    //   1 image  → imageToVideo (first frame)
+    //   ≥2       → imageRefer / firstAndLastFrame per model capability
+    // no image  → text-to-video.
+    const MAX_REF_IMAGES: usize = 7;
+    let image_refs = collect_image_urls(body, MAX_REF_IMAGES);
     let tag = route.tags.first().cloned().unwrap_or_else(|| "pixmax".to_string());
 
     // pixmax wants every param as a string. Defaults and allowed values come
@@ -4593,6 +4660,22 @@ async fn handle_pixmax_video_request(
     // risk a rejection (specs empty = catalog unavailable, keep sending it).
     let send_include_audio = specs.is_empty() || specs.contains_key("includeAudio");
 
+    let refer_mode = pixmax_refer_mode(
+        &specs,
+        image_refs.len(),
+        body.get("referModel").and_then(|v| v.as_str()),
+    )
+    .ok_or_else(|| {
+        ProxyError::Upstream(format!(
+            "pixmax: model {} has no multi-image mode (referModel options: {:?}) — \
+             {} reference images need imageRefer (KLING/VIDU/HappyHorse) or exactly 2 for firstAndLastFrame; \
+             send fewer images or use a route with a multi-reference model",
+            route.model,
+            specs.get("referModel").map(|(_, o)| o).cloned().unwrap_or_default(),
+            image_refs.len()
+        ))
+    })?;
+
     log::info!(
         "[Proxy] pixmax → {} (model={}, prompt {} chars)",
         provider.name,
@@ -4602,32 +4685,36 @@ async fn handle_pixmax_video_request(
 
     let session = pixmax_ensure_session(&state, provider, route).await?;
 
-    // Image-to-video: upload the reference as a canvas asset, then carry a
-    // BASE_IMAGE node upstream of the video node (canvas edge) plus
-    // referModel=imageToVideo — the CLI's `video image-to-video` shape.
-    let mut image_node: Option<Value> = None;
-    if let Some(image_ref) = &image_ref {
+    // Reference images: upload each as a canvas asset, then carry a BASE_IMAGE
+    // node upstream of the video node (canvas edge). Order matters — for
+    // firstAndLastFrame the first image is the first frame, the second the
+    // last; for imageRefer the order is the reference order.
+    let mut image_nodes: Vec<(String, Value)> = Vec::new(); // (uuid, node)
+    for (i, image_ref) in image_refs.iter().enumerate() {
         let (bytes, mime) = image_ref_to_bytes(&state, image_ref).await?;
         log::info!(
-            "[Proxy] pixmax i2v: uploading first frame ({} bytes, {})",
+            "[Proxy] pixmax reference image {}/{}: uploading ({} bytes, {})",
+            i + 1,
+            image_refs.len(),
             bytes.len(),
             mime
         );
         let asset_uuid = pixmax_upload_image_asset(&state, provider, route, &bytes, &mime).await?;
         let img_uuid = uuid::Uuid::new_v4().to_string();
-        image_node = Some(json!({
+        let node = json!({
             "uuid": img_uuid,
             "fileUuid": session.file_uuid,
             "type": "BASE_IMAGE",
             "isGenerateNode": false,
             "metaData": json!({
                 "data": {"label": PIXMAX_NODE_LABEL, "assetUuid": asset_uuid},
-                "position": {"x": -400, "y": 0}
+                "position": {"x": -400, "y": i * 220}
             }).to_string(),
             "defaultAssetUuid": asset_uuid,
             "params": {},
             "prevNodeUuids": []
-        }));
+        });
+        image_nodes.push((img_uuid, node));
     }
 
     // Canvas read: revision for the optimistic-concurrency batch, plus the
@@ -4660,13 +4747,10 @@ async fn handle_pixmax_video_request(
     // duplicate-submission (5s per-file dedup lock) with fresh revision,
     // mirroring the CLI's ≤3 attempts.
     let node_uuid = uuid::Uuid::new_v4().to_string();
-    let img_node_uuid = image_node
-        .as_ref()
-        .and_then(|n| n.get("uuid"))
-        .and_then(|u| u.as_str())
-        .map(String::from);
-    let meta = match &img_node_uuid {
-        Some(img_uuid) => json!({
+    // Single-image i2v keeps the verified CLI shape (workflow + referenceNodeUuid);
+    // multi-image matches the web app: no workflow marker, edges carry the wiring.
+    let meta = match image_nodes.first() {
+        Some((img_uuid, _)) if image_nodes.len() == 1 => json!({
             "data": {
                 "label": PIXMAX_NODE_LABEL,
                 "workflow": "image-to-video",
@@ -4674,7 +4758,7 @@ async fn handle_pixmax_video_request(
             },
             "position": {"x": 0, "y": 0}
         }),
-        None => json!({
+        _ => json!({
             "data": {"label": PIXMAX_NODE_LABEL, "workflow": "text-to-video"},
             "position": {"x": 0, "y": 0}
         }),
@@ -4693,19 +4777,19 @@ async fn handle_pixmax_video_request(
             "resolution": resolution,
             "aspectRatio": aspect_ratio,
             "duration": duration,
-            "referModel": if img_node_uuid.is_some() { "imageToVideo" } else { "textToVideo" },
+            "referModel": refer_mode,
             "count": count
         },
-        "prevNodeUuids": match &img_node_uuid { Some(u) => json!([u]), None => json!([]) }
+        "prevNodeUuids": image_nodes.iter().map(|(u, _)| json!(u)).collect::<Vec<_>>()
     });
     if send_include_audio {
         node["params"]["includeAudio"] = json!(include_audio);
     }
-    // i2v: the image node rides in the same create batch, upstream of the
-    // video node (canvas edge = prevNodeUuids reference).
+    // Reference image nodes ride in the same create batch, upstream of the
+    // video node (canvas edge = prevNodeUuids reference, order = frame order).
     let mut create_list: Vec<Value> = Vec::new();
-    if let Some(img) = image_node.clone() {
-        create_list.push(img);
+    for (_, img) in image_nodes.iter() {
+        create_list.push(img.clone());
     }
     create_list.push(node.clone());
     let mut created = Err(ProxyError::Upstream("pixmax: node create not attempted".into()));
@@ -6620,6 +6704,69 @@ mod tests {
 
         let none = json!({"messages":[{"role":"user","content":"text only"}]});
         assert!(find_first_image_url(&none).is_none());
+    }
+
+    #[test]
+    fn test_collect_image_urls_order_and_cap() {
+        let obj = json!({"messages":[
+            {"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"https://x/a.png"}},
+                {"type":"text","text":"prompt"},
+                {"type":"image_url","image_url":"https://x/b.png"}
+            ]},
+            {"role":"assistant","content":"ok"},
+            {"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"https://x/c.png"}}
+            ]}
+        ]});
+        assert_eq!(
+            collect_image_urls(&obj, 7),
+            vec!["https://x/a.png", "https://x/b.png", "https://x/c.png"]
+        );
+        assert_eq!(collect_image_urls(&obj, 2), vec!["https://x/a.png", "https://x/b.png"]);
+        assert!(collect_image_urls(&json!({"messages":[]}), 7).is_empty());
+    }
+
+    #[test]
+    fn test_pixmax_refer_mode_selection() {
+        let mk = |opts: &[&str]| {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "referModel".to_string(),
+                (opts.first().unwrap_or(&"").to_string(), opts.iter().map(|s| s.to_string()).collect()),
+            );
+            m
+        };
+        // draft-style: t2v / i2v / firstAndLastFrame only
+        let draft = mk(&["textToVideo", "referToVideo", "imageToVideo", "firstAndLastFrame"]);
+        assert_eq!(pixmax_refer_mode(&draft, 0, None).as_deref(), Some("textToVideo"));
+        assert_eq!(pixmax_refer_mode(&draft, 1, None).as_deref(), Some("imageToVideo"));
+        // exactly 2 → firstAndLastFrame on a model without imageRefer
+        assert_eq!(pixmax_refer_mode(&draft, 2, None).as_deref(), Some("firstAndLastFrame"));
+        // 3+ has no mode here
+        assert!(pixmax_refer_mode(&draft, 3, None).is_none());
+
+        // kling-style: has imageRefer → always preferred for ≥2
+        let kling = mk(&["textToVideo", "imageToVideo", "firstAndLastFrame", "imageRefer", "keyFrames"]);
+        assert_eq!(pixmax_refer_mode(&kling, 2, None).as_deref(), Some("imageRefer"));
+        assert_eq!(pixmax_refer_mode(&kling, 5, None).as_deref(), Some("imageRefer"));
+        // explicit client override wins when valid…
+        assert_eq!(pixmax_refer_mode(&kling, 1, Some("imageRefer")).as_deref(), Some("imageRefer"));
+        // …and falls back to auto when not a catalog option
+        assert_eq!(pixmax_refer_mode(&kling, 1, Some("nope")).as_deref(), Some("imageToVideo"));
+
+        // t2v-only model: any image has no auto mode
+        let t2v = mk(&["textToVideo"]);
+        assert!(pixmax_refer_mode(&t2v, 1, None).is_none());
+
+        // imageRefer-only model (VIDU_Q3_MIX): no text mode at all
+        let mix = mk(&["imageRefer"]);
+        assert!(pixmax_refer_mode(&mix, 0, None).is_none());
+        assert_eq!(pixmax_refer_mode(&mix, 3, None).as_deref(), Some("imageRefer"));
+
+        // catalog unavailable → optimistic imageRefer for ≥2
+        let empty = std::collections::HashMap::new();
+        assert_eq!(pixmax_refer_mode(&empty, 3, None).as_deref(), Some("imageRefer"));
     }
 
     #[test]
