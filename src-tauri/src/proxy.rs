@@ -1238,6 +1238,22 @@ async fn handle_proxy(
                     }
                 }
                 ProviderFormat::DashscopeVideo => {
+                    // Image-to-video must not silently fall through to a pure
+                    // text-to-video route: the reference frame would be dropped
+                    // and a plausible-but-wrong render submitted on the user's
+                    // bill (observed when the pixmax leg failed). Skip loudly
+                    // instead — a later i2v-capable candidate may still serve.
+                    if find_first_image_url(&body).is_some() {
+                        log::warn!(
+                            "[Proxy] skipping dashscope route {} ({}): text-to-video model cannot use the request's first-frame image",
+                            route.id, route.model
+                        );
+                        last_error = Some(ProxyError::Upstream(format!(
+                            "route {} ({}): text-to-video model cannot use the request's first-frame image",
+                            route.id, route.model
+                        )));
+                        continue;
+                    }
                     match handle_video_request(state.clone(), caller_key_id, route, provider, &body, start).await {
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
