@@ -3811,45 +3811,56 @@ fn collect_image_urls(body: &Value, max: usize) -> Vec<String> {
 ///   ≥2       → imageRefer (KLING/VIDU/HappyHorse multi-reference), else
 ///              firstAndLastFrame when exactly 2 (first image = first frame,
 ///              second = last frame)
-/// An explicit client referModel (a valid catalog option) always wins.
-/// Returns None when the model has no mode for that many images — the caller
-/// errors with guidance instead of submitting a doomed generation.
+/// An explicit client referModel wins when the model supports it; asking for an
+/// unsupported mode is an error (not a silent semantic switch) so the request
+/// can fail over to a route whose model does support it.
+/// Err = human-readable reason for the caller to surface.
 fn pixmax_refer_mode(
     specs: &std::collections::HashMap<String, (String, Vec<String>)>,
     image_count: usize,
     client_refer_model: Option<&str>,
-) -> Option<String> {
+) -> Result<String, String> {
     let options = specs.get("referModel").map(|(_, o)| o.clone());
     let has = |mode: &str| options.iter().flatten().any(|x| x == mode);
     if let Some(v) = client_refer_model {
         let valid = options.as_ref().map(|o| o.is_empty() || o.iter().any(|x| x == v)).unwrap_or(true);
         if valid {
-            return Some(v.to_string());
+            return Ok(v.to_string());
         }
-        log::warn!(
-            "[Proxy] pixmax referModel '{}': not a catalog option ({:?}), choosing automatically",
+        return Err(format!(
+            "referModel '{}' is not a catalog option for this model (options: {:?}) — use a route with a capable model",
             v,
-            options.clone().unwrap_or_default()
-        );
+            options.unwrap_or_default()
+        ));
     }
     match image_count {
-        0 if has("textToVideo") || options.is_none() => Some("textToVideo".to_string()),
-        1 if has("imageToVideo") || options.is_none() => Some("imageToVideo".to_string()),
+        0 if has("textToVideo") || options.is_none() => Ok("textToVideo".to_string()),
+        1 if has("imageToVideo") || options.is_none() => Ok("imageToVideo".to_string()),
         n if n >= 2 => {
             if has("imageRefer") {
-                Some("imageRefer".to_string())
+                Ok("imageRefer".to_string())
             } else if n == 2 && has("firstAndLastFrame") {
-                Some("firstAndLastFrame".to_string())
+                Ok("firstAndLastFrame".to_string())
             } else if options.is_none() {
                 // Catalog unavailable — be optimistic and let pixmax's own
                 // validation speak if the model lacks the mode (failover
                 // still applies).
-                Some("imageRefer".to_string())
+                Ok("imageRefer".to_string())
             } else {
-                None
+                Err(format!(
+                    "model has no mode for {} reference images (referModel options: {:?}) — \
+                     multi-image needs imageRefer (KLING/VIDU/HappyHorse) or exactly 2 for firstAndLastFrame",
+                    n,
+                    options.unwrap_or_default()
+                ))
             }
         }
-        _ => None,
+        n => Err(format!(
+            "model has no image mode for {} reference image{} (referModel options: {:?})",
+            n,
+            if n == 1 { "" } else { "s" },
+            options.unwrap_or_default()
+        )),
     }
 }
 
@@ -4665,15 +4676,8 @@ async fn handle_pixmax_video_request(
         image_refs.len(),
         body.get("referModel").and_then(|v| v.as_str()),
     )
-    .ok_or_else(|| {
-        ProxyError::Upstream(format!(
-            "pixmax: model {} has no multi-image mode (referModel options: {:?}) — \
-             {} reference images need imageRefer (KLING/VIDU/HappyHorse) or exactly 2 for firstAndLastFrame; \
-             send fewer images or use a route with a multi-reference model",
-            route.model,
-            specs.get("referModel").map(|(_, o)| o).cloned().unwrap_or_default(),
-            image_refs.len()
-        ))
+    .map_err(|reason| {
+        ProxyError::Upstream(format!("pixmax: model {}: {}", route.model, reason))
     })?;
 
     log::info!(
@@ -6739,34 +6743,35 @@ mod tests {
         };
         // draft-style: t2v / i2v / firstAndLastFrame only
         let draft = mk(&["textToVideo", "referToVideo", "imageToVideo", "firstAndLastFrame"]);
-        assert_eq!(pixmax_refer_mode(&draft, 0, None).as_deref(), Some("textToVideo"));
-        assert_eq!(pixmax_refer_mode(&draft, 1, None).as_deref(), Some("imageToVideo"));
+        assert_eq!(pixmax_refer_mode(&draft, 0, None).as_deref(), Ok("textToVideo"));
+        assert_eq!(pixmax_refer_mode(&draft, 1, None).as_deref(), Ok("imageToVideo"));
         // exactly 2 → firstAndLastFrame on a model without imageRefer
-        assert_eq!(pixmax_refer_mode(&draft, 2, None).as_deref(), Some("firstAndLastFrame"));
+        assert_eq!(pixmax_refer_mode(&draft, 2, None).as_deref(), Ok("firstAndLastFrame"));
         // 3+ has no mode here
-        assert!(pixmax_refer_mode(&draft, 3, None).is_none());
+        assert!(pixmax_refer_mode(&draft, 3, None).is_err());
 
         // kling-style: has imageRefer → always preferred for ≥2
         let kling = mk(&["textToVideo", "imageToVideo", "firstAndLastFrame", "imageRefer", "keyFrames"]);
-        assert_eq!(pixmax_refer_mode(&kling, 2, None).as_deref(), Some("imageRefer"));
-        assert_eq!(pixmax_refer_mode(&kling, 5, None).as_deref(), Some("imageRefer"));
+        assert_eq!(pixmax_refer_mode(&kling, 2, None).as_deref(), Ok("imageRefer"));
+        assert_eq!(pixmax_refer_mode(&kling, 5, None).as_deref(), Ok("imageRefer"));
         // explicit client override wins when valid…
-        assert_eq!(pixmax_refer_mode(&kling, 1, Some("imageRefer")).as_deref(), Some("imageRefer"));
-        // …and falls back to auto when not a catalog option
-        assert_eq!(pixmax_refer_mode(&kling, 1, Some("nope")).as_deref(), Some("imageToVideo"));
+        assert_eq!(pixmax_refer_mode(&kling, 1, Some("imageRefer")).as_deref(), Ok("imageRefer"));
+        // …and is an ERROR (not a silent switch) when the model lacks it
+        assert!(pixmax_refer_mode(&kling, 1, Some("nope")).is_err());
+        assert!(pixmax_refer_mode(&draft, 2, Some("imageRefer")).is_err());
 
         // t2v-only model: any image has no auto mode
         let t2v = mk(&["textToVideo"]);
-        assert!(pixmax_refer_mode(&t2v, 1, None).is_none());
+        assert!(pixmax_refer_mode(&t2v, 1, None).is_err());
 
         // imageRefer-only model (VIDU_Q3_MIX): no text mode at all
         let mix = mk(&["imageRefer"]);
-        assert!(pixmax_refer_mode(&mix, 0, None).is_none());
-        assert_eq!(pixmax_refer_mode(&mix, 3, None).as_deref(), Some("imageRefer"));
+        assert!(pixmax_refer_mode(&mix, 0, None).is_err());
+        assert_eq!(pixmax_refer_mode(&mix, 3, None).as_deref(), Ok("imageRefer"));
 
         // catalog unavailable → optimistic imageRefer for ≥2
         let empty = std::collections::HashMap::new();
-        assert_eq!(pixmax_refer_mode(&empty, 3, None).as_deref(), Some("imageRefer"));
+        assert_eq!(pixmax_refer_mode(&empty, 3, None).as_deref(), Ok("imageRefer"));
     }
 
     #[test]
