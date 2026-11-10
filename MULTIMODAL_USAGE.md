@@ -38,8 +38,8 @@ curl https://brain.aginx.net/v1/chat/completions \
 > 成片在 `resultAssets[].webUrl`（pixmax）或 `output.video_url`（wanx）或
 > `content.video_url`（seedance）。任务卡 `RUNNING/99` 超 15 分钟会被网关
 > 标记为 `FAILED`（`stuck:true`），此时应重新提交而不是继续轮询。
-> **参考图（首帧）驱动的图生视频目前只有 `seedance` 标签支持**；
-> `video` / `pixmax` 标签是纯文生视频，请求带 `image_url` 会直接报错。
+> **首帧图生视频**：`seedance`（3.4）和 `video` / `pixmax`（3.5）都支持——
+> user 消息里加 `image_url` 块即可（http(s) URL 或 data:base64）。
 
 ---
 
@@ -351,10 +351,18 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 > 会自动回落到该模型的目录默认值并记 warn 日志，而不是上游报 `parameter illegal`。
 > 不传参数时也用目录默认。模型没有的参数（如 kling 无 `includeAudio`、无 `adaptive` 比例）自动省略/回落。
 
-> **本标签仅文生视频，不支持参考图**：请求带 `image_url` 会直接报错
-> （"image-to-video is not supported yet"）。pixmax 的 i2v 需要资产上传
-> 链路，暂未接入。**需要首帧图生视频请用 `seedance` 标签**（见 3.4 节，
-> 支持首帧 `image_url` + 多模态参考）。
+**图生视频**（首帧驱动）：在 user 内容里加一个 `image_url` 块作为首帧，网关自动把参考图上传到 pixmax 资产库、挂上游图片节点并以图生视频模式提交（目录里的图生视频模型都可用，首帧比例通常跟随图片）：
+
+```json
+{ "model": "video",
+  "messages": [{ "role": "user", "content": [
+    { "type": "text", "text": "镜头缓缓推进，光影流动，电影感" },
+    { "type": "image_url", "image_url": { "url": "https://.../first_frame.png" } }
+  ]}],
+  "resolution": "480p", "duration": 5 }
+```
+
+参考图支持 http(s) URL 或 data:base64（与图片生成/编辑的参考图同一约定）。
 
 **提交响应**（与 wanx / seedance 同 shape）：
 ```json

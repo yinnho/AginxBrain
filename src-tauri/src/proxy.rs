@@ -4164,6 +4164,132 @@ async fn pixmax_ensure_canvas_file(
     })
 }
 
+/// Upload a client image to pixmax as a canvas asset (image-to-video first
+/// frame). Chain (verified live 2026-11-09): /assets/oss/authorize → signed
+/// OSS STS PUT (v1 signature; every x-oss-* header, including the callback,
+/// must be in the signed canonical headers or OSS answers
+/// SignatureDoesNotMatch) → poll /assets/oss/check until the server-side
+/// callback registers the asset. Returns the assetsUuid.
+async fn pixmax_upload_image_asset(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    bytes: &[u8],
+    mime: &str,
+) -> Result<String, ProxyError> {
+    let ext = mime.strip_prefix("image/").unwrap_or("png");
+    let file_name = format!("aginxbrain-i2v-{}.{}", uuid::Uuid::new_v4(), ext);
+    let auth_payload = json!({
+        "fileName": file_name,
+        "fileSize": bytes.len(),
+        "fileType": "IMG",
+        "contentType": mime,
+    });
+    let auth = pixmax_call(state, provider, route, "/assets/oss/authorize", &auth_payload).await?;
+    let data = auth.get("data").cloned().unwrap_or(Value::Null);
+    let s = |k: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let (bucket, host, object_key, ak, sk, token) = (
+        s("bucketName"),
+        s("endpoint"),
+        s("objectKey"),
+        s("accessKeyId"),
+        s("accessKeySecret"),
+        s("securityToken"),
+    );
+    let (cb_url, cb_body, cb_type) = (s("callbackUrl"), s("callbackBody"), s("callbackBodyType"));
+    if bucket.is_empty() || object_key.is_empty() || ak.is_empty() || sk.is_empty() || token.is_empty() {
+        return Err(ProxyError::Upstream(format!(
+            "pixmax: oss authorize incomplete: {}",
+            truncate_chars(&data.to_string(), 200)
+        )));
+    }
+    if cb_url.is_empty() || cb_body.is_empty() {
+        // Without the callback the PUT succeeds but the asset never registers
+        // (check stays AUTHORIZED/callbackReceived:false forever).
+        return Err(ProxyError::Upstream("pixmax: oss authorize missing callback fields".into()));
+    }
+
+    // OSS signature v1. Canonical headers must include EVERY x-oss-* header
+    // being sent, sorted — the callback header included.
+    let cb_json = json!({"callbackUrl": cb_url, "callbackBody": cb_body, "callbackBodyType": cb_type});
+    let cb_header = base64::engine::general_purpose::STANDARD.encode(cb_json.to_string());
+    let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let canonical = format!("x-oss-callback:{}\nx-oss-security-token:{}\n", cb_header, token);
+    let string_to_sign = format!("PUT\n\n{}\n{}\n{}/{}{}", mime, date, canonical, bucket, object_key);
+    use hmac::Mac as _;
+    let mut mac = <hmac::Hmac<sha1::Sha1> as hmac::KeyInit>::new_from_slice(sk.as_bytes())
+        .map_err(|e| ProxyError::Upstream(format!("pixmax: hmac init: {}", e)))?;
+    mac.update(string_to_sign.as_bytes());
+    let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+    let upload_url = format!("https://{}.{}{}", bucket, host, {
+        // objectKey may need escaping; keys are RES-UUID.ext (safe charset) —
+        // escape conservatively except path separators.
+        let mut escaped = String::new();
+        for ch in object_key.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '/' || ch == '.' || ch == '-' || ch == '_' || ch == '~' {
+                escaped.push(ch);
+            } else {
+                escaped.push_str(&format!("%{:02X}", ch as u8));
+            }
+        }
+        if escaped.starts_with('/') { escaped } else { format!("/{}", escaped) }
+    });
+    let resp = state
+        .http_client
+        .put(&upload_url)
+        .header("Content-Type", mime)
+        .header("Date", &date)
+        .header("x-oss-security-token", &token)
+        .header("x-oss-callback", &cb_header)
+        .header("Authorization", format!("OSS {}:{}", ak, signature))
+        .timeout(std::time::Duration::from_secs(120))
+        .body(bytes.to_vec())
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("pixmax: oss put: {}", e)))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ProxyError::Upstream(format!(
+            "pixmax: oss put {}: {}",
+            status,
+            truncate_chars(&body, 200)
+        )));
+    }
+
+    // Poll registration: the OSS callback fires server-side; the asset uuid
+    // appears under data.asset.assetsUuid once registered (observed <2s).
+    let mut check_payload = auth_payload.clone();
+    for k in ["sessionId", "objectKey", "relativePath", "webUrl"] {
+        check_payload[k] = data.get(k).cloned().unwrap_or(Value::Null);
+    }
+    for _ in 0..20 {
+        let check = pixmax_call(state, provider, route, "/assets/oss/check", &check_payload).await?;
+        let cd = check.get("data").cloned().unwrap_or(Value::Null);
+        let asset_uuid = cd
+            .pointer("/asset/assetsUuid")
+            .or_else(|| cd.pointer("/asset/uuid"))
+            .or_else(|| cd.get("assetsUuid"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if let Some(uuid) = asset_uuid {
+            log::info!("[Proxy] pixmax asset registered: {} ({} bytes as {})", uuid, bytes.len(), mime);
+            return Ok(uuid);
+        }
+        let status = cd.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status == "FAILED" || status == "ERROR" {
+            return Err(ProxyError::Upstream(format!(
+                "pixmax: asset registration {}: {}",
+                status,
+                truncate_chars(&check.to_string(), 200)
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    Err(ProxyError::Upstream("pixmax: asset registration timed out (callback not received)".into()))
+}
+
 /// Authenticated pixmax call, resilient to two observed flakiness modes:
 /// 1. A token minted seconds ago can be rejected once ("UNAUTHORIZED / No
 ///    login" or a bare "System Error") before the session propagates — retry
@@ -4369,11 +4495,9 @@ async fn handle_pixmax_video_request(
 ) -> Result<Response, ProxyError> {
     let prompt = last_user_text(body)
         .ok_or_else(|| ProxyError::Upstream("pixmax: no text prompt found in messages".into()))?;
-    if find_first_image_url(body).is_some() {
-        return Err(ProxyError::Upstream(
-            "pixmax: image-to-video is not supported yet (text-to-video only)".into(),
-        ));
-    }
+    // First image_url in messages = image-to-video first frame (uploaded to
+    // pixmax as a canvas asset below); no image = text-to-video.
+    let image_ref = find_first_image_url(body);
     let tag = route.tags.first().cloned().unwrap_or_else(|| "pixmax".to_string());
 
     // pixmax wants every param as a string. Defaults and allowed values come
@@ -4439,6 +4563,34 @@ async fn handle_pixmax_video_request(
 
     let session = pixmax_ensure_session(&state, provider, route).await?;
 
+    // Image-to-video: upload the reference as a canvas asset, then carry a
+    // BASE_IMAGE node upstream of the video node (canvas edge) plus
+    // referModel=imageToVideo — the CLI's `video image-to-video` shape.
+    let mut image_node: Option<Value> = None;
+    if let Some(image_ref) = &image_ref {
+        let (bytes, mime) = image_ref_to_bytes(&state, image_ref).await?;
+        log::info!(
+            "[Proxy] pixmax i2v: uploading first frame ({} bytes, {})",
+            bytes.len(),
+            mime
+        );
+        let asset_uuid = pixmax_upload_image_asset(&state, provider, route, &bytes, &mime).await?;
+        let img_uuid = uuid::Uuid::new_v4().to_string();
+        image_node = Some(json!({
+            "uuid": img_uuid,
+            "fileUuid": session.file_uuid,
+            "type": "BASE_IMAGE",
+            "isGenerateNode": false,
+            "metaData": json!({
+                "data": {"label": PIXMAX_NODE_LABEL, "assetUuid": asset_uuid},
+                "position": {"x": -400, "y": 0}
+            }).to_string(),
+            "defaultAssetUuid": asset_uuid,
+            "params": {},
+            "prevNodeUuids": []
+        }));
+    }
+
     // Canvas read: revision for the optimistic-concurrency batch, plus the
     // node list for occasional garbage collection of our old nodes.
     let canvas = pixmax_call(
@@ -4469,10 +4621,25 @@ async fn handle_pixmax_video_request(
     // duplicate-submission (5s per-file dedup lock) with fresh revision,
     // mirroring the CLI's ≤3 attempts.
     let node_uuid = uuid::Uuid::new_v4().to_string();
-    let meta = json!({
-        "data": {"label": PIXMAX_NODE_LABEL, "workflow": "text-to-video"},
-        "position": {"x": 0, "y": 0}
-    })
+    let img_node_uuid = image_node
+        .as_ref()
+        .and_then(|n| n.get("uuid"))
+        .and_then(|u| u.as_str())
+        .map(String::from);
+    let meta = match &img_node_uuid {
+        Some(img_uuid) => json!({
+            "data": {
+                "label": PIXMAX_NODE_LABEL,
+                "workflow": "image-to-video",
+                "referenceNodeUuid": img_uuid
+            },
+            "position": {"x": 0, "y": 0}
+        }),
+        None => json!({
+            "data": {"label": PIXMAX_NODE_LABEL, "workflow": "text-to-video"},
+            "position": {"x": 0, "y": 0}
+        }),
+    }
     .to_string();
     let mut node = json!({
         "uuid": node_uuid,
@@ -4487,20 +4654,27 @@ async fn handle_pixmax_video_request(
             "resolution": resolution,
             "aspectRatio": aspect_ratio,
             "duration": duration,
-            "referModel": "textToVideo",
+            "referModel": if img_node_uuid.is_some() { "imageToVideo" } else { "textToVideo" },
             "count": count
         },
-        "prevNodeUuids": []
+        "prevNodeUuids": match &img_node_uuid { Some(u) => json!([u]), None => json!([]) }
     });
     if send_include_audio {
         node["params"]["includeAudio"] = json!(include_audio);
     }
+    // i2v: the image node rides in the same create batch, upstream of the
+    // video node (canvas edge = prevNodeUuids reference).
+    let mut create_list: Vec<Value> = Vec::new();
+    if let Some(img) = image_node.clone() {
+        create_list.push(img);
+    }
+    create_list.push(node.clone());
     let mut created = Err(ProxyError::Upstream("pixmax: node create not attempted".into()));
     for attempt in 0..3 {
         let batch = json!({
             "fileUuid": session.file_uuid,
             "baseRevision": revision,
-            "create": [node],
+            "create": create_list,
             "update": [],
             "delete": []
         });
@@ -5021,6 +5195,31 @@ async fn generate_openai_images(
 /// b64_json, same shape as generations. `edits_url` is the final endpoint —
 /// openai_images auto-switch derives it from its generations URL, explicit
 /// openai_image_edit routes pass route.effective_path() as-is.
+/// Resolve a client-supplied image reference (http(s) URL or data:base64) to
+/// raw bytes + mime. Data URLs decode locally; remote URLs ride the shared
+/// client's fetch path (30s timeout, 10MB cap). Shared by OpenAI image edits
+/// and pixmax image-to-video first frames.
+async fn image_ref_to_bytes(state: &AppState, image_ref: &str) -> Result<(Vec<u8>, String), ProxyError> {
+    if let Some(rest) = image_ref.strip_prefix("data:") {
+        let (meta, data) = rest
+            .split_once(',')
+            .ok_or_else(|| ProxyError::Upstream("image: malformed data URL reference".into()))?;
+        let mime = meta.split(';').next().unwrap_or("image/png").to_string();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| ProxyError::Upstream(format!("image: invalid base64 reference: {}", e)))?;
+        Ok((bytes, mime))
+    } else {
+        let (mime, b64) = fetch_image_to_base64(&state.http_client, image_ref)
+            .await
+            .ok_or_else(|| ProxyError::Upstream(format!("image: failed to fetch reference image {}", image_ref)))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .map_err(|e| ProxyError::Upstream(format!("image: reference decode: {}", e)))?;
+        Ok((bytes, mime))
+    }
+}
+
 async fn generate_openai_image_edit(
     state: &AppState,
     provider: &Provider,
@@ -5030,26 +5229,7 @@ async fn generate_openai_image_edit(
     req: &GenerateImageRequest,
     image_ref: &str,
 ) -> Result<Vec<GeneratedImage>, ProxyError> {
-    // (bytes, mime) — data URLs decode locally, remote URLs ride the shared
-    // client's fetch path (30s timeout, 10MB cap, generous logging).
-    let (bytes, mime) = if let Some(rest) = image_ref.strip_prefix("data:") {
-        let (meta, data) = rest
-            .split_once(',')
-            .ok_or_else(|| ProxyError::Upstream("image: malformed data URL reference".into()))?;
-        let mime = meta.split(';').next().unwrap_or("image/png").to_string();
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|e| ProxyError::Upstream(format!("image: invalid base64 reference: {}", e)))?;
-        (bytes, mime)
-    } else {
-        let (mime, b64) = fetch_image_to_base64(&state.http_client, image_ref)
-            .await
-            .ok_or_else(|| ProxyError::Upstream(format!("image: failed to fetch reference image {}", image_ref)))?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&b64)
-            .map_err(|e| ProxyError::Upstream(format!("image: reference decode: {}", e)))?;
-        (bytes, mime)
-    };
+    let (bytes, mime) = image_ref_to_bytes(state, image_ref).await?;
     let ext = mime.strip_prefix("image/").unwrap_or("png");
     log::info!(
         "[Proxy] image edit → {} (model={}, {} byte reference as {})",
@@ -5579,7 +5759,7 @@ async fn send_test_to_route(
     // Convert using the SAME code as the live proxy path (build_fwd_body is
     // the single source of truth — the template above is an Anthropic
     // Messages request, so client_protocol is "anthropic").
-    let mut fwd_body = match build_fwd_body("anthropic", &route.format, &anthropic_body, route) {
+    let fwd_body = match build_fwd_body("anthropic", &route.format, &anthropic_body, route) {
         Ok(b) => b,
         Err(e) => {
             return TestResult {

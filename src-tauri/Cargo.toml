@@ -50,6 +50,8 @@ tauri = { version = "2", features = ["tray-icon"], optional = true }
 tauri-plugin-shell = { version = "2", optional = true }
 tauri-plugin-updater = { version = "2", optional = true }
 tauri-plugin-process = { version = "2", optional = true }
+hmac = { version = "0.13.0", default-features = false }
+sha1 = { version = "0.11.0", default-features = false }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
