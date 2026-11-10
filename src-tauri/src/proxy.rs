@@ -4215,19 +4215,10 @@ async fn pixmax_upload_image_asset(
     let cb_header = base64::engine::general_purpose::STANDARD.encode(cb_json.to_string());
     let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
     let canonical = format!("x-oss-callback:{}\nx-oss-security-token:{}\n", cb_header, token);
-    let string_to_sign = format!("PUT\n\n{}\n{}\n{}/{}{}", mime, date, canonical, bucket, object_key);
-    // Diagnostic: the OSS 403 body echoes the StringToSign IT derived from the
-    // received headers — log ours (token masked) so a mismatch is diffable
-    // from the server journal in one round trip.
-    log::info!(
-        "[Proxy] pixmax oss put signing: https://{}.{} mime={} ak={} key={} sts=\n{}",
-        bucket,
-        host,
-        mime,
-        ak,
-        object_key,
-        string_to_sign.replace(&token, &format!("{}…", &token[..token.len().min(12)]))
-    );
+    // Canonical resource = "/" + bucket + "/" + key. objectKey arrives WITHOUT
+    // a leading slash — a missing separator here signs "/bucketkey/…" and OSS
+    // answers SignatureDoesNotMatch (verified against its own <StringToSign>).
+    let string_to_sign = format!("PUT\n\n{}\n{}\n{}/{}/{}", mime, date, canonical, bucket, object_key);
     use hmac::Mac as _;
     let mut mac = <hmac::Hmac<sha1::Sha1> as hmac::KeyInit>::new_from_slice(sk.as_bytes())
         .map_err(|e| ProxyError::Upstream(format!("pixmax: hmac init: {}", e)))?;
