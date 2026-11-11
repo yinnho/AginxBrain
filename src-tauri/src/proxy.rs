@@ -4488,6 +4488,85 @@ fn pixmax_is_transient(envelope: &Value) -> bool {
     envelope.get("errCode").and_then(|v| v.as_str()) == Some("500")
 }
 
+/// Classify a pixmax asset-compliance status: Some(true) = cleared for use,
+/// Some(false) = blocked, None = still pending (poll again). Status strings
+/// mirror the pixmax-cli terminal sets.
+fn pixmax_compliance_status_class(status: &str) -> Option<bool> {
+    const PASS: [&str; 7] = ["ACTIVE", "PASS", "PASSED", "SUCCESS", "SUCCEEDED", "COMPLETE", "COMPLETED"];
+    const FAIL: [&str; 5] = ["FAILED", "FAIL", "REJECTED", "BLOCKED", "ERROR"];
+    let status = status.trim().to_uppercase();
+    if PASS.contains(&status.as_str()) {
+        Some(true)
+    } else if FAIL.contains(&status.as_str()) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Run pixmax's asset compliance check (/assetLibrary/compliance/check) for an
+/// uploaded reference image until it resolves. A definitive rejection fails
+/// the submit with the image NAMED (reference image #N) so the caller knows
+/// which one to redraw; pending-after-timeout or endpoint errors only warn —
+/// the render-side moderation remains the backstop, so this can never make a
+/// working submission worse.
+async fn pixmax_ensure_asset_compliant(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    asset_uuid: &str,
+    image_no: usize,
+) -> Result<(), ProxyError> {
+    const MAX_ATTEMPTS: usize = 15; // ~30s at 2s intervals; clean images resolve in 1-2 calls
+    for attempt in 0..MAX_ATTEMPTS {
+        let res = match pixmax_call(
+            state,
+            provider,
+            route,
+            "/assetLibrary/compliance/check",
+            &json!({"assetUuid": asset_uuid}),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "[Proxy] pixmax compliance check for reference image #{} unavailable ({}), continuing",
+                    image_no,
+                    e
+                );
+                return Ok(());
+            }
+        };
+        let data = res.get("data").cloned().unwrap_or(Value::Null);
+        let status = ["complianceStatus", "status", "assetComplianceStatus"]
+            .iter()
+            .find_map(|k| data.get(k).and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_uppercase();
+        match pixmax_compliance_status_class(&status) {
+            Some(true) => return Ok(()),
+            Some(false) => {
+                return Err(ProxyError::Upstream(format!(
+                    "pixmax: reference image #{} was blocked by the compliance check (status {}) — \
+                     the provider sees person/sensitive content in it; replace or redraw that image",
+                    image_no, status
+                )));
+            }
+            None => {}
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+    log::warn!(
+        "[Proxy] pixmax compliance check for reference image #{} still pending after {}s, continuing",
+        image_no,
+        MAX_ATTEMPTS * 2
+    );
+    Ok(())
+}
+
 /// Canvas model catalog, cached per provider for 1h. (provider name → fetched-at, data)
 static PIXMAX_CATALOGS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
@@ -4860,6 +4939,12 @@ async fn handle_pixmax_video_request(
             mime
         );
         let asset_uuid = pixmax_upload_image_asset(&state, provider, route, &bytes, &mime).await?;
+        // Person-image compliance pre-clear: pixmax's render providers reject
+        // person-looking references at RENDER time with "输入图像可能包含人像
+        // 图片，请先将人物图片进行合规检测" — the sanctioned fix is the asset
+        // compliance check before submitting. A rejected image errors HERE,
+        // named by position, instead of burning the render slot.
+        pixmax_ensure_asset_compliant(&state, provider, route, &asset_uuid, i + 1).await?;
         let img_uuid = uuid::Uuid::new_v4().to_string();
         let node = json!({
             "uuid": img_uuid,
@@ -6983,6 +7068,19 @@ mod tests {
         // catalog unavailable → optimistic imageRefer for ≥2
         let empty = std::collections::HashMap::new();
         assert_eq!(pixmax_refer_mode(&empty, &no_caps, 3, None).as_deref(), Ok("imageRefer"));
+    }
+
+    #[test]
+    fn test_pixmax_compliance_status_class() {
+        assert_eq!(pixmax_compliance_status_class("ACTIVE"), Some(true));
+        assert_eq!(pixmax_compliance_status_class("pass"), Some(true));
+        assert_eq!(pixmax_compliance_status_class("COMPLETED"), Some(true));
+        assert_eq!(pixmax_compliance_status_class("REJECTED"), Some(false));
+        assert_eq!(pixmax_compliance_status_class("blocked"), Some(false));
+        assert_eq!(pixmax_compliance_status_class("ERROR"), Some(false));
+        assert_eq!(pixmax_compliance_status_class("PENDING"), None);
+        assert_eq!(pixmax_compliance_status_class("CHECKING"), None);
+        assert_eq!(pixmax_compliance_status_class(""), None);
     }
 
     #[test]

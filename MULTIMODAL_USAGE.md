@@ -414,6 +414,8 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 | `HAILUO_23` | 1 张首帧 |
 
 > 多图参考 = `imageRefer`（KLING/VIDU）或 `referToVideo`（PIXDANCE/Seedance、HappyHorse 等，纯图即可，无需视频）。上限来自 pixmax 模型目录，以目录为准；超限在上传前直接报错。
+>
+> **人像合规预检**：参考图上传后网关自动逐张过 pixmax 合规检测（`/assetLibrary/compliance/check`）——渲染方的真人风控（"输入图像可能包含人像图片"）要求先过检。被拒的图会在**提交前**点名报错（如 `reference image #4 was blocked`），不会再浪费一次渲染；建议角色参考图避免过于写实的人像照片。
 
 **提交响应**（与 wanx / seedance 同 shape）：
 ```json
