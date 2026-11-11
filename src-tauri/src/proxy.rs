@@ -4754,8 +4754,21 @@ async fn handle_pixmax_video_request(
     //   1 image  → imageToVideo (first frame)
     //   ≥2       → imageRefer / firstAndLastFrame per model capability
     // no image  → text-to-video.
-    const MAX_REF_IMAGES: usize = 7;
-    let image_refs = collect_image_urls(body, MAX_REF_IMAGES);
+    // Gateway ceiling for reference images = the largest cap in the pixmax
+    // catalog (draft referToVideo takes 30). Requests beyond it error BEFORE
+    // uploads — never silently truncate (dropping character refs 8+ rendered
+    // videos with the wrong cast). Per-model catalog caps tighten this
+    // further in pixmax_refer_mode.
+    const MAX_REF_IMAGES: usize = 30;
+    let all_image_refs = collect_image_urls(body, usize::MAX);
+    if all_image_refs.len() > MAX_REF_IMAGES {
+        return Err(ProxyError::Upstream(format!(
+            "pixmax: {} reference images exceeds the gateway limit of {} (largest model cap) — send fewer",
+            all_image_refs.len(),
+            MAX_REF_IMAGES
+        )));
+    }
+    let image_refs = all_image_refs;
     let tag = route.tags.first().cloned().unwrap_or_else(|| "pixmax".to_string());
 
     // pixmax wants every param as a string. Defaults and allowed values come
