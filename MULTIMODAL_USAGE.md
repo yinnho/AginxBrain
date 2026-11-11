@@ -370,7 +370,7 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 
 参考图支持 http(s) URL 或 data:base64（与图片生成/编辑的参考图同一约定）。
 
-**多参考图**（`image_url` 块放多个，按顺序）——网关按模型目录能力自动选模式：
+**多参考图**（`image_url` 块放多个，按顺序，**网关最多取前 7 张**）——网关按模型目录能力自动选模式：
 
 | 图数 | 自动模式 | 说明 |
 |---|---|---|
