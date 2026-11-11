@@ -375,10 +375,10 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 | 图数 | 自动模式 | 说明 |
 |---|---|---|
 | 1 | `imageToVideo` | 首帧图生视频（所有图生视频模型）；imageRefer-only 模型（如 VIDU_Q3_MIX）则走 `imageRefer` |
-| 2 | `imageRefer` > `firstAndLastFrame` | 模型有 `imageRefer`（KLING / VIDU / HappyHorse 系）就用多图参考；否则恰好 2 张走首尾帧（第 1 张=首帧，第 2 张=尾帧，如 PIXDANCE 系） |
-| ≥3 | `imageRefer` | 仅多图参考模型支持；不支持的模型会返回明确错误（列出该模型的模式与上限） |
+| 2 | `imageRefer` > `firstAndLastFrame` | 模型有 `imageRefer`（KLING / VIDU 系）就用多图参考；否则走首尾帧（第 1 张=首帧，第 2 张=尾帧） |
+| ≥3 | `imageRefer` > `referToVideo` | 有 `imageRefer` 用之（KLING/VIDU）；否则 Seedance/PIXDANCE 等家族走 `referToVideo` 多图参考（纯图、无需视频，实测出片） |
 
-**张数上限按模型校验（提交前拒绝，不浪费上传）**：每个模式的可收图数来自 pixmax 模型目录——`imageToVideo` 恒为 1、`firstAndLastFrame` 恒为 2、`imageRefer` 因模型而异（**VIDU_Q3_MIX 1–3**、**KLING_4 1–10**）。超过上限的请求在**上传资产之前**即报错并按候选路由 failover；所有路由都吃不下时返回最终错误（错误信息带各模式上限，如 `imageRefer 1-3`）。>3 张的请求需要有 KLING_4（或更高上限）路由在链上才会出片。
+**张数上限按模型校验（提交前拒绝，不浪费上传）**：每个模式的可收图数来自 pixmax 模型目录——`imageToVideo` 恒为 1、`firstAndLastFrame` 恒为 2、`imageRefer` / `referToVideo` 因模型而异（见下表）。超过上限的请求在**上传资产之前**即报错并按候选路由 failover；所有路由都吃不下时返回最终错误（错误信息带各模式上限，如 `imageRefer 1-3`）。
 
 ```json
 { "model": "video",
@@ -396,22 +396,24 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 
 | 模型代码 | 参考图能力 |
 |---|---|
-| `PIXDANCE_2_5` / `PIXDANCE_2_5_DRAFT` | 1 张首帧；2 张首尾帧 |
-| `PIXDANCE_2` / `PIXDANCE_2_FAST` / `PIXDANCE_2_MINI` | 1 张首帧；2 张首尾帧 |
+| `PIXDANCE_2_5` / `PIXDANCE_2_5_DRAFT` | 1 张首帧；2 张首尾帧；**多图参考 ≤30 张** |
+| `PIXDANCE_2` / `PIXDANCE_2_FAST` / `PIXDANCE_2_MINI` | 1 张首帧；2 张首尾帧；**多图参考 ≤9 张**（FAST 实测 3 张出片） |
 | `SEEDANCE_1_5` | 1 张首帧；2 张首尾帧 |
-| `KLING_4` | 1 / 2 张；**imageRefer 1–10**；keyFrames 3–10 |
-| `KLING_O1` / `KLING_V3_OMNI` | 1 / 2 张；**imageRefer 1–7** |
+| `KLING_4` | 1 / 2 张；**imageRefer ≤10**；keyFrames 3–10；referToVideo ≤10 |
+| `KLING_O1` / `KLING_V3_OMNI` | 1 / 2 张；**imageRefer ≤7**；referToVideo ≤4 |
 | `KLING_V3` / `KLING_2_6` | 1 / 2 张 |
-| `VIDU_Q4_PREVIEW` | 1 张；**imageRefer 1–15** |
-| `VIDU_Q3_PRO` / `VIDU_Q3_MIX` | **imageRefer 1–3**（Q3_PRO 另有 1/2 张模式） |
-| `VIDU_Q2_PRO` | 1 / 2 张；**imageRefer 1–7** |
-| `WAN3_0` / `WAN3_0_PRIME` / `WAN2_6` / `VEGA_10_PRO` | 1 / 2 张 |
-| `MINIMAX_H3` / `MINIMAX_H3_MAX` / `HAILUO_02` | 1 / 2 张 |
-| `PIXVERSE_V6` / `PIXVERSE_C1` | 1 / 2 张 |
-| `HAPPYHORSE_11` / `HAPPYHORSE_10` | 1 张首帧 |
+| `VIDU_Q4_PREVIEW` | 1 张；**imageRefer ≤15** |
+| `VIDU_Q3_PRO` / `VIDU_Q3_MIX` | **imageRefer ≤3**（Q3_PRO 另有 1/2 张模式） |
+| `VIDU_Q2_PRO` | 1 / 2 张；**imageRefer ≤7**；referToVideo ≤4 |
+| `WAN3_0` / `WAN3_0_PRIME` | 1 / 2 张；多图（混合上限）≤20 |
+| `WAN2_6` | 1 张；多图（混合上限）≤5 |
+| `VEGA_10_PRO` | 1 / 2 张；多图参考 ≤9 |
+| `MINIMAX_H3` / `MINIMAX_H3_MAX` / `HAILUO_02` | 1 / 2 张（H3 混合多图 ≤12） |
+| `PIXVERSE_V6` / `PIXVERSE_C1` | 1 / 2 张（C1 多图 ≤3） |
+| `HAPPYHORSE_11` / `HAPPYHORSE_10` | 1 张首帧；多图参考 ≤9 |
 | `HAILUO_23` | 1 张首帧 |
 
-> 3 张及以上只有 imageRefer 系（KLING_4 最多 10、VIDU_Q4_PREVIEW 最多 15）支持；其余模型超上限会在上传前直接报错（错误信息带该模型各模式上限）。上限来自 pixmax 模型目录，以目录为准。
+> 多图参考 = `imageRefer`（KLING/VIDU）或 `referToVideo`（PIXDANCE/Seedance、HappyHorse 等，纯图即可，无需视频）。上限来自 pixmax 模型目录，以目录为准；超限在上传前直接报错。
 
 **提交响应**（与 wanx / seedance 同 shape）：
 ```json

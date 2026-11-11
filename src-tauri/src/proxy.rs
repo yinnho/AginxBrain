@@ -3865,6 +3865,12 @@ fn pixmax_refer_mode(
                 Ok("imageRefer".to_string())
             } else if n == 2 && has("firstAndLastFrame") && fits("firstAndLastFrame") {
                 Ok("firstAndLastFrame".to_string())
+            } else if has("referToVideo") && fits("referToVideo") {
+                // Reference-to-video: images-only works (video optional 0-3,
+                // E2E 2026-11-11: PIXDANCE_2_FAST + 3 images → COMPLETE). The
+                // Seedance/PIXDANCE family takes multi-reference this way —
+                // up to 30 on draft, 9 on PIXDANCE_2/FAST/MINI.
+                Ok("referToVideo".to_string())
             } else if options.is_none() {
                 // Catalog unavailable — be optimistic and let pixmax's own
                 // validation speak if the model lacks the mode (failover
@@ -3873,7 +3879,8 @@ fn pixmax_refer_mode(
             } else {
                 Err(format!(
                     "model has no mode accepting {} reference images ({}) — \
-                     multi-image needs imageRefer with headroom (e.g. KLING_4 1-10) or exactly 2 for firstAndLastFrame",
+                     multi-image needs imageRefer or referToVideo with headroom (KLING_4 1-10, \
+                     PIXDANCE draft 30) or exactly 2 for firstAndLastFrame",
                     n,
                     pixmax_mode_caps_desc(ranges)
                 ))
@@ -4612,22 +4619,40 @@ fn pixmax_parse_refer_ranges(
                         let Some(value) = opt.get("value").and_then(|v| v.as_str()) else {
                             continue;
                         };
+                        // Two rule shapes cover BASE_IMAGE: an images-ONLY rule
+                        // (inValues within the image family — the tight cap for
+                        // our image-only payloads, e.g. referToVideo images
+                        // 0-9 on PIXDANCE_2_FAST) and a COMBINED media rule
+                        // (images+video+audio total). Prefer the images-only
+                        // one when present; fall back to combined.
+                        let mut images_only: Option<(usize, usize)> = None;
+                        let mut any_covering: Option<(usize, usize)> = None;
                         for dep in opt.get("dependOn").and_then(|v| v.as_array()).into_iter().flatten() {
-                            let covers_images = dep
-                                .get("inValues")
-                                .and_then(|v| v.as_array())
-                                .map(|vals| vals.iter().any(|t| t.as_str() == Some("BASE_IMAGE")))
-                                .unwrap_or(false);
+                            let Some(vals) = dep.get("inValues").and_then(|v| v.as_array()) else {
+                                continue;
+                            };
+                            let covers_images = vals.iter().any(|t| t.as_str() == Some("BASE_IMAGE"));
                             if !covers_images {
                                 continue;
                             }
-                            if let Some((lo, hi)) = dep
+                            let Some((lo, hi)) = dep
                                 .get("length")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| serde_json::from_str::<(usize, usize)>(s).ok())
-                            {
-                                out.insert(value.to_string(), (lo, hi));
+                            else {
+                                continue;
+                            };
+                            let all_image_family = vals.iter().all(|t| {
+                                matches!(t.as_str(), Some("BASE_IMAGE") | Some("GENERATE_IMAGE") | Some("GENERATE_STORYBOARD"))
+                            });
+                            if all_image_family {
+                                images_only = Some((lo, hi));
+                            } else {
+                                any_covering = Some((lo, hi));
                             }
+                        }
+                        if let Some(range) = images_only.or(any_covering) {
+                            out.insert(value.to_string(), range);
                         }
                     }
                 }
@@ -6860,18 +6885,23 @@ mod tests {
             m
         };
         let no_caps = std::collections::HashMap::new();
-        // draft-style: t2v / i2v / firstAndLastFrame only
+        // draft-style: t2v / i2v / firstAndLastFrame / referToVideo
         let draft = mk(&["textToVideo", "referToVideo", "imageToVideo", "firstAndLastFrame"]);
         let draft_caps = std::collections::HashMap::from([
             ("imageToVideo".to_string(), (1usize, 1usize)),
             ("firstAndLastFrame".to_string(), (2usize, 2usize)),
+            ("referToVideo".to_string(), (0usize, 30usize)),
         ]);
         assert_eq!(pixmax_refer_mode(&draft, &no_caps, 0, None).as_deref(), Ok("textToVideo"));
         assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 1, None).as_deref(), Ok("imageToVideo"));
         // exactly 2 → firstAndLastFrame on a model without imageRefer
         assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 2, None).as_deref(), Ok("firstAndLastFrame"));
-        // 3+ has no mode here
-        assert!(pixmax_refer_mode(&draft, &draft_caps, 3, None).is_err());
+        // 3+ falls to referToVideo (Seedance/PIXDANCE multi-reference, images-only)
+        assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 3, None).as_deref(), Ok("referToVideo"));
+        assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 6, None).as_deref(), Ok("referToVideo"));
+        assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 30, None).as_deref(), Ok("referToVideo"));
+        // over draft's referToVideo cap → error
+        assert!(pixmax_refer_mode(&draft, &draft_caps, 31, None).is_err());
 
         // kling-style: has imageRefer → always preferred for ≥2
         let kling = mk(&["textToVideo", "imageToVideo", "firstAndLastFrame", "imageRefer", "keyFrames"]);
@@ -6907,6 +6937,22 @@ mod tests {
         assert!(pixmax_refer_mode(&mix, &mix_caps, 6, Some("imageRefer")).is_err());
         // a 6-image request CAN land on kling (cap 10)
         assert_eq!(pixmax_refer_mode(&kling, &kling_caps, 6, None).as_deref(), Ok("imageRefer"));
+        // PIXDANCE_2_FAST shape: no imageRefer, referToVideo images-only 0-9
+        let fast = mk(&["textToVideo", "referToVideo", "imageToVideo", "firstAndLastFrame"]);
+        let fast_caps = std::collections::HashMap::from([
+            ("imageToVideo".to_string(), (1usize, 1usize)),
+            ("firstAndLastFrame".to_string(), (2usize, 2usize)),
+            ("referToVideo".to_string(), (0usize, 9usize)),
+        ]);
+        assert_eq!(pixmax_refer_mode(&fast, &fast_caps, 3, None).as_deref(), Ok("referToVideo"));
+        assert_eq!(pixmax_refer_mode(&fast, &fast_caps, 9, None).as_deref(), Ok("referToVideo"));
+        assert!(pixmax_refer_mode(&fast, &fast_caps, 10, None).is_err());
+        assert!(pixmax_refer_mode(&fast, &fast_caps, 10, Some("referToVideo")).is_err());
+        // imageRefer still wins over referToVideo when both fit
+        assert_eq!(
+            pixmax_refer_mode(&kling, &kling_caps, 5, None).as_deref(),
+            Ok("imageRefer")
+        );
         // model with imageRefer capped below the count falls to
         // firstAndLastFrame when exactly 2 fits it
         let low_refer = mk(&["imageToVideo", "firstAndLastFrame", "imageRefer"]);
