@@ -3805,26 +3805,48 @@ fn collect_image_urls(body: &Value, max: usize) -> Vec<String> {
 }
 
 /// Choose the pixmax `referModel` for the number of reference images the client
-/// sent, based on the model's catalog options:
+/// sent, based on the model's catalog options AND per-mode image-count caps
+/// (`ranges` from pixmax_refer_image_ranges):
 ///   0 images → textToVideo
-///   1 image  → imageToVideo
+///   1 image  → imageToVideo, else imageRefer when that's the model's only
+///              image mode (e.g. VIDU_Q3_MIX)
 ///   ≥2       → imageRefer (KLING/VIDU/HappyHorse multi-reference), else
 ///              firstAndLastFrame when exactly 2 (first image = first frame,
 ///              second = last frame)
-/// An explicit client referModel wins when the model supports it; asking for an
-/// unsupported mode is an error (not a silent semantic switch) so the request
-/// can fail over to a route whose model does support it.
+/// A mode only qualifies when the image count fits its catalog range — VIDU
+/// imageRefer is 1–3, so 6 images reject HERE instead of after uploading six
+/// assets (pixmax only checks at render time). An explicit client referModel
+/// wins when the model supports it AND the count fits; violations are errors
+/// (not silent semantic switches) so the request can fail over to a route
+/// whose model accepts the count.
 /// Err = human-readable reason for the caller to surface.
 fn pixmax_refer_mode(
     specs: &std::collections::HashMap<String, (String, Vec<String>)>,
+    ranges: &std::collections::HashMap<String, (usize, usize)>,
     image_count: usize,
     client_refer_model: Option<&str>,
 ) -> Result<String, String> {
     let options = specs.get("referModel").map(|(_, o)| o.clone());
     let has = |mode: &str| options.iter().flatten().any(|x| x == mode);
+    // Unknown range (catalog silent) counts as fitting — pixmax's own
+    // validation is the backstop then.
+    let fits = |mode: &str| {
+        ranges
+            .get(mode)
+            .map(|(lo, hi)| image_count >= *lo && image_count <= *hi)
+            .unwrap_or(true)
+    };
     if let Some(v) = client_refer_model {
         let valid = options.as_ref().map(|o| o.is_empty() || o.iter().any(|x| x == v)).unwrap_or(true);
         if valid {
+            if !fits(v) {
+                let (lo, hi) = ranges.get(v).copied().unwrap_or((0, 0));
+                return Err(format!(
+                    "referModel '{}' on this model takes {}-{} reference images, got {} — \
+                     fail over to a model with a higher cap (e.g. KLING_4 imageRefer 1-10) or send fewer images",
+                    v, lo, hi, image_count
+                ));
+            }
             return Ok(v.to_string());
         }
         return Err(format!(
@@ -3835,11 +3857,13 @@ fn pixmax_refer_mode(
     }
     match image_count {
         0 if has("textToVideo") || options.is_none() => Ok("textToVideo".to_string()),
-        1 if has("imageToVideo") || options.is_none() => Ok("imageToVideo".to_string()),
+        1 if has("imageToVideo") && fits("imageToVideo") => Ok("imageToVideo".to_string()),
+        1 if has("imageRefer") && fits("imageRefer") => Ok("imageRefer".to_string()),
+        1 if options.is_none() => Ok("imageToVideo".to_string()),
         n if n >= 2 => {
-            if has("imageRefer") {
+            if has("imageRefer") && fits("imageRefer") {
                 Ok("imageRefer".to_string())
-            } else if n == 2 && has("firstAndLastFrame") {
+            } else if n == 2 && has("firstAndLastFrame") && fits("firstAndLastFrame") {
                 Ok("firstAndLastFrame".to_string())
             } else if options.is_none() {
                 // Catalog unavailable — be optimistic and let pixmax's own
@@ -3848,10 +3872,10 @@ fn pixmax_refer_mode(
                 Ok("imageRefer".to_string())
             } else {
                 Err(format!(
-                    "model has no mode for {} reference images (referModel options: {:?}) — \
-                     multi-image needs imageRefer (KLING/VIDU/HappyHorse) or exactly 2 for firstAndLastFrame",
+                    "model has no mode accepting {} reference images ({}) — \
+                     multi-image needs imageRefer with headroom (e.g. KLING_4 1-10) or exactly 2 for firstAndLastFrame",
                     n,
-                    options.unwrap_or_default()
+                    pixmax_mode_caps_desc(ranges)
                 ))
             }
         }
@@ -4552,6 +4576,98 @@ async fn pixmax_model_params(
     out
 }
 
+/// Per-mode accepted image counts for route.model, from the catalog's
+/// referModel dependOn rules: each option carries inputNodeTypes rules and the
+/// one covering BASE_IMAGE has `length` "[min,max]" — e.g. VIDU_Q3_MIX
+/// imageRefer is [1,3] (KLING_4: [1,10]), imageToVideo is [1,1] everywhere,
+/// firstAndLastFrame [2,2]. Pixmax enforces this at RENDER time (after assets
+/// are uploaded) with "Image count must be between 1 and 3 for imageRefer
+/// mode" — we extract the same caps here to reject over-limit requests BEFORE
+/// any upload. Empty map = catalog silent (caller stays optimistic and
+/// pixmax's own validation applies).
+fn pixmax_parse_refer_ranges(
+    catalog: &Value,
+    model: &str,
+) -> std::collections::HashMap<String, (usize, usize)> {
+    let mut out = std::collections::HashMap::new();
+    let Some(groups) = catalog.as_array() else {
+        return out;
+    };
+    'outer: for group in groups {
+        let Some(models) = group.get("nodeConfig").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for m in models {
+            let matches = m.get("modelCode").and_then(|v| v.as_str()) == Some(model)
+                || m.get("modelCodeAlias").and_then(|v| v.as_str()) == Some(model);
+            if !matches {
+                continue;
+            }
+            if let Some(params) = m.pointer("/modelConfig/params").and_then(|v| v.as_array()) {
+                for p in params {
+                    if p.get("name").and_then(|v| v.as_str()) != Some("referModel") {
+                        continue;
+                    }
+                    for opt in p.get("options").and_then(|v| v.as_array()).into_iter().flatten() {
+                        let Some(value) = opt.get("value").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        for dep in opt.get("dependOn").and_then(|v| v.as_array()).into_iter().flatten() {
+                            let covers_images = dep
+                                .get("inValues")
+                                .and_then(|v| v.as_array())
+                                .map(|vals| vals.iter().any(|t| t.as_str() == Some("BASE_IMAGE")))
+                                .unwrap_or(false);
+                            if !covers_images {
+                                continue;
+                            }
+                            if let Some((lo, hi)) = dep
+                                .get("length")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| serde_json::from_str::<(usize, usize)>(s).ok())
+                            {
+                                out.insert(value.to_string(), (lo, hi));
+                            }
+                        }
+                    }
+                }
+            }
+            break 'outer;
+        }
+    }
+    out
+}
+
+/// Cached-catalog wrapper around pixmax_parse_refer_ranges for route.model.
+async fn pixmax_refer_image_ranges(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+) -> std::collections::HashMap<String, (usize, usize)> {
+    let catalog = {
+        let cache = pixmax_catalogs().lock().unwrap();
+        cache
+            .get(&provider.name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Null)
+    };
+    pixmax_parse_refer_ranges(&catalog, &route.model)
+}
+
+/// Human-readable summary of known per-mode image caps for error messages:
+/// "imageRefer 1-3, firstAndLastFrame 2-2" (sorted for determinism).
+fn pixmax_mode_caps_desc(ranges: &std::collections::HashMap<String, (usize, usize)>) -> String {
+    if ranges.is_empty() {
+        return "caps unknown".to_string();
+    }
+    let mut parts: Vec<String> = ranges
+        .iter()
+        .map(|(mode, (lo, hi))| format!("{} {}-{}", mode, lo, hi))
+        .collect();
+    parts.sort();
+    parts.join(", ")
+}
+
 /// Resolve one client param against the catalog spec: keep the client value
 /// when the model allows it (or when there is no spec), else snap to the
 /// model default instead of failing the generation with "parameter illegal".
@@ -4671,8 +4787,10 @@ async fn handle_pixmax_video_request(
     // risk a rejection (specs empty = catalog unavailable, keep sending it).
     let send_include_audio = specs.is_empty() || specs.contains_key("includeAudio");
 
+    let refer_ranges = pixmax_refer_image_ranges(&state, provider, route).await;
     let refer_mode = pixmax_refer_mode(
         &specs,
+        &refer_ranges,
         image_refs.len(),
         body.get("referModel").and_then(|v| v.as_str()),
     )
@@ -6741,37 +6859,119 @@ mod tests {
             );
             m
         };
+        let no_caps = std::collections::HashMap::new();
         // draft-style: t2v / i2v / firstAndLastFrame only
         let draft = mk(&["textToVideo", "referToVideo", "imageToVideo", "firstAndLastFrame"]);
-        assert_eq!(pixmax_refer_mode(&draft, 0, None).as_deref(), Ok("textToVideo"));
-        assert_eq!(pixmax_refer_mode(&draft, 1, None).as_deref(), Ok("imageToVideo"));
+        let draft_caps = std::collections::HashMap::from([
+            ("imageToVideo".to_string(), (1usize, 1usize)),
+            ("firstAndLastFrame".to_string(), (2usize, 2usize)),
+        ]);
+        assert_eq!(pixmax_refer_mode(&draft, &no_caps, 0, None).as_deref(), Ok("textToVideo"));
+        assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 1, None).as_deref(), Ok("imageToVideo"));
         // exactly 2 → firstAndLastFrame on a model without imageRefer
-        assert_eq!(pixmax_refer_mode(&draft, 2, None).as_deref(), Ok("firstAndLastFrame"));
+        assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 2, None).as_deref(), Ok("firstAndLastFrame"));
         // 3+ has no mode here
-        assert!(pixmax_refer_mode(&draft, 3, None).is_err());
+        assert!(pixmax_refer_mode(&draft, &draft_caps, 3, None).is_err());
 
         // kling-style: has imageRefer → always preferred for ≥2
         let kling = mk(&["textToVideo", "imageToVideo", "firstAndLastFrame", "imageRefer", "keyFrames"]);
-        assert_eq!(pixmax_refer_mode(&kling, 2, None).as_deref(), Ok("imageRefer"));
-        assert_eq!(pixmax_refer_mode(&kling, 5, None).as_deref(), Ok("imageRefer"));
+        let kling_caps = std::collections::HashMap::from([
+            ("imageToVideo".to_string(), (1usize, 1usize)),
+            ("firstAndLastFrame".to_string(), (2usize, 2usize)),
+            ("imageRefer".to_string(), (1usize, 10usize)),
+            ("keyFrames".to_string(), (3usize, 10usize)),
+        ]);
+        assert_eq!(pixmax_refer_mode(&kling, &kling_caps, 2, None).as_deref(), Ok("imageRefer"));
+        assert_eq!(pixmax_refer_mode(&kling, &kling_caps, 5, None).as_deref(), Ok("imageRefer"));
+        assert_eq!(pixmax_refer_mode(&kling, &kling_caps, 10, None).as_deref(), Ok("imageRefer"));
         // explicit client override wins when valid…
-        assert_eq!(pixmax_refer_mode(&kling, 1, Some("imageRefer")).as_deref(), Ok("imageRefer"));
+        assert_eq!(pixmax_refer_mode(&kling, &kling_caps, 1, Some("imageRefer")).as_deref(), Ok("imageRefer"));
         // …and is an ERROR (not a silent switch) when the model lacks it
-        assert!(pixmax_refer_mode(&kling, 1, Some("nope")).is_err());
-        assert!(pixmax_refer_mode(&draft, 2, Some("imageRefer")).is_err());
+        assert!(pixmax_refer_mode(&kling, &kling_caps, 1, Some("nope")).is_err());
+        assert!(pixmax_refer_mode(&draft, &draft_caps, 2, Some("imageRefer")).is_err());
 
         // t2v-only model: any image has no auto mode
         let t2v = mk(&["textToVideo"]);
-        assert!(pixmax_refer_mode(&t2v, 1, None).is_err());
+        assert!(pixmax_refer_mode(&t2v, &no_caps, 1, None).is_err());
 
         // imageRefer-only model (VIDU_Q3_MIX): no text mode at all
         let mix = mk(&["imageRefer"]);
-        assert!(pixmax_refer_mode(&mix, 0, None).is_err());
-        assert_eq!(pixmax_refer_mode(&mix, 3, None).as_deref(), Ok("imageRefer"));
+        let mix_caps = std::collections::HashMap::from([("imageRefer".to_string(), (1usize, 3usize))]);
+        assert!(pixmax_refer_mode(&mix, &mix_caps, 0, None).is_err());
+        assert_eq!(pixmax_refer_mode(&mix, &mix_caps, 1, None).as_deref(), Ok("imageRefer"));
+        assert_eq!(pixmax_refer_mode(&mix, &mix_caps, 3, None).as_deref(), Ok("imageRefer"));
+        // THE 6-image incident: cap rejects BEFORE uploads (pixmax only
+        // checks at render time, after assets are already uploaded)
+        let over = pixmax_refer_mode(&mix, &mix_caps, 6, None).unwrap_err();
+        assert!(over.contains("1-3") && over.contains("6"), "got: {}", over);
+        assert!(pixmax_refer_mode(&mix, &mix_caps, 6, Some("imageRefer")).is_err());
+        // a 6-image request CAN land on kling (cap 10)
+        assert_eq!(pixmax_refer_mode(&kling, &kling_caps, 6, None).as_deref(), Ok("imageRefer"));
+        // model with imageRefer capped below the count falls to
+        // firstAndLastFrame when exactly 2 fits it
+        let low_refer = mk(&["imageToVideo", "firstAndLastFrame", "imageRefer"]);
+        let low_caps = std::collections::HashMap::from([
+            ("imageToVideo".to_string(), (1usize, 1usize)),
+            ("firstAndLastFrame".to_string(), (2usize, 2usize)),
+            ("imageRefer".to_string(), (2usize, 2usize)),
+        ]);
+        assert_eq!(
+            pixmax_refer_mode(&low_refer, &low_caps, 2, None).as_deref(),
+            Ok("imageRefer")
+        );
+        assert!(pixmax_refer_mode(&low_refer, &low_caps, 5, None).is_err());
 
         // catalog unavailable → optimistic imageRefer for ≥2
         let empty = std::collections::HashMap::new();
-        assert_eq!(pixmax_refer_mode(&empty, 3, None).as_deref(), Ok("imageRefer"));
+        assert_eq!(pixmax_refer_mode(&empty, &no_caps, 3, None).as_deref(), Ok("imageRefer"));
+    }
+
+    #[test]
+    fn test_pixmax_refer_image_ranges_extraction() {
+        // Mirrors the real /canvas/modelConfig entry shape: referModel options
+        // carry dependOn inputNodeTypes rules; the BASE_IMAGE-covering one has
+        // length "[min,max]".
+        let catalog = json!([{
+            "name": "视频生成",
+            "nodeConfig": [{
+                "modelCode": "VIDU_Q3_MIX",
+                "modelConfig": {
+                    "params": [{
+                        "name": "referModel",
+                        "type": "radio",
+                        "default": "imageRefer",
+                        "options": [
+                            {"value": "imageRefer", "dependOn": [
+                                {"type": "inputNodeTypes", "field": "inputNodeTypes",
+                                 "inValues": ["BASE_IMAGE", "GENERATE_IMAGE"],
+                                 "eqValue": null, "betweenValue": null, "length": "[1,3]"},
+                                {"type": "inputNodeTypes", "field": "inputNodeTypes",
+                                 "inValues": ["BASE_VIDEO", "GENERATE_VIDEO"],
+                                 "eqValue": null, "betweenValue": null, "length": "[0,0]"}
+                            ]},
+                            {"value": "keyFrames", "dependOn": [
+                                {"type": "inputNodeTypes", "field": "inputNodeTypes",
+                                 "inValues": ["BASE_TEXT", "GENERATE_TEXT"],
+                                 "eqValue": null, "betweenValue": null, "length": "[0,20]"}
+                            ]}
+                        ]
+                    }, {
+                        "name": "resolution", "type": "select", "default": "720P", "options": []
+                    }]
+                }
+            }, {
+                "modelCode": "OTHER_MODEL", "modelConfig": {"params": []}
+            }]
+        }]);
+        // Real parser against the real catalog JSON shape.
+        let ranges = pixmax_parse_refer_ranges(&catalog, "VIDU_Q3_MIX");
+        assert_eq!(ranges.get("imageRefer"), Some(&(1usize, 3usize)));
+        assert!(!ranges.contains_key("keyFrames")); // text rule never counted
+        // wrong model → empty
+        assert!(pixmax_parse_refer_ranges(&catalog, "OTHER_MODEL").is_empty());
+        // malformed length strings are skipped, not fatal
+        assert!(serde_json::from_str::<(usize, usize)>("[1,3").is_err());
+        assert!(pixmax_parse_refer_ranges(&Value::Null, "VIDU_Q3_MIX").is_empty());
     }
 
     #[test]

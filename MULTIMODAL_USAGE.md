@@ -371,9 +371,11 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 
 | 图数 | 自动模式 | 说明 |
 |---|---|---|
-| 1 | `imageToVideo` | 首帧图生视频（所有图生视频模型） |
+| 1 | `imageToVideo` | 首帧图生视频（所有图生视频模型）；imageRefer-only 模型（如 VIDU_Q3_MIX）则走 `imageRefer` |
 | 2 | `imageRefer` > `firstAndLastFrame` | 模型有 `imageRefer`（KLING / VIDU / HappyHorse 系）就用多图参考；否则恰好 2 张走首尾帧（第 1 张=首帧，第 2 张=尾帧，如 PIXDANCE 系） |
-| ≥3 | `imageRefer` | 仅多图参考模型支持；不支持的模型会返回明确错误（列出该模型的模式） |
+| ≥3 | `imageRefer` | 仅多图参考模型支持；不支持的模型会返回明确错误（列出该模型的模式与上限） |
+
+**张数上限按模型校验（提交前拒绝，不浪费上传）**：每个模式的可收图数来自 pixmax 模型目录——`imageToVideo` 恒为 1、`firstAndLastFrame` 恒为 2、`imageRefer` 因模型而异（**VIDU_Q3_MIX 1–3**、**KLING_4 1–10**）。超过上限的请求在**上传资产之前**即报错并按候选路由 failover；所有路由都吃不下时返回最终错误（错误信息带各模式上限，如 `imageRefer 1-3`）。>3 张的请求需要有 KLING_4（或更高上限）路由在链上才会出片。
 
 ```json
 { "model": "video",
@@ -385,7 +387,7 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
   "resolution": "480p", "duration": 5 }
 ```
 
-显式覆盖：body 顶层加 `"referModel": "imageRefer"`（或 `firstAndLastFrame` / `keyFrames` 等，需为该模型目录合法值）。
+显式覆盖：body 顶层加 `"referModel": "imageRefer"`（或 `firstAndLastFrame` / `keyFrames` 等，需为该模型目录合法值，且图数须落在该模式上限内）。
 
 **提交响应**（与 wanx / seedance 同 shape）：
 ```json
