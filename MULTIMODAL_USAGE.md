@@ -41,8 +41,11 @@ curl https://brain.aginx.net/v1/chat/completions \
 > **图生视频**：`seedance`（3.4）和 `video` / `pixmax`（3.5）都支持——
 > user 消息里加 `image_url` 块即可（http(s) URL 或 data:base64）。
 > **多参考图**（pixmax）：`image_url` 块可放多个——2+ 张自动按模型能力选
-> `imageRefer`（多图参考，KLING/VIDU/HappyHorse 系）或 `firstAndLastFrame`
+> `imageRefer`（多图参考，KLING/VIDU 系）或 `firstAndLastFrame`
 > （首尾帧，第 1 张=首帧第 2 张=尾帧），详见 3.5。
+> **模型直选**（pixmax）：`model` 直接填 pixmax 模型代码（如
+> `PIXDANCE_2_FAST` = Seedance 2.0 Fast）精确指定模型；各模型参考图
+> 上限见 3.5 的模型表。
 
 ---
 
@@ -388,6 +391,27 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 ```
 
 显式覆盖：body 顶层加 `"referModel": "imageRefer"`（或 `firstAndLastFrame` / `keyFrames` 等，需为该模型目录合法值，且图数须落在该模式上限内）。
+
+**模型直选**：`model` 直接填 pixmax 模型代码（大小写随意），跳过 `video` 标签的自动链、精确指定模型。各模型参考图能力（1 = 首帧图生视频，2 = 首尾帧 [1]=首帧 [2]=尾帧，imageRefer = 多图参考）：
+
+| 模型代码 | 参考图能力 |
+|---|---|
+| `PIXDANCE_2_5` / `PIXDANCE_2_5_DRAFT` | 1 张首帧；2 张首尾帧 |
+| `PIXDANCE_2` / `PIXDANCE_2_FAST` / `PIXDANCE_2_MINI` | 1 张首帧；2 张首尾帧 |
+| `SEEDANCE_1_5` | 1 张首帧；2 张首尾帧 |
+| `KLING_4` | 1 / 2 张；**imageRefer 1–10**；keyFrames 3–10 |
+| `KLING_O1` / `KLING_V3_OMNI` | 1 / 2 张；**imageRefer 1–7** |
+| `KLING_V3` / `KLING_2_6` | 1 / 2 张 |
+| `VIDU_Q4_PREVIEW` | 1 张；**imageRefer 1–15** |
+| `VIDU_Q3_PRO` / `VIDU_Q3_MIX` | **imageRefer 1–3**（Q3_PRO 另有 1/2 张模式） |
+| `VIDU_Q2_PRO` | 1 / 2 张；**imageRefer 1–7** |
+| `WAN3_0` / `WAN3_0_PRIME` / `WAN2_6` / `VEGA_10_PRO` | 1 / 2 张 |
+| `MINIMAX_H3` / `MINIMAX_H3_MAX` / `HAILUO_02` | 1 / 2 张 |
+| `PIXVERSE_V6` / `PIXVERSE_C1` | 1 / 2 张 |
+| `HAPPYHORSE_11` / `HAPPYHORSE_10` | 1 张首帧 |
+| `HAILUO_23` | 1 张首帧 |
+
+> 3 张及以上只有 imageRefer 系（KLING_4 最多 10、VIDU_Q4_PREVIEW 最多 15）支持；其余模型超上限会在上传前直接报错（错误信息带该模型各模式上限）。上限来自 pixmax 模型目录，以目录为准。
 
 **提交响应**（与 wanx / seedance 同 shape）：
 ```json
