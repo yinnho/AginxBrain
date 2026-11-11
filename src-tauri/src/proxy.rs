@@ -244,7 +244,7 @@ fn build_fwd_body(
             openai_rename_max_tokens(&mut out, route);
             out
         }
-        ("anthropic", ProviderFormat::OpenaiResponses) => {
+        ("anthropic", ProviderFormat::OpenaiResponses | ProviderFormat::ArkResponses) => {
             // Anthropic → OpenAI Responses API
             let mut b = body.clone();
             normalize_roles(&mut b);
@@ -260,7 +260,7 @@ fn build_fwd_body(
             openai_rename_max_tokens(&mut b, route);
             b
         }
-        ("openai", ProviderFormat::OpenaiResponses) => {
+        ("openai", ProviderFormat::OpenaiResponses | ProviderFormat::ArkResponses) => {
             // OpenAI Chat → OpenAI Responses
             convert::openai_to_responses_request(body, &route.model)
         }
@@ -268,7 +268,7 @@ fn build_fwd_body(
             // OpenAI Chat → Anthropic Messages
             convert::openai_to_anthropic_request(body, &route.model)
         }
-        ("openai_responses", ProviderFormat::OpenaiResponses) => {
+        ("openai_responses", ProviderFormat::OpenaiResponses | ProviderFormat::ArkResponses) => {
             // Responses → Responses: passthrough
             let mut b = body.clone();
             b["model"] = Value::String(route.model.clone());
@@ -777,7 +777,10 @@ fn extract_xml_tool_uses(resp: &mut Value) {
 fn is_chat_format(format: &ProviderFormat) -> bool {
     matches!(
         format,
-        ProviderFormat::Anthropic | ProviderFormat::Openai | ProviderFormat::OpenaiResponses
+        ProviderFormat::Anthropic
+            | ProviderFormat::Openai
+            | ProviderFormat::OpenaiResponses
+            | ProviderFormat::ArkResponses
     )
 }
 
@@ -1370,8 +1373,10 @@ async fn handle_proxy(
         if let Some(obj) = fwd_body.as_object_mut() {
             obj.insert("thinking".to_string(), json!({"type": "disabled"}));
         }
-    } else if matches!(provider_format, ProviderFormat::OpenaiResponses)
-        && client_thinking == Some(ThinkingIntent::Disabled)
+    } else if matches!(
+        provider_format,
+        ProviderFormat::OpenaiResponses | ProviderFormat::ArkResponses
+    ) && client_thinking == Some(ThinkingIntent::Disabled)
     {
         if let Some(obj) = fwd_body.as_object_mut() {
             obj.remove("reasoning");
@@ -1792,7 +1797,7 @@ async fn handle_proxy(
                     .body(body)
                     .map_err(|e| ProxyError::Upstream(format!("failed to build streaming response: {}", e)))?)
             }
-            ("anthropic", ProviderFormat::OpenaiResponses) => {
+            ("anthropic", ProviderFormat::OpenaiResponses | ProviderFormat::ArkResponses) => {
                 // Convert OpenAI Responses SSE → Anthropic SSE
                 let converted = convert::convert_responses_stream_to_anthropic(
                     Box::pin(raw_stream),
@@ -1837,7 +1842,7 @@ async fn handle_proxy(
                     .body(body)
                     .map_err(|e| ProxyError::Upstream(format!("failed to build streaming response: {}", e)))?)
             }
-            ("openai", ProviderFormat::OpenaiResponses) => {
+            ("openai", ProviderFormat::OpenaiResponses | ProviderFormat::ArkResponses) => {
                 // Convert OpenAI Responses SSE → OpenAI Chat SSE
                 let converted = convert::convert_responses_stream_to_chat(
                     Box::pin(raw_stream),
@@ -1886,7 +1891,7 @@ async fn handle_proxy(
                     .map_err(|e| ProxyError::Upstream(format!("failed to build streaming response: {}", e)))?)
             }
             ("openai", ProviderFormat::Openai)
-            | ("openai_responses", ProviderFormat::OpenaiResponses) => {
+            | ("openai_responses", ProviderFormat::OpenaiResponses | ProviderFormat::ArkResponses) => {
                 // Passthrough: forward raw bytes without JSON parsing
                 let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
                     if strip_reasoning && client_protocol == "openai" {
@@ -2041,7 +2046,7 @@ async fn handle_proxy(
                 )
                     .into_response())
             }
-            ("anthropic", ProviderFormat::OpenaiResponses) => {
+            ("anthropic", ProviderFormat::OpenaiResponses | ProviderFormat::ArkResponses) => {
                 // Convert OpenAI Responses response → Anthropic response
                 let responses_resp: Value = parse_upstream_json(&resp_body)?;
                 let anthropic_resp = convert::responses_to_anthropic_response(&responses_resp, &request_model);
@@ -2053,7 +2058,7 @@ async fn handle_proxy(
                 )
                     .into_response())
             }
-            ("openai", ProviderFormat::OpenaiResponses) => {
+            ("openai", ProviderFormat::OpenaiResponses | ProviderFormat::ArkResponses) => {
                 // Convert OpenAI Responses response → OpenAI Chat response
                 let responses_resp: Value = parse_upstream_json(&resp_body)?;
                 let openai_resp = convert::responses_to_openai_response(&responses_resp, &request_model);
@@ -2492,7 +2497,9 @@ fn scan_sse_for_usage(buf: &[u8], format: &ProviderFormat) -> SseUsageScan {
                     .or_else(|| json.pointer("/response/usage"));
                 if let Some(usage) = usage {
                     match format {
-                        ProviderFormat::Anthropic | ProviderFormat::OpenaiResponses => {
+                        ProviderFormat::Anthropic
+                        | ProviderFormat::OpenaiResponses
+                        | ProviderFormat::ArkResponses => {
                             if let Some(total) = anthropic_total_input(usage) {
                                 scan.input = Some(total);
                             }
@@ -2593,7 +2600,9 @@ fn anthropic_total_input(usage: &Value) -> Option<i64> {
 /// Extract input/output tokens from an upstream response body.
 fn extract_usage_tokens(value: &Value, format: &ProviderFormat) -> (Option<i64>, Option<i64>) {
     match format {
-        ProviderFormat::Anthropic | ProviderFormat::OpenaiResponses => {
+        ProviderFormat::Anthropic
+        | ProviderFormat::OpenaiResponses
+        | ProviderFormat::ArkResponses => {
             let input = value
                 .pointer("/usage")
                 .and_then(|u| anthropic_total_input(u));
@@ -3550,6 +3559,7 @@ fn format_string(format: &ProviderFormat) -> String {
         ProviderFormat::Anthropic => "anthropic",
         ProviderFormat::Openai => "openai",
         ProviderFormat::OpenaiResponses => "openai_responses",
+        ProviderFormat::ArkResponses => "ark_responses",
         ProviderFormat::OpenaiImages => "openai_images",
         ProviderFormat::OpenaiImageEdit => "openai_image_edit",
         ProviderFormat::DashscopeImage => "dashscope_image",
@@ -6241,7 +6251,7 @@ async fn send_test_to_route(
                 serde_json::from_str(&resp_text).map_err(|e| { log::warn!("[Test] failed to parse response as JSON: {}", e); Value::Null }).unwrap_or(Value::Null);
             convert::openai_to_anthropic_response(&openai_resp, tag)
         }
-        ProviderFormat::OpenaiResponses => {
+        ProviderFormat::OpenaiResponses | ProviderFormat::ArkResponses => {
             let responses_resp: Value =
                 serde_json::from_str(&resp_text).map_err(|e| { log::warn!("[Test] failed to parse response as JSON: {}", e); Value::Null }).unwrap_or(Value::Null);
             convert::responses_to_anthropic_response(&responses_resp, tag)

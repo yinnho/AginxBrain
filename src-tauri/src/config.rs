@@ -122,6 +122,12 @@ pub enum ProviderFormat {
     /// generate submit → progress poll).
     #[serde(rename = "pixmax_video")]
     PixmaxVideo,
+    /// Volcano Ark (Doubao) Responses endpoint: POST /api/v3/responses.
+    /// Same wire protocol as OpenaiResponses (pure passthrough) — separate
+    /// variant only so the admin UI has a pickable "Doubao Responses (Ark)"
+    /// format with the ark default path (ark does not serve /v1/responses).
+    #[serde(rename = "ark_responses")]
+    ArkResponses,
 }
 
 fn default_format() -> ProviderFormat {
@@ -143,6 +149,7 @@ impl ProviderFormat {
             ProviderFormat::Openai | ProviderFormat::DashscopeAsr => "/v1/chat/completions",
             ProviderFormat::Anthropic => "/v1/messages",
             ProviderFormat::OpenaiResponses => "/v1/responses",
+            ProviderFormat::ArkResponses => "/api/v3/responses",
             ProviderFormat::OpenaiImages => "/v1/images/generations",
             ProviderFormat::OpenaiImageEdit => "/v1/images/edits",
             ProviderFormat::DashscopeImage => "/api/v1/services/aigc/image-generation/generation",
@@ -778,6 +785,14 @@ mod tests {
         let yaml = "openai_responses";
         let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(fmt, ProviderFormat::OpenaiResponses);
+        assert_eq!(fmt.path(), "/v1/responses");
+
+        let yaml = "ark_responses";
+        let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fmt, ProviderFormat::ArkResponses);
+        // ark does not serve /v1/responses — the variant exists so the ark
+        // path is the default and the admin UI has a pickable doubao format.
+        assert_eq!(fmt.path(), "/api/v3/responses");
 
         let yaml = "dashscope_image";
         let fmt: ProviderFormat = serde_yaml::from_str(yaml).unwrap();

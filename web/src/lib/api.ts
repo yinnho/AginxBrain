@@ -22,7 +22,8 @@ export type RouteFormat =
   | 'kling'
   | 'seedance'
   | 'minimax_image'
-  | 'pixmax_video';
+  | 'pixmax_video'
+  | 'ark_responses';
 
 export interface Route {
   id: string;

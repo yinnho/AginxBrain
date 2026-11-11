@@ -22,6 +22,7 @@ function formatDefaultPath(fmt: RouteFormat): string {
     seedance: '/api/v3/contents/generations/tasks',
     minimax_image: '/v1/image_generation',
     pixmax_video: '/user/api/generate/batch',
+    ark_responses: '/api/v3/responses',
   };
   return paths[fmt] || '';
 }
@@ -112,6 +113,7 @@ export function RoutesPage({ config, onConfigChange }: { config: AppConfig; onCo
   const formatColor = (fmt: RouteFormat) => {
     if (fmt === 'openai') return '#10a37f';
     if (fmt === 'openai_responses') return '#6366f1';
+    if (fmt === 'ark_responses') return '#0ea5e9';
     if (fmt.includes('image') || fmt === 'dashscope_chat_image') return '#ec4899';
     if (fmt.includes('video') || fmt === 'kling') return '#8b5cf6';
     if (fmt.includes('tts')) return '#f97316';
@@ -391,6 +393,7 @@ function RouteForm({ initial, providers, tags, onSave, onCancel }: {
           <option value="openai">OpenAI</option>
           <option value="anthropic">Anthropic</option>
           <option value="openai_responses">OpenAI Responses</option>
+          <option value="ark_responses">Doubao Responses (Ark)</option>
           <option value="openai_images">OpenAI Images</option>
           <option value="openai_image_edit">OpenAI Image Edit (图生图)</option>
           <option value="dashscope_image">DashScope Image</option>
