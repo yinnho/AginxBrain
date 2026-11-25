@@ -1,6 +1,7 @@
 use crate::config::{AppState, AppConfig, CircuitState, CircuitStatus, Provider, ProviderFormat, Route};
 use crate::convert;
 use crate::failure_class::{self, FailoverAction, FailureClass};
+use crate::video_media::{self, AudioFormat, AudioRef, MediaError, VideoRefPlan};
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -506,8 +507,10 @@ fn find_candidate_routes<'a>(
 /// Non-retryable errors (NoRoute, NoProvider, 4xx responses) are returned immediately.
 fn is_retryable(err: &ProxyError) -> bool {
     // Any upstream error is retryable — try the next route in the failover chain.
-    // Only config-level errors (no route, unknown provider) are non-retryable.
-    matches!(err, ProxyError::Upstream(_))
+    // So is Unsupported: THIS route lacks a capability the request needs, the
+    // next one may have it. Only config-level errors (no route, unknown
+    // provider) and BadRequest (the request itself is wrong) are final.
+    matches!(err, ProxyError::Upstream(_) | ProxyError::Unsupported(_))
 }
 
 /// Backoff before same-route retry #`attempt` (1-based): 300ms, 600ms, capped
@@ -1181,6 +1184,12 @@ async fn handle_proxy(
     }
 
     let mut last_error: Option<ProxyError> = None;
+    // The first (highest-priority) route that declined for lack of a
+    // capability: its reason is the one to show when every route declines.
+    let mut first_unsupported: Option<ProxyError> = None;
+    // The last video route that TRIED the request and failed for real (upload
+    // error, upstream rejection) — as opposed to one that merely declined.
+    let mut last_upstream_error: Option<ProxyError> = None;
     let mut last_modality: String = String::new();
     // Track how many candidates failed due to rate-limiting (429).
     let mut rate_limited_count: u32 = 0;
@@ -1225,6 +1234,20 @@ async fn handle_proxy(
         //    and early-return. They MUST NOT fall through to the chat fwd_body /
         //    streaming conversion below — their bodies are not chat-shaped.
         if !is_chat_format(provider_format) {
+            // Reference media follow the Seedance 2.0 Fast contract on every
+            // video route. The request's shape is checked before any route
+            // work — audio alone, audio next to a first frame, a clip over its
+            // limit — because no route can serve such a request, so there is
+            // nothing to fail over to.
+            if matches!(
+                provider_format,
+                ProviderFormat::Seedance | ProviderFormat::PixmaxVideo | ProviderFormat::DashscopeVideo
+            ) {
+                if let Err(e) = video_media::validate_reference_audio(&video_media::parse_video_media(&body)) {
+                    last_error = Some(e.into());
+                    break 'candidates;
+                }
+            }
             match provider_format {
                 ProviderFormat::OpenaiImages
                 | ProviderFormat::OpenaiImageEdit
@@ -1266,15 +1289,23 @@ async fn handle_proxy(
                     // and a plausible-but-wrong render submitted on the user's
                     // bill (observed when the pixmax leg failed). Skip loudly
                     // instead — a later i2v-capable candidate may still serve.
-                    if find_first_image_url(&body).is_some() {
+                    // The same goes for the other reference media (reference
+                    // images, video, audio): wanx takes a prompt only.
+                    let media = video_media::parse_video_media(&body);
+                    let uses_references = find_first_image_url(&body).is_some()
+                        || !media.videos.is_empty()
+                        || !media.audios.is_empty();
+                    if uses_references {
                         log::warn!(
-                            "[Proxy] skipping dashscope route {} ({}): text-to-video model cannot use the request's first-frame image",
+                            "[Proxy] skipping dashscope route {} ({}): text-to-video model cannot use the request's reference media",
                             route.id, route.model
                         );
-                        last_error = Some(ProxyError::Upstream(format!(
-                            "route {} ({}): text-to-video model cannot use the request's first-frame image",
+                        let e = ProxyError::Unsupported(format!(
+                            "route {} ({}): text-to-video model cannot use the request's reference media (first frame / reference images / video / audio)",
                             route.id, route.model
-                        )));
+                        ));
+                        first_unsupported.get_or_insert_with(|| e.clone());
+                        last_error = Some(e);
                         continue;
                     }
                     match handle_video_request(state.clone(), caller_key_id, route, provider, &body, start).await {
@@ -1291,6 +1322,11 @@ async fn handle_proxy(
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
                             log::warn!("[Proxy] seedance route failed: {}", e);
+                            if matches!(e, ProxyError::Unsupported(_)) {
+                                first_unsupported.get_or_insert_with(|| e.clone());
+                            } else if matches!(e, ProxyError::Upstream(_)) {
+                                last_upstream_error = Some(e.clone());
+                            }
                             if is_retryable(&e) { last_error = Some(e); continue; }
                             return Err(e);
                         }
@@ -1301,6 +1337,11 @@ async fn handle_proxy(
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
                             log::warn!("[Proxy] pixmax route failed: {}", e);
+                            if matches!(e, ProxyError::Unsupported(_)) {
+                                first_unsupported.get_or_insert_with(|| e.clone());
+                            } else if matches!(e, ProxyError::Upstream(_)) {
+                                last_upstream_error = Some(e.clone());
+                            }
                             if is_retryable(&e) { last_error = Some(e); continue; }
                             return Err(e);
                         }
@@ -2172,6 +2213,24 @@ async fn handle_proxy(
     // instead of crashing on an unexpected 502.
     if rate_limited_count > 0 && rate_limited_count as usize == candidates.len() {
         Err(ProxyError::RateLimited("all providers rate limited, please retry later".into()))
+    } else if let Some(e @ ProxyError::BadRequest(_)) = last_error {
+        // The request itself was rejected before any route work: nothing was
+        // "unavailable", and retrying later cannot help.
+        Err(e)
+    } else if let Some(ProxyError::Unsupported(_)) = last_error {
+        match last_upstream_error {
+            // A route that TRIED and failed says more than the ones that
+            // merely declined after it.
+            Some(e) => Err(ProxyError::Upstream(format!(
+                "all providers unavailable, please try again later: {}",
+                e
+            ))),
+            // Every route declined for lack of a capability: show the first
+            // one's reason — it names the route the tag prefers.
+            None => Err(first_unsupported.or(last_error).unwrap_or_else(|| {
+                ProxyError::Upstream("all routes declined the request".into())
+            })),
+        }
     } else {
         let detail = last_error.as_ref().map(|e| e.to_string()).unwrap_or_default();
         Err(ProxyError::Upstream(format!(
@@ -3814,48 +3873,211 @@ fn collect_image_urls(body: &Value, max: usize) -> Vec<String> {
     out
 }
 
-/// Choose the pixmax `referModel` for the number of reference images the client
-/// sent, based on the model's catalog options AND per-mode image-count caps
-/// (`ranges` from pixmax_refer_image_ranges):
-///   0 images → textToVideo
-///   1 image  → imageToVideo, else imageRefer when that's the model's only
-///              image mode (e.g. VIDU_Q3_MIX)
-///   ≥2       → imageRefer (KLING/VIDU/HappyHorse multi-reference), else
-///              firstAndLastFrame when exactly 2 (first image = first frame,
-///              second = last frame)
-/// A mode only qualifies when the image count fits its catalog range — VIDU
-/// imageRefer is 1–3, so 6 images reject HERE instead of after uploading six
-/// assets (pixmax only checks at render time). An explicit client referModel
-/// wins when the model supports it AND the count fits; violations are errors
-/// (not silent semantic switches) so the request can fail over to a route
-/// whose model accepts the count.
+/// What one pixmax `referModel` accepts, from the `dependOn` rules on its
+/// catalog options: each option carries inputNodeTypes rules, and the ones
+/// naming a single media family have `length` "[min,max]" — e.g.
+/// PIXDANCE_2_FAST referToVideo: images 0-9, videos 0-3, audio 0-3, all media
+/// together 1-15. `None` = the catalog has no rule for that family under the
+/// mode. Pixmax enforces this at RENDER time (after assets are uploaded) with
+/// "Image count must be between 1 and 3 for imageRefer mode" — we extract the
+/// same caps to reject over-limit requests BEFORE any upload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ModeCaps {
+    /// Images alone.
+    images: Option<(usize, usize)>,
+    videos: Option<(usize, usize)>,
+    audios: Option<(usize, usize)>,
+    /// A mixed-media rule that covers images.
+    combined: Option<(usize, usize)>,
+}
+
+impl ModeCaps {
+    /// Range to hold image-only inputs to: a dedicated images rule when the
+    /// catalog has one, else the mixed-media rule.
+    fn image_range(&self) -> Option<(usize, usize)> {
+        self.images.or(self.combined)
+    }
+}
+
+/// The reference media a request carries, by kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RefCounts {
+    images: usize,
+    videos: usize,
+    audios: usize,
+}
+
+/// Mode caps for `model` from the /canvas/modelConfig catalog. Empty map =
+/// catalog silent (callers then stay optimistic for images, as before).
+fn pixmax_parse_mode_caps(
+    catalog: &Value,
+    model: &str,
+) -> std::collections::HashMap<String, ModeCaps> {
+    let mut out = std::collections::HashMap::new();
+    let Some(groups) = catalog.as_array() else {
+        return out;
+    };
+    'outer: for group in groups {
+        let Some(models) = group.get("nodeConfig").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for m in models {
+            let matches = m.get("modelCode").and_then(|v| v.as_str()) == Some(model)
+                || m.get("modelCodeAlias").and_then(|v| v.as_str()) == Some(model);
+            if !matches {
+                continue;
+            }
+            if let Some(params) = m.pointer("/modelConfig/params").and_then(|v| v.as_array()) {
+                for p in params {
+                    if p.get("name").and_then(|v| v.as_str()) != Some("referModel") {
+                        continue;
+                    }
+                    for opt in p.get("options").and_then(|v| v.as_array()).into_iter().flatten() {
+                        let Some(value) = opt.get("value").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        let caps = out.entry(value.to_string()).or_default();
+                        for dep in opt.get("dependOn").and_then(|v| v.as_array()).into_iter().flatten() {
+                            let Some(vals) = dep.get("inValues").and_then(|v| v.as_array()) else {
+                                continue;
+                            };
+                            let Some((lo, hi)) = dep
+                                .get("length")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| serde_json::from_str::<(usize, usize)>(s).ok())
+                            else {
+                                continue;
+                            };
+                            let types: Vec<&str> = vals.iter().filter_map(|t| t.as_str()).collect();
+                            if types.is_empty() {
+                                continue;
+                            }
+                            let all = |family: &[&str]| types.iter().all(|t| family.contains(t));
+                            // Two rule shapes cover images: an images-ONLY one
+                            // (the tight cap for image-only payloads) and a
+                            // mixed-media one; video and audio only ever get
+                            // their own, single-family rule.
+                            if all(&["BASE_IMAGE", "GENERATE_IMAGE", "GENERATE_STORYBOARD"]) {
+                                caps.images = Some((lo, hi));
+                            } else if all(&["BASE_VIDEO", "GENERATE_VIDEO"]) {
+                                caps.videos = Some((lo, hi));
+                            } else if all(&["BASE_AUDIO", "GENERATE_AUDIO"]) {
+                                caps.audios = Some((lo, hi));
+                            } else if types.contains(&"BASE_IMAGE") {
+                                caps.combined = Some((lo, hi));
+                            }
+                        }
+                    }
+                }
+            }
+            break 'outer;
+        }
+    }
+    out
+}
+
+/// Human-readable summary of the per-mode image caps, for error messages:
+/// "imageRefer 1-3, firstAndLastFrame 2-2" (sorted for determinism).
+fn pixmax_mode_caps_desc(caps: &std::collections::HashMap<String, ModeCaps>) -> String {
+    let mut parts: Vec<String> = caps
+        .iter()
+        .filter_map(|(mode, c)| c.image_range().map(|(lo, hi)| format!("{} {}-{}", mode, lo, hi)))
+        .collect();
+    if parts.is_empty() {
+        return "caps unknown".to_string();
+    }
+    parts.sort();
+    parts.join(", ")
+}
+
+/// Does `mode` take this media mix? Images keep the original optimism (an
+/// unknown range fits — the catalog may be unreachable); video and audio need
+/// positive evidence, a rule naming their node family, because a model
+/// without it would render WITHOUT the reference and still charge for it.
+fn pixmax_mode_fits(caps: Option<&ModeCaps>, counts: RefCounts) -> bool {
+    let within = |r: Option<(usize, usize)>, n: usize, when_unknown: bool| match r {
+        Some((lo, hi)) => n >= lo && n <= hi,
+        // No rule for this kind: that never constrains a kind the request
+        // does not carry; otherwise it is the caller's policy.
+        None => n == 0 || when_unknown,
+    };
+    let Some(caps) = caps else {
+        return counts.videos == 0 && counts.audios == 0;
+    };
+    let total = counts.images + counts.videos + counts.audios;
+    within(caps.image_range(), counts.images, true)
+        && within(caps.videos, counts.videos, false)
+        && within(caps.audios, counts.audios, false)
+        && within(caps.combined, total, true)
+}
+
+fn pixmax_range(r: Option<(usize, usize)>) -> String {
+    match r {
+        Some((lo, hi)) => format!("{lo}-{hi}"),
+        None => "none".to_string(),
+    }
+}
+
+/// Why `mode` cannot take `counts` — with both sides spelled out.
+fn pixmax_mode_mismatch(mode: &str, caps: Option<&ModeCaps>, counts: RefCounts) -> String {
+    match caps {
+        Some(c) => format!(
+            "referModel '{}' takes images {}, videos {}, audio clips {} — the request has {}/{}/{}; \
+             fail over to a model with headroom (e.g. KLING_4 imageRefer 1-10, PIXDANCE draft \
+             referToVideo 30) or adjust the request",
+            mode,
+            pixmax_range(c.image_range()),
+            pixmax_range(c.videos),
+            pixmax_range(c.audios),
+            counts.images,
+            counts.videos,
+            counts.audios
+        ),
+        None => format!(
+            "referModel '{}' has no catalog rule for media input on this model — the request has \
+             {} image(s), {} video(s), {} audio clip(s)",
+            mode, counts.images, counts.videos, counts.audios
+        ),
+    }
+}
+
+/// Choose the pixmax `referModel` for the reference media the client sent,
+/// based on the model's catalog options AND the per-mode media caps
+/// (`caps` from pixmax_parse_mode_caps):
+///   no media        → textToVideo
+///   1 image         → imageToVideo, else imageRefer when that's the model's
+///                     only image mode (e.g. VIDU_Q3_MIX)
+///   ≥2 images       → imageRefer (KLING/VIDU/HappyHorse multi-reference), else
+///                     firstAndLastFrame when exactly 2 (first image = first
+///                     frame, second = last frame), else referToVideo
+///   reference_only  → imageRefer > referToVideo. The client tagged its images
+///                     `role: reference_image` (and may add reference audio):
+///                     they are references, never reinterpreted as frames.
+/// A mode only qualifies when EVERY media kind fits its catalog range — VIDU
+/// imageRefer is 1–3 images, so 6 images reject HERE instead of after
+/// uploading six assets (pixmax only checks at render time), and no
+/// first/last-frame mode qualifies next to a reference audio clip. An
+/// explicit client referModel wins when the model supports it AND the media
+/// fit; violations are errors (not silent semantic switches) so the request
+/// can fail over to a route whose model accepts it.
 /// Err = human-readable reason for the caller to surface.
 fn pixmax_refer_mode(
     specs: &std::collections::HashMap<String, (String, Vec<String>)>,
-    ranges: &std::collections::HashMap<String, (usize, usize)>,
-    image_count: usize,
+    caps: &std::collections::HashMap<String, ModeCaps>,
+    counts: RefCounts,
+    reference_only: bool,
     client_refer_model: Option<&str>,
 ) -> Result<String, String> {
     let options = specs.get("referModel").map(|(_, o)| o.clone());
     let has = |mode: &str| options.iter().flatten().any(|x| x == mode);
-    // Unknown range (catalog silent) counts as fitting — pixmax's own
-    // validation is the backstop then.
-    let fits = |mode: &str| {
-        ranges
-            .get(mode)
-            .map(|(lo, hi)| image_count >= *lo && image_count <= *hi)
-            .unwrap_or(true)
-    };
+    let fits = |mode: &str| pixmax_mode_fits(caps.get(mode), counts);
+    let image_count = counts.images;
+
     if let Some(v) = client_refer_model {
         let valid = options.as_ref().map(|o| o.is_empty() || o.iter().any(|x| x == v)).unwrap_or(true);
         if valid {
             if !fits(v) {
-                let (lo, hi) = ranges.get(v).copied().unwrap_or((0, 0));
-                return Err(format!(
-                    "referModel '{}' on this model takes {}-{} reference images, got {} — \
-                     fail over to a model with a higher cap (e.g. KLING_4 imageRefer 1-10) or send fewer images",
-                    v, lo, hi, image_count
-                ));
+                return Err(pixmax_mode_mismatch(v, caps.get(v), counts));
             }
             return Ok(v.to_string());
         }
@@ -3865,6 +4087,36 @@ fn pixmax_refer_mode(
             options.unwrap_or_default()
         ));
     }
+
+    if reference_only {
+        return ["imageRefer", "referToVideo"]
+            .into_iter()
+            .find(|mode| has(mode) && fits(mode))
+            .map(String::from)
+            .ok_or_else(|| {
+                if counts.audios > 0 && caps.values().all(|c| c.audios.is_none()) {
+                    if caps.is_empty() {
+                        "the model catalog is unavailable, so reference audio cannot be confirmed \
+                         for this model — retry shortly or use an Ark seedance route"
+                            .to_string()
+                    } else {
+                        "takes no reference audio (none of its referModel options accepts audio \
+                         input) — use a model whose catalog lists audio, e.g. PIXDANCE_2_FAST \
+                         (= Seedance 2.0 Fast), or the Ark seedance route"
+                            .to_string()
+                    }
+                } else {
+                    format!(
+                        "has no reference mode taking {} image(s), {} video(s), {} audio clip(s) ({})",
+                        counts.images,
+                        counts.videos,
+                        counts.audios,
+                        pixmax_mode_caps_desc(caps)
+                    )
+                }
+            });
+    }
+
     match image_count {
         0 if has("textToVideo") || options.is_none() => Ok("textToVideo".to_string()),
         1 if has("imageToVideo") && fits("imageToVideo") => Ok("imageToVideo".to_string()),
@@ -3888,16 +4140,16 @@ fn pixmax_refer_mode(
                 Ok("imageRefer".to_string())
             } else {
                 Err(format!(
-                    "model has no mode accepting {} reference images ({}) — \
+                    "has no mode accepting {} reference images ({}) — \
                      multi-image needs imageRefer or referToVideo with headroom (KLING_4 1-10, \
                      PIXDANCE draft 30) or exactly 2 for firstAndLastFrame",
                     n,
-                    pixmax_mode_caps_desc(ranges)
+                    pixmax_mode_caps_desc(caps)
                 ))
             }
         }
         n => Err(format!(
-            "model has no image mode for {} reference image{} (referModel options: {:?})",
+            "has no image mode for {} reference image{} (referModel options: {:?})",
             n,
             if n == 1 { "" } else { "s" },
             options.unwrap_or_default()
@@ -3905,55 +4157,98 @@ fn pixmax_refer_mode(
     }
 }
 
-/// Seedance (Volcano Ark) video generation: submit an async task and return the
-/// task_id immediately. The client polls GET /v1/tasks/{tag}/{task_id}, which
-/// forwards to GET {base}/api/v3/contents/generations/tasks/{id} (see
-/// handle_task_poll). The Volcano native poll response is passed through.
-///
-/// Client body (OpenAI chat):
-///   text-to-video:  messages: [{role:user, content:"<prompt>"}]
-///   image-to-video: messages: [{role:user, content:[{type:text,text:..},{type:image_url,image_url:{url}}]}]
-///   resolution: "480p"|"720p"|"1080p"|"4K"  (default "1080p")
-///   ratio:      "16:9"|"9:16"|"1:1"|...      (default "16:9")
-///   duration:   4..15 | -1 (smart)           (default 5)
-///   generate_audio: bool                      (default true)
-async fn handle_seedance_video_request(
-    state: AppState,
-    caller_key_id: Option<i64>,
-    route: &Route,
-    provider: &Provider,
-    body: &Value,
-    start: std::time::Instant,
-) -> Result<Response, ProxyError> {
+/// Is route.model the Seedance 2.0 Fast variant
+/// (`doubao-seedance-2-0-fast-260128`)? It renders 480p / 720p only — the
+/// standard 2.0 also does 1080p — so its default resolution differs.
+fn seedance_is_fast(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("seedance-2-0-fast") || m.contains("seedance_2_0_fast")
+}
+
+/// Seedance 2.x (2.0, 2.0 fast, 2.5): duration is 4–15 s, or -1.
+fn seedance_is_2x(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("seedance-2") || m.contains("seedance_2") || m.contains("seedance2")
+}
+
+/// Ark content item for an image block — the client's block as-is, role
+/// included when given (no role = first frame).
+fn seedance_image_item(img: &video_media::MediaRef) -> Value {
+    let mut item = json!({ "type": "image_url", "image_url": { "url": img.url } });
+    if let Some(role) = &img.role {
+        item["role"] = json!(role);
+    }
+    item
+}
+
+/// Build the Ark task body for a Seedance route — everything but the network
+/// call, so the contract is unit-tested.
+fn build_seedance_submit(route: &Route, body: &Value) -> Result<Value, ProxyError> {
     let prompt = last_user_text(body)
         .ok_or_else(|| ProxyError::Upstream("seedance: no text prompt found in messages".into()))?;
-    let resolution = body
-        .get("resolution")
-        .and_then(|v| v.as_str())
-        .unwrap_or("1080p")
-        .to_string();
+    let media = video_media::parse_video_media(body);
+    let plan = video_media::plan_video_refs(&media)?;
+
+    // 2.0 Fast renders 480p / 720p only, so it defaults to 720p; the other
+    // 2.x models keep the gateway's 1080p default and Ark's own validation.
+    let fast = seedance_is_fast(&route.model);
+    let resolution = match body.get("resolution").and_then(|v| v.as_str()) {
+        Some(r) if fast => {
+            let r = r.trim().to_ascii_lowercase();
+            if r != "480p" && r != "720p" {
+                return Err(MediaError::Unsupported(format!(
+                    "{} renders 480p / 720p only, got \"{}\" — 1080p needs a route with doubao-seedance-2-0-260128",
+                    route.model, r
+                ))
+                .into());
+            }
+            r
+        }
+        Some(r) => r.to_string(),
+        None if fast => "720p".to_string(),
+        None => "1080p".to_string(),
+    };
     let ratio = body
         .get("ratio")
         .and_then(|v| v.as_str())
         .unwrap_or("16:9")
         .to_string();
     let duration = body.get("duration").and_then(|v| v.as_i64()).unwrap_or(5);
+    if seedance_is_2x(&route.model) && duration != -1 && !(4..=15).contains(&duration) {
+        return Err(MediaError::Unsupported(format!(
+            "{} takes a duration of 4–15 seconds, or -1 — got {}",
+            route.model, duration
+        ))
+        .into());
+    }
     let generate_audio = body
         .get("generate_audio")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.effective_path());
-    log::info!(
-        "[Proxy] seedance → {} (model={}, format={:?})",
-        provider.name, route.model, route.format
-    );
-    log::info!("[Proxy] submitting seedance task to {}", url);
-
-    // content: text prompt + optional first-frame image (image-to-video).
+    // content: the text prompt + the reference usage the client asked for.
+    // Role-less images keep the original wire shape (the first image, no
+    // role = first frame); the other usages forward the blocks as they came.
     let mut content = vec![json!({ "type": "text", "text": prompt })];
-    if let Some(img) = find_first_image_url(body) {
-        content.push(json!({ "type": "image_url", "image_url": { "url": img } }));
+    match plan {
+        VideoRefPlan::Text => {}
+        VideoRefPlan::FirstFrame => content.push(seedance_image_item(&media.images[0])),
+        VideoRefPlan::FirstLastFrame => content.extend(media.images.iter().map(seedance_image_item)),
+        VideoRefPlan::Omni => {
+            content.extend(media.images.iter().map(seedance_image_item));
+            for video in &media.videos {
+                content.push(json!({
+                    "type": "video_url", "video_url": { "url": video.url }, "role": "reference_video"
+                }));
+            }
+            for audio in &media.audios {
+                let parsed = video_media::parse_audio_ref(&audio.url)
+                    .map_err(|e| MediaError::Invalid(format!("reference audio: {}", e)))?;
+                content.push(json!({
+                    "type": "audio_url", "audio_url": { "url": parsed.url() }, "role": "reference_audio"
+                }));
+            }
+        }
     }
 
     let submit_body = json!({
@@ -3964,7 +4259,104 @@ async fn handle_seedance_video_request(
         "duration": duration,
         "generate_audio": generate_audio,
     });
-    let result = send_image_post(&state, provider, &url, &submit_body, &[]).await?;
+    // Ark caps a task body at 64 MB. Say so here, with the way out, instead
+    // of relaying an opaque rejection from the provider.
+    if serde_json::to_vec(&submit_body).map(|b| b.len()).unwrap_or(0) > video_media::SEEDANCE_MAX_BODY_BYTES {
+        return Err(MediaError::Invalid(format!(
+            "the task body is over the {} MB limit — send large images / audio as public URLs instead of base64",
+            video_media::SEEDANCE_MAX_BODY_BYTES / 1024 / 1024
+        ))
+        .into());
+    }
+    Ok(submit_body)
+}
+
+/// POST the task to Ark. An invalid task comes back as HTTP 400 with the
+/// reason (a clip at a URL Ark fetched itself is too long, an unsupported
+/// media combination…). That is for the caller to fix: surface it as a 400
+/// carrying Ark's message, not as a 502 "try again later".
+async fn send_seedance_submit(
+    state: &AppState,
+    provider: &Provider,
+    url: &str,
+    body: &Value,
+) -> Result<Value, ProxyError> {
+    let http = crate::config::client_for_provider(state, provider)
+        .await
+        .map_err(ProxyError::Upstream)?;
+    let resp = http
+        .post(url)
+        .header(provider.auth_type.header_name(), provider.auth_type.header_value(&provider.api_key))
+        .timeout(std::time::Duration::from_secs(180))
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("failed to read seedance response body: {}", e)))?;
+    if status.as_u16() == 400 {
+        let message = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
+            .unwrap_or_else(|| truncate_chars(&text, 500).to_string());
+        return Err(ProxyError::BadRequest(format!("ark rejected the task: {}", message)));
+    }
+    if !status.is_success() {
+        return Err(ProxyError::Upstream(format!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            truncate_chars(&text, 500)
+        )));
+    }
+    serde_json::from_str(&text)
+        .map_err(|e| ProxyError::Upstream(format!("failed to parse seedance response: {}", e)))
+}
+
+/// Seedance (Volcano Ark) video generation: submit an async task and return the
+/// task_id immediately. The client polls GET /v1/tasks/{tag}/{task_id}, which
+/// forwards to GET {base}/api/v3/contents/generations/tasks/{id} (see
+/// handle_task_poll). The Volcano native poll response is passed through.
+///
+/// Client body (OpenAI chat):
+///   text-to-video:  messages: [{role:user, content:"<prompt>"}]
+///   image-to-video: messages: [{role:user, content:[{type:text,text:..},{type:image_url,image_url:{url}}]}]
+///   resolution: "480p"|"720p"|"1080p"|"4K"  (default "1080p"; 2.0 Fast: 480p|720p, default 720p)
+///   ratio:      "16:9"|"9:16"|"1:1"|...      (default "16:9")
+///   duration:   4..15 | -1 (smart)           (default 5)
+///   generate_audio: bool                      (default true)
+///
+/// Reference media ride in the same content array (video_media.rs): the block
+/// shape is Ark's own content[] shape, so it is forwarded as-is. 首帧 (an
+/// image without role), 首尾帧 (images role first_frame + last_frame) and
+/// 全模态参考 (images reference_image, videos reference_video, audio
+/// reference_audio) are three mutually exclusive usages. `generate_audio` is
+/// the OUTPUT soundtrack — unrelated to reference audio; both are kept.
+async fn handle_seedance_video_request(
+    state: AppState,
+    caller_key_id: Option<i64>,
+    route: &Route,
+    provider: &Provider,
+    body: &Value,
+    start: std::time::Instant,
+) -> Result<Response, ProxyError> {
+    let submit_body = build_seedance_submit(route, body)?;
+    let media = video_media::parse_video_media(body);
+    let url = format!("{}{}", route.base_url.trim_end_matches('/'), route.effective_path());
+    log::info!(
+        "[Proxy] seedance → {} (model={}, format={:?}, reference media: {} image(s), {} video(s), {} audio clip(s))",
+        provider.name,
+        route.model,
+        route.format,
+        media.images.len(),
+        media.videos.len(),
+        media.audios.len()
+    );
+    log::info!("[Proxy] submitting seedance task to {}", url);
+
+    let result = send_seedance_submit(&state, provider, &url, &submit_body).await?;
     let task_id = result
         .get("id")
         .and_then(|v| v.as_str())
@@ -4328,10 +4720,26 @@ async fn pixmax_upload_image_asset(
 ) -> Result<String, ProxyError> {
     let ext = mime.strip_prefix("image/").unwrap_or("png");
     let file_name = format!("aginxbrain-i2v-{}.{}", uuid::Uuid::new_v4(), ext);
+    pixmax_upload_asset(state, provider, route, bytes, mime, &file_name, "IMG").await
+}
+
+/// Upload one client media file (image → BASE_IMAGE, audio → BASE_AUDIO) to
+/// pixmax as a canvas asset. Same chain for every kind: authorize → signed OSS
+/// PUT → poll the registration. `file_type` is pixmax's asset enum
+/// (IMG / VIDEO / AUDIO).
+async fn pixmax_upload_asset(
+    state: &AppState,
+    provider: &Provider,
+    route: &Route,
+    bytes: &[u8],
+    mime: &str,
+    file_name: &str,
+    file_type: &str,
+) -> Result<String, ProxyError> {
     let auth_payload = json!({
         "fileName": file_name,
         "fileSize": bytes.len(),
-        "fileType": "IMG",
+        "fileType": file_type,
         "contentType": mime,
     });
     let auth = pixmax_call(state, provider, route, "/assets/oss/authorize", &auth_payload).await?;
@@ -4672,92 +5080,12 @@ async fn pixmax_model_params(
     out
 }
 
-/// Per-mode accepted image counts for route.model, from the catalog's
-/// referModel dependOn rules: each option carries inputNodeTypes rules and the
-/// one covering BASE_IMAGE has `length` "[min,max]" — e.g. VIDU_Q3_MIX
-/// imageRefer is [1,3] (KLING_4: [1,10]), imageToVideo is [1,1] everywhere,
-/// firstAndLastFrame [2,2]. Pixmax enforces this at RENDER time (after assets
-/// are uploaded) with "Image count must be between 1 and 3 for imageRefer
-/// mode" — we extract the same caps here to reject over-limit requests BEFORE
-/// any upload. Empty map = catalog silent (caller stays optimistic and
-/// pixmax's own validation applies).
-fn pixmax_parse_refer_ranges(
-    catalog: &Value,
-    model: &str,
-) -> std::collections::HashMap<String, (usize, usize)> {
-    let mut out = std::collections::HashMap::new();
-    let Some(groups) = catalog.as_array() else {
-        return out;
-    };
-    'outer: for group in groups {
-        let Some(models) = group.get("nodeConfig").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for m in models {
-            let matches = m.get("modelCode").and_then(|v| v.as_str()) == Some(model)
-                || m.get("modelCodeAlias").and_then(|v| v.as_str()) == Some(model);
-            if !matches {
-                continue;
-            }
-            if let Some(params) = m.pointer("/modelConfig/params").and_then(|v| v.as_array()) {
-                for p in params {
-                    if p.get("name").and_then(|v| v.as_str()) != Some("referModel") {
-                        continue;
-                    }
-                    for opt in p.get("options").and_then(|v| v.as_array()).into_iter().flatten() {
-                        let Some(value) = opt.get("value").and_then(|v| v.as_str()) else {
-                            continue;
-                        };
-                        // Two rule shapes cover BASE_IMAGE: an images-ONLY rule
-                        // (inValues within the image family — the tight cap for
-                        // our image-only payloads, e.g. referToVideo images
-                        // 0-9 on PIXDANCE_2_FAST) and a COMBINED media rule
-                        // (images+video+audio total). Prefer the images-only
-                        // one when present; fall back to combined.
-                        let mut images_only: Option<(usize, usize)> = None;
-                        let mut any_covering: Option<(usize, usize)> = None;
-                        for dep in opt.get("dependOn").and_then(|v| v.as_array()).into_iter().flatten() {
-                            let Some(vals) = dep.get("inValues").and_then(|v| v.as_array()) else {
-                                continue;
-                            };
-                            let covers_images = vals.iter().any(|t| t.as_str() == Some("BASE_IMAGE"));
-                            if !covers_images {
-                                continue;
-                            }
-                            let Some((lo, hi)) = dep
-                                .get("length")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| serde_json::from_str::<(usize, usize)>(s).ok())
-                            else {
-                                continue;
-                            };
-                            let all_image_family = vals.iter().all(|t| {
-                                matches!(t.as_str(), Some("BASE_IMAGE") | Some("GENERATE_IMAGE") | Some("GENERATE_STORYBOARD"))
-                            });
-                            if all_image_family {
-                                images_only = Some((lo, hi));
-                            } else {
-                                any_covering = Some((lo, hi));
-                            }
-                        }
-                        if let Some(range) = images_only.or(any_covering) {
-                            out.insert(value.to_string(), range);
-                        }
-                    }
-                }
-            }
-            break 'outer;
-        }
-    }
-    out
-}
-
-/// Cached-catalog wrapper around pixmax_parse_refer_ranges for route.model.
-async fn pixmax_refer_image_ranges(
-    state: &AppState,
+/// Cached-catalog wrapper around pixmax_parse_mode_caps for route.model
+/// (pixmax_model_params keeps the cache warm).
+fn pixmax_mode_caps(
     provider: &Provider,
     route: &Route,
-) -> std::collections::HashMap<String, (usize, usize)> {
+) -> std::collections::HashMap<String, ModeCaps> {
     let catalog = {
         let cache = pixmax_catalogs().lock().unwrap();
         cache
@@ -4765,21 +5093,7 @@ async fn pixmax_refer_image_ranges(
             .map(|(_, v)| v.clone())
             .unwrap_or(Value::Null)
     };
-    pixmax_parse_refer_ranges(&catalog, &route.model)
-}
-
-/// Human-readable summary of known per-mode image caps for error messages:
-/// "imageRefer 1-3, firstAndLastFrame 2-2" (sorted for determinism).
-fn pixmax_mode_caps_desc(ranges: &std::collections::HashMap<String, (usize, usize)>) -> String {
-    if ranges.is_empty() {
-        return "caps unknown".to_string();
-    }
-    let mut parts: Vec<String> = ranges
-        .iter()
-        .map(|(mode, (lo, hi))| format!("{} {}-{}", mode, lo, hi))
-        .collect();
-    parts.sort();
-    parts.join(", ")
+    pixmax_parse_mode_caps(&catalog, &route.model)
 }
 
 /// Resolve one client param against the catalog spec: keep the client value
@@ -4815,11 +5129,20 @@ fn pixmax_resolve_param(
 
 /// Client body (OpenAI chat, mirroring the seedance contract):
 ///   messages: [{role:user, content:"<prompt>"}]
-///   + image_url blocks in the content array = reference images, in order:
-///     1 image  → imageToVideo (first frame)
-///     ≥2       → imageRefer (multi-reference) or firstAndLastFrame (exactly 2,
-///                first→首帧 second→尾帧), chosen from the model's catalog
-///                options; explicit body-level `referModel` overrides
+///   + image_url blocks in the content array:
+///     without role         → reference images in order, mode by count:
+///       1 image            → imageToVideo (first frame)
+///       ≥2                 → imageRefer (multi-reference) or firstAndLastFrame
+///                            (exactly 2: first→首帧 second→尾帧), else referToVideo,
+///                            chosen from the model's catalog options
+///     role reference_image → references (imageRefer > referToVideo, never frames)
+///     role first_frame / last_frame → first frame / first+last frame
+///   + audio_url blocks (role reference_audio) → reference audio under the
+///     Seedance 2.0 Fast rules (video_media.rs): only next to at least one
+///     reference image, ≤3 clips of 2–15 s, ≤15 s in total, wav / mp3.
+///     Omni-reference only: pixmax's catalog gives imageToVideo and
+///     firstAndLastFrame an audio count of 0.
+///   video_url blocks are refused: reference video is wired on the Ark route only.
 ///   resolution: "480p"|"720p"|"1080p"   (default "720p")
 ///   ratio:      "16:9"|"9:16"|...|"auto" (default "auto" → pixmax "adaptive")
 ///   duration:   seconds                   (default 5)
@@ -4839,25 +5162,35 @@ async fn handle_pixmax_video_request(
 ) -> Result<Response, ProxyError> {
     let prompt = last_user_text(body)
         .ok_or_else(|| ProxyError::Upstream("pixmax: no text prompt found in messages".into()))?;
-    // Every image_url in messages = reference images, in order:
-    //   1 image  → imageToVideo (first frame)
-    //   ≥2       → imageRefer / firstAndLastFrame per model capability
-    // no image  → text-to-video.
+    // Every image_url in messages = a reference image, in order; which usage
+    // it is (first frame, first+last frame, omni-reference) is decided by the
+    // roles and the count below.
     // Gateway ceiling for reference images = the largest cap in the pixmax
     // catalog (draft referToVideo takes 30). Requests beyond it error BEFORE
     // uploads — never silently truncate (dropping character refs 8+ rendered
     // videos with the wrong cast). Per-model catalog caps tighten this
     // further in pixmax_refer_mode.
     const MAX_REF_IMAGES: usize = 30;
-    let all_image_refs = collect_image_urls(body, usize::MAX);
-    if all_image_refs.len() > MAX_REF_IMAGES {
+    let media = video_media::parse_video_media(body);
+    if media.images.len() > MAX_REF_IMAGES {
         return Err(ProxyError::Upstream(format!(
             "pixmax: {} reference images exceeds the gateway limit of {} (largest model cap) — send fewer",
-            all_image_refs.len(),
+            media.images.len(),
             MAX_REF_IMAGES
         )));
     }
-    let image_refs = all_image_refs;
+    // Reference video is not wired on pixmax. Refuse it by name: dropping the
+    // block would render WITHOUT the reference and still charge for it.
+    if !media.videos.is_empty() {
+        return Err(ProxyError::Unsupported(
+            "pixmax routes take no reference video (video_url) — send reference_video on an Ark \
+             seedance route instead"
+                .into(),
+        ));
+    }
+    // One set of mode rules for both backends: mixed or unknown roles and
+    // malformed blocks are rejected here exactly as on the Ark route.
+    let plan = video_media::plan_video_refs(&media)?;
     let tag = route.tags.first().cloned().unwrap_or_else(|| "pixmax".to_string());
 
     // pixmax wants every param as a string. Defaults and allowed values come
@@ -4914,21 +5247,94 @@ async fn handle_pixmax_video_request(
     // risk a rejection (specs empty = catalog unavailable, keep sending it).
     let send_include_audio = specs.is_empty() || specs.contains_key("includeAudio");
 
-    let refer_ranges = pixmax_refer_image_ranges(&state, provider, route).await;
+    let mode_caps = pixmax_mode_caps(provider, route);
+    // Which usage the client asked for. Role-less images keep the count-based
+    // mode selection (the original pixmax contract); any explicit role goes
+    // through the same plan as the Ark route, so one content format drives
+    // both backends.
+    let role_less_only = media.images.iter().all(|i| i.role.is_none());
+    let (reference_only, explicit_mode): (bool, Option<&str>) = if role_less_only {
+        (false, None)
+    } else {
+        match plan {
+            VideoRefPlan::Text | VideoRefPlan::FirstFrame => (false, None),
+            VideoRefPlan::FirstLastFrame => (false, Some("firstAndLastFrame")),
+            VideoRefPlan::Omni => (true, None),
+        }
+    };
     let refer_mode = pixmax_refer_mode(
         &specs,
-        &refer_ranges,
-        image_refs.len(),
-        body.get("referModel").and_then(|v| v.as_str()),
+        &mode_caps,
+        RefCounts {
+            images: media.images.len(),
+            videos: media.videos.len(),
+            audios: media.audios.len(),
+        },
+        reference_only,
+        body.get("referModel").and_then(|v| v.as_str()).or(explicit_mode),
     )
-    .map_err(|reason| {
-        ProxyError::Upstream(format!("pixmax: model {}: {}", route.model, reason))
-    })?;
+    // A mode the model lacks is a capability gap, not an outage: fail over,
+    // and answer 400 — with the reason — when no route can serve.
+    .map_err(|reason| ProxyError::Unsupported(format!("pixmax: model {}: {}", route.model, reason)))?;
+
+    // Reference audio: pixmax needs the bytes as a canvas asset. Base64 clips
+    // were already checked at the gateway; URL clips are fetched here and get
+    // the same checks. asset:// is an Ark-only namespace.
+    let mut audio_clips: Vec<(AudioFormat, Vec<u8>)> = Vec::new();
+    let mut audio_secs = 0.0;
+    let mut audio_overhead = 0.0;
+    for (i, clip) in media.audios.iter().enumerate() {
+        let parsed = video_media::parse_audio_ref(&clip.url)
+            .map_err(|e| MediaError::Invalid(format!("reference audio #{}: {}", i + 1, e)))?;
+        let (declared, bytes, inline) = match parsed {
+            AudioRef::Data { fmt, bytes, .. } => (Some(fmt), bytes, true),
+            AudioRef::Url(url) => {
+                // A clip may be 15 MB; stop reading one byte beyond that.
+                match fetch_media_bytes(
+                    &state.http_client,
+                    &url,
+                    video_media::REF_AUDIO_MAX_BYTES + 1,
+                    std::time::Duration::from_secs(120),
+                )
+                .await
+                {
+                    Ok(bytes) => (None, bytes, false),
+                    Err(FetchMediaError::TooLarge) => {
+                        return Err(video_media::audio_too_large_error(i + 1, None, false).into());
+                    }
+                    Err(FetchMediaError::Other(e)) => {
+                        return Err(ProxyError::Upstream(format!("reference audio #{}: {}", i + 1, e)));
+                    }
+                }
+            }
+            AudioRef::Asset(_) => {
+                return Err(ProxyError::Unsupported(
+                    "pixmax routes cannot read asset:// reference audio (an Ark digital-human \
+                     asset id) — send a public URL or base64, or use an Ark seedance route"
+                        .into(),
+                ));
+            }
+        };
+        let fmt = declared.or_else(|| video_media::sniff_audio_format(&bytes)).ok_or_else(|| {
+            MediaError::Invalid(format!(
+                "reference audio #{}: unrecognized audio data — reference audio accepts wav and mp3 only",
+                i + 1
+            ))
+        })?;
+        let duration = video_media::check_audio_clip(i + 1, fmt, &bytes, inline)?;
+        audio_secs += duration.secs;
+        audio_overhead += duration.overhead;
+        audio_clips.push((fmt, bytes));
+    }
+    video_media::check_audio_total(audio_secs, audio_overhead)?;
 
     log::info!(
-        "[Proxy] pixmax → {} (model={}, prompt {} chars)",
+        "[Proxy] pixmax → {} (model={}, referModel={}, {} reference image(s), {} audio clip(s), prompt {} chars)",
         provider.name,
         route.model,
+        refer_mode,
+        media.images.len(),
+        audio_clips.len(),
         prompt.len()
     );
 
@@ -4939,12 +5345,12 @@ async fn handle_pixmax_video_request(
     // firstAndLastFrame the first image is the first frame, the second the
     // last; for imageRefer the order is the reference order.
     let mut image_nodes: Vec<(String, Value)> = Vec::new(); // (uuid, node)
-    for (i, image_ref) in image_refs.iter().enumerate() {
-        let (bytes, mime) = image_ref_to_bytes(&state, image_ref).await?;
+    for (i, image) in media.images.iter().enumerate() {
+        let (bytes, mime) = image_ref_to_bytes(&state, &image.url).await?;
         log::info!(
             "[Proxy] pixmax reference image {}/{}: uploading ({} bytes, {})",
             i + 1,
-            image_refs.len(),
+            media.images.len(),
             bytes.len(),
             mime
         );
@@ -4970,6 +5376,37 @@ async fn handle_pixmax_video_request(
             "prevNodeUuids": []
         });
         image_nodes.push((img_uuid, node));
+    }
+
+    // Reference audio: each clip becomes an audio asset on a BASE_AUDIO node,
+    // wired upstream of the video node like the images.
+    let mut audio_nodes: Vec<(String, Value)> = Vec::new(); // (uuid, node)
+    for (i, (fmt, bytes)) in audio_clips.iter().enumerate() {
+        log::info!(
+            "[Proxy] pixmax reference audio {}/{}: uploading ({} bytes, {})",
+            i + 1,
+            audio_clips.len(),
+            bytes.len(),
+            fmt.name()
+        );
+        let file_name = format!("aginxbrain-ref-audio-{}.{}", uuid::Uuid::new_v4(), fmt.name());
+        let asset_uuid =
+            pixmax_upload_asset(&state, provider, route, bytes, fmt.mime(), &file_name, "AUDIO").await?;
+        let audio_uuid = uuid::Uuid::new_v4().to_string();
+        let node = json!({
+            "uuid": audio_uuid,
+            "fileUuid": session.file_uuid,
+            "type": "BASE_AUDIO",
+            "isGenerateNode": false,
+            "metaData": json!({
+                "data": {"label": PIXMAX_NODE_LABEL, "assetUuid": asset_uuid},
+                "position": {"x": -400, "y": 1000 + i * 220}
+            }).to_string(),
+            "defaultAssetUuid": asset_uuid,
+            "params": {},
+            "prevNodeUuids": []
+        });
+        audio_nodes.push((audio_uuid, node));
     }
 
     // Canvas read: revision for the optimistic-concurrency batch, plus the
@@ -4998,14 +5435,15 @@ async fn handle_pixmax_video_request(
         .unwrap_or_default();
     pixmax_gc_nodes(&state, provider, route, &session, &nodes).await;
 
-    // Create the GENERATE_VIDEO node. Retry on revision conflict /
-    // duplicate-submission (5s per-file dedup lock) with fresh revision,
-    // mirroring the CLI's ≤3 attempts.
     let node_uuid = uuid::Uuid::new_v4().to_string();
     // Single-image i2v keeps the verified CLI shape (workflow + referenceNodeUuid);
-    // multi-image matches the web app: no workflow marker, edges carry the wiring.
+    // everything else — multi-image, explicit first+last frame, reference
+    // audio — matches the web app: no workflow marker, edges carry the wiring.
+    let single_first_frame = audio_nodes.is_empty()
+        && image_nodes.len() == 1
+        && (role_less_only || refer_mode == "imageToVideo");
     let meta = match image_nodes.first() {
-        Some((img_uuid, _)) if image_nodes.len() == 1 => json!({
+        Some((img_uuid, _)) if single_first_frame => json!({
             "data": {
                 "label": PIXMAX_NODE_LABEL,
                 "workflow": "image-to-video",
@@ -5035,16 +5473,21 @@ async fn handle_pixmax_video_request(
             "referModel": refer_mode,
             "count": count
         },
-        "prevNodeUuids": image_nodes.iter().map(|(u, _)| json!(u)).collect::<Vec<_>>()
+        "prevNodeUuids": image_nodes
+            .iter()
+            .chain(audio_nodes.iter())
+            .map(|(u, _)| json!(u))
+            .collect::<Vec<_>>()
     });
     if send_include_audio {
         node["params"]["includeAudio"] = json!(include_audio);
     }
-    // Reference image nodes ride in the same create batch, upstream of the
-    // video node (canvas edge = prevNodeUuids reference, order = frame order).
+    // Reference nodes ride in the same create batch, upstream of the video
+    // node (canvas edge = prevNodeUuids reference; within a kind the order is
+    // the client's order).
     let mut create_list: Vec<Value> = Vec::new();
-    for (_, img) in image_nodes.iter() {
-        create_list.push(img.clone());
+    for (_, node) in image_nodes.iter().chain(audio_nodes.iter()) {
+        create_list.push(node.clone());
     }
     create_list.push(node.clone());
     let mut created = Err(ProxyError::Upstream("pixmax: node create not attempted".into()));
@@ -5596,6 +6039,53 @@ async fn image_ref_to_bytes(state: &AppState, image_ref: &str) -> Result<(Vec<u8
             .map_err(|e| ProxyError::Upstream(format!("image: reference decode: {}", e)))?;
         Ok((bytes, mime))
     }
+}
+
+enum FetchMediaError {
+    /// The body ran past the cap while streaming.
+    TooLarge,
+    Other(String),
+}
+
+/// Fetch a client-referenced URL into memory with a hard size cap, checked
+/// while streaming so an oversized host cannot balloon memory. Unlike
+/// fetch_image_to_base64 (10 MB, returns None to leave the URL in place) this
+/// is for media the gateway MUST hold — a reference clip it has to re-upload —
+/// so failures are reported, never skipped.
+async fn fetch_media_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    max_bytes: usize,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, FetchMediaError> {
+    let other =
+        |msg: String| FetchMediaError::Other(format!("failed to fetch {}: {}", truncate_chars(url, 200), msg));
+    let mut resp = client
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| other(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(other(format!("HTTP {}", status.as_u16())));
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = resp
+            .chunk()
+            .await
+            .map_err(|e| other(format!("failed to read the body: {}", e)))?;
+        let Some(chunk) = chunk else { break };
+        if bytes.len() + chunk.len() > max_bytes {
+            return Err(FetchMediaError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return Err(other("empty body".into()));
+    }
+    Ok(bytes)
 }
 
 async fn generate_openai_image_edit(
@@ -6378,7 +6868,7 @@ pub async fn test_route_by_index(
 // Error types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProxyError {
     #[error("no route for tag '{0}'")]
     NoRoute(String),
@@ -6388,6 +6878,25 @@ pub enum ProxyError {
     Upstream(String),
     #[error("rate limited: {0}")]
     RateLimited(String),
+    /// The request itself violates the contract (modes mixed, a clip over its
+    /// limit, a malformed block, or the upstream said so with a 400). HTTP
+    /// 400, answered at once: every route would reject the same body.
+    #[error("{0}")]
+    BadRequest(String),
+    /// THIS route cannot serve an otherwise well-formed request — the model
+    /// takes no reference audio, renders no 1080p… The failover loop tries the
+    /// next route; when none can serve it, this is a 400 too.
+    #[error("{0}")]
+    Unsupported(String),
+}
+
+impl From<MediaError> for ProxyError {
+    fn from(e: MediaError) -> Self {
+        match e {
+            MediaError::Invalid(m) => ProxyError::BadRequest(m),
+            MediaError::Unsupported(m) => ProxyError::Unsupported(m),
+        }
+    }
 }
 
 
@@ -6407,6 +6916,11 @@ impl IntoResponse for ProxyError {
             }
             ProxyError::RateLimited(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             ProxyError::Upstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
+            // Request-shaped: fix the request, don't retry — and not a 502,
+            // which reads as "the gateway/provider is down".
+            ProxyError::BadRequest(_) | ProxyError::Unsupported(_) => {
+                (StatusCode::BAD_REQUEST, self.to_string())
+            }
         };
         // Return error in Anthropic format so Claude Code / Anthropic SDK clients
         // can parse it correctly. OpenAI clients also tolerate this format.
@@ -6982,102 +7496,119 @@ mod tests {
         assert!(collect_image_urls(&json!({"messages":[]}), 7).is_empty());
     }
 
+    // ─── pixmax refer-mode selection ─────────────────────────────────────
+
+    /// Catalog options for the referModel param.
+    fn refer_specs(opts: &[&str]) -> std::collections::HashMap<String, (String, Vec<String>)> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "referModel".to_string(),
+            (opts.first().unwrap_or(&"").to_string(), opts.iter().map(|s| s.to_string()).collect()),
+        );
+        m
+    }
+
+    /// Mode caps with an images-only rule per mode (the pre-audio shape).
+    fn image_caps(entries: &[(&str, (usize, usize))]) -> std::collections::HashMap<String, ModeCaps> {
+        entries
+            .iter()
+            .map(|(mode, r)| (mode.to_string(), ModeCaps { images: Some(*r), ..Default::default() }))
+            .collect()
+    }
+
+    fn counts(images: usize) -> RefCounts {
+        RefCounts { images, ..Default::default() }
+    }
+
     #[test]
     fn test_pixmax_refer_mode_selection() {
-        let mk = |opts: &[&str]| {
-            let mut m = std::collections::HashMap::new();
-            m.insert(
-                "referModel".to_string(),
-                (opts.first().unwrap_or(&"").to_string(), opts.iter().map(|s| s.to_string()).collect()),
-            );
-            m
-        };
         let no_caps = std::collections::HashMap::new();
         // draft-style: t2v / i2v / firstAndLastFrame / referToVideo
-        let draft = mk(&["textToVideo", "referToVideo", "imageToVideo", "firstAndLastFrame"]);
-        let draft_caps = std::collections::HashMap::from([
-            ("imageToVideo".to_string(), (1usize, 1usize)),
-            ("firstAndLastFrame".to_string(), (2usize, 2usize)),
-            ("referToVideo".to_string(), (0usize, 30usize)),
+        let draft = refer_specs(&["textToVideo", "referToVideo", "imageToVideo", "firstAndLastFrame"]);
+        let draft_caps = image_caps(&[
+            ("imageToVideo", (1, 1)),
+            ("firstAndLastFrame", (2, 2)),
+            ("referToVideo", (0, 30)),
         ]);
-        assert_eq!(pixmax_refer_mode(&draft, &no_caps, 0, None).as_deref(), Ok("textToVideo"));
-        assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 1, None).as_deref(), Ok("imageToVideo"));
+        let pick = |specs, caps, n| pixmax_refer_mode(specs, caps, counts(n), false, None);
+        assert_eq!(pick(&draft, &no_caps, 0).as_deref(), Ok("textToVideo"));
+        assert_eq!(pick(&draft, &draft_caps, 1).as_deref(), Ok("imageToVideo"));
         // exactly 2 → firstAndLastFrame on a model without imageRefer
-        assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 2, None).as_deref(), Ok("firstAndLastFrame"));
+        assert_eq!(pick(&draft, &draft_caps, 2).as_deref(), Ok("firstAndLastFrame"));
         // 3+ falls to referToVideo (Seedance/PIXDANCE multi-reference, images-only)
-        assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 3, None).as_deref(), Ok("referToVideo"));
-        assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 6, None).as_deref(), Ok("referToVideo"));
-        assert_eq!(pixmax_refer_mode(&draft, &draft_caps, 30, None).as_deref(), Ok("referToVideo"));
+        assert_eq!(pick(&draft, &draft_caps, 3).as_deref(), Ok("referToVideo"));
+        assert_eq!(pick(&draft, &draft_caps, 6).as_deref(), Ok("referToVideo"));
+        assert_eq!(pick(&draft, &draft_caps, 30).as_deref(), Ok("referToVideo"));
         // over draft's referToVideo cap → error
-        assert!(pixmax_refer_mode(&draft, &draft_caps, 31, None).is_err());
+        assert!(pick(&draft, &draft_caps, 31).is_err());
 
         // kling-style: has imageRefer → always preferred for ≥2
-        let kling = mk(&["textToVideo", "imageToVideo", "firstAndLastFrame", "imageRefer", "keyFrames"]);
-        let kling_caps = std::collections::HashMap::from([
-            ("imageToVideo".to_string(), (1usize, 1usize)),
-            ("firstAndLastFrame".to_string(), (2usize, 2usize)),
-            ("imageRefer".to_string(), (1usize, 10usize)),
-            ("keyFrames".to_string(), (3usize, 10usize)),
+        let kling = refer_specs(&["textToVideo", "imageToVideo", "firstAndLastFrame", "imageRefer", "keyFrames"]);
+        let kling_caps = image_caps(&[
+            ("imageToVideo", (1, 1)),
+            ("firstAndLastFrame", (2, 2)),
+            ("imageRefer", (1, 10)),
+            ("keyFrames", (3, 10)),
         ]);
-        assert_eq!(pixmax_refer_mode(&kling, &kling_caps, 2, None).as_deref(), Ok("imageRefer"));
-        assert_eq!(pixmax_refer_mode(&kling, &kling_caps, 5, None).as_deref(), Ok("imageRefer"));
-        assert_eq!(pixmax_refer_mode(&kling, &kling_caps, 10, None).as_deref(), Ok("imageRefer"));
+        assert_eq!(pick(&kling, &kling_caps, 2).as_deref(), Ok("imageRefer"));
+        assert_eq!(pick(&kling, &kling_caps, 5).as_deref(), Ok("imageRefer"));
+        assert_eq!(pick(&kling, &kling_caps, 10).as_deref(), Ok("imageRefer"));
         // explicit client override wins when valid…
-        assert_eq!(pixmax_refer_mode(&kling, &kling_caps, 1, Some("imageRefer")).as_deref(), Ok("imageRefer"));
+        assert_eq!(
+            pixmax_refer_mode(&kling, &kling_caps, counts(1), false, Some("imageRefer")).as_deref(),
+            Ok("imageRefer")
+        );
         // …and is an ERROR (not a silent switch) when the model lacks it
-        assert!(pixmax_refer_mode(&kling, &kling_caps, 1, Some("nope")).is_err());
-        assert!(pixmax_refer_mode(&draft, &draft_caps, 2, Some("imageRefer")).is_err());
+        assert!(pixmax_refer_mode(&kling, &kling_caps, counts(1), false, Some("nope")).is_err());
+        assert!(pixmax_refer_mode(&draft, &draft_caps, counts(2), false, Some("imageRefer")).is_err());
+        // …or when the count is over the mode's cap (named on both sides)
+        let over = pixmax_refer_mode(&draft, &draft_caps, counts(31), false, Some("referToVideo")).unwrap_err();
+        assert!(over.contains("images 0-30") && over.contains("31/0/0"), "{over}");
 
         // t2v-only model: any image has no auto mode
-        let t2v = mk(&["textToVideo"]);
-        assert!(pixmax_refer_mode(&t2v, &no_caps, 1, None).is_err());
+        let t2v = refer_specs(&["textToVideo"]);
+        assert!(pick(&t2v, &no_caps, 1).is_err());
 
         // imageRefer-only model (VIDU_Q3_MIX): no text mode at all
-        let mix = mk(&["imageRefer"]);
-        let mix_caps = std::collections::HashMap::from([("imageRefer".to_string(), (1usize, 3usize))]);
-        assert!(pixmax_refer_mode(&mix, &mix_caps, 0, None).is_err());
-        assert_eq!(pixmax_refer_mode(&mix, &mix_caps, 1, None).as_deref(), Ok("imageRefer"));
-        assert_eq!(pixmax_refer_mode(&mix, &mix_caps, 3, None).as_deref(), Ok("imageRefer"));
+        let mix = refer_specs(&["imageRefer"]);
+        let mix_caps = image_caps(&[("imageRefer", (1, 3))]);
+        assert!(pick(&mix, &mix_caps, 0).is_err());
+        assert_eq!(pick(&mix, &mix_caps, 1).as_deref(), Ok("imageRefer"));
+        assert_eq!(pick(&mix, &mix_caps, 3).as_deref(), Ok("imageRefer"));
         // THE 6-image incident: cap rejects BEFORE uploads (pixmax only
         // checks at render time, after assets are already uploaded)
-        let over = pixmax_refer_mode(&mix, &mix_caps, 6, None).unwrap_err();
+        let over = pick(&mix, &mix_caps, 6).unwrap_err();
         assert!(over.contains("1-3") && over.contains("6"), "got: {}", over);
-        assert!(pixmax_refer_mode(&mix, &mix_caps, 6, Some("imageRefer")).is_err());
+        assert!(pixmax_refer_mode(&mix, &mix_caps, counts(6), false, Some("imageRefer")).is_err());
         // a 6-image request CAN land on kling (cap 10)
-        assert_eq!(pixmax_refer_mode(&kling, &kling_caps, 6, None).as_deref(), Ok("imageRefer"));
+        assert_eq!(pick(&kling, &kling_caps, 6).as_deref(), Ok("imageRefer"));
         // PIXDANCE_2_FAST shape: no imageRefer, referToVideo images-only 0-9
-        let fast = mk(&["textToVideo", "referToVideo", "imageToVideo", "firstAndLastFrame"]);
-        let fast_caps = std::collections::HashMap::from([
-            ("imageToVideo".to_string(), (1usize, 1usize)),
-            ("firstAndLastFrame".to_string(), (2usize, 2usize)),
-            ("referToVideo".to_string(), (0usize, 9usize)),
+        let fast = refer_specs(&["textToVideo", "referToVideo", "imageToVideo", "firstAndLastFrame"]);
+        let fast_caps = image_caps(&[
+            ("imageToVideo", (1, 1)),
+            ("firstAndLastFrame", (2, 2)),
+            ("referToVideo", (0, 9)),
         ]);
-        assert_eq!(pixmax_refer_mode(&fast, &fast_caps, 3, None).as_deref(), Ok("referToVideo"));
-        assert_eq!(pixmax_refer_mode(&fast, &fast_caps, 9, None).as_deref(), Ok("referToVideo"));
-        assert!(pixmax_refer_mode(&fast, &fast_caps, 10, None).is_err());
-        assert!(pixmax_refer_mode(&fast, &fast_caps, 10, Some("referToVideo")).is_err());
+        assert_eq!(pick(&fast, &fast_caps, 3).as_deref(), Ok("referToVideo"));
+        assert_eq!(pick(&fast, &fast_caps, 9).as_deref(), Ok("referToVideo"));
+        assert!(pick(&fast, &fast_caps, 10).is_err());
+        assert!(pixmax_refer_mode(&fast, &fast_caps, counts(10), false, Some("referToVideo")).is_err());
         // imageRefer still wins over referToVideo when both fit
-        assert_eq!(
-            pixmax_refer_mode(&kling, &kling_caps, 5, None).as_deref(),
-            Ok("imageRefer")
-        );
+        assert_eq!(pick(&kling, &kling_caps, 5).as_deref(), Ok("imageRefer"));
         // model with imageRefer capped below the count falls to
         // firstAndLastFrame when exactly 2 fits it
-        let low_refer = mk(&["imageToVideo", "firstAndLastFrame", "imageRefer"]);
-        let low_caps = std::collections::HashMap::from([
-            ("imageToVideo".to_string(), (1usize, 1usize)),
-            ("firstAndLastFrame".to_string(), (2usize, 2usize)),
-            ("imageRefer".to_string(), (2usize, 2usize)),
+        let low_refer = refer_specs(&["imageToVideo", "firstAndLastFrame", "imageRefer"]);
+        let low_caps = image_caps(&[
+            ("imageToVideo", (1, 1)),
+            ("firstAndLastFrame", (2, 2)),
+            ("imageRefer", (2, 2)),
         ]);
-        assert_eq!(
-            pixmax_refer_mode(&low_refer, &low_caps, 2, None).as_deref(),
-            Ok("imageRefer")
-        );
-        assert!(pixmax_refer_mode(&low_refer, &low_caps, 5, None).is_err());
+        assert_eq!(pick(&low_refer, &low_caps, 2).as_deref(), Ok("imageRefer"));
+        assert!(pick(&low_refer, &low_caps, 5).is_err());
 
         // catalog unavailable → optimistic imageRefer for ≥2
         let empty = std::collections::HashMap::new();
-        assert_eq!(pixmax_refer_mode(&empty, &no_caps, 3, None).as_deref(), Ok("imageRefer"));
+        assert_eq!(pick(&empty, &no_caps, 3).as_deref(), Ok("imageRefer"));
     }
 
     #[test]
@@ -7093,52 +7624,430 @@ mod tests {
         assert_eq!(pixmax_compliance_status_class(""), None);
     }
 
-    #[test]
-    fn test_pixmax_refer_image_ranges_extraction() {
-        // Mirrors the real /canvas/modelConfig entry shape: referModel options
-        // carry dependOn inputNodeTypes rules; the BASE_IMAGE-covering one has
-        // length "[min,max]".
-        let catalog = json!([{
+    /// A referModel option as the /canvas/modelConfig catalog spells it.
+    fn refer_option(value: &str, rules: &[(&[&str], &str)]) -> Value {
+        json!({
+            "value": value,
+            "dependOn": rules.iter().map(|(types, length)| json!({
+                "type": "inputNodeTypes",
+                "field": "inputNodeTypes",
+                "inValues": types,
+                "length": length
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    /// catalog data[] for one model with the given referModel options.
+    fn one_model_catalog(model: &str, options: Vec<Value>) -> Value {
+        json!([{
             "name": "视频生成",
             "nodeConfig": [{
-                "modelCode": "VIDU_Q3_MIX",
-                "modelConfig": {
-                    "params": [{
-                        "name": "referModel",
-                        "type": "radio",
-                        "default": "imageRefer",
-                        "options": [
-                            {"value": "imageRefer", "dependOn": [
-                                {"type": "inputNodeTypes", "field": "inputNodeTypes",
-                                 "inValues": ["BASE_IMAGE", "GENERATE_IMAGE"],
-                                 "eqValue": null, "betweenValue": null, "length": "[1,3]"},
-                                {"type": "inputNodeTypes", "field": "inputNodeTypes",
-                                 "inValues": ["BASE_VIDEO", "GENERATE_VIDEO"],
-                                 "eqValue": null, "betweenValue": null, "length": "[0,0]"}
-                            ]},
-                            {"value": "keyFrames", "dependOn": [
-                                {"type": "inputNodeTypes", "field": "inputNodeTypes",
-                                 "inValues": ["BASE_TEXT", "GENERATE_TEXT"],
-                                 "eqValue": null, "betweenValue": null, "length": "[0,20]"}
-                            ]}
-                        ]
-                    }, {
-                        "name": "resolution", "type": "select", "default": "720P", "options": []
-                    }]
-                }
+                "modelCode": model,
+                "modelConfig": {"params": [
+                    {"name": "referModel", "type": "radio", "default": "referToVideo", "options": options},
+                    {"name": "resolution", "type": "select", "default": "720P", "options": []}
+                ]}
             }, {
                 "modelCode": "OTHER_MODEL", "modelConfig": {"params": []}
             }]
-        }]);
-        // Real parser against the real catalog JSON shape.
-        let ranges = pixmax_parse_refer_ranges(&catalog, "VIDU_Q3_MIX");
-        assert_eq!(ranges.get("imageRefer"), Some(&(1usize, 3usize)));
-        assert!(!ranges.contains_key("keyFrames")); // text rule never counted
-        // wrong model → empty
-        assert!(pixmax_parse_refer_ranges(&catalog, "OTHER_MODEL").is_empty());
+        }])
+    }
+
+    /// PIXDANCE_2_FAST's referModel rules as the live catalog has them
+    /// (2026-11-25): audio is accepted by referToVideo only.
+    fn fast_catalog() -> Value {
+        const TEXT: &[&str] = &["BASE_TEXT", "GENERATE_TEXT"];
+        const IMG: &[&str] = &["BASE_IMAGE", "GENERATE_IMAGE", "GENERATE_STORYBOARD"];
+        const VID: &[&str] = &["BASE_VIDEO", "GENERATE_VIDEO"];
+        const AUD: &[&str] = &["BASE_AUDIO", "GENERATE_AUDIO"];
+        const MEDIA: &[&str] = &[
+            "BASE_IMAGE", "GENERATE_IMAGE", "GENERATE_STORYBOARD", "BASE_VIDEO", "GENERATE_VIDEO",
+            "BASE_AUDIO", "GENERATE_AUDIO",
+        ];
+        const VID_AUD: &[&str] = &["BASE_VIDEO", "GENERATE_VIDEO", "BASE_AUDIO", "GENERATE_AUDIO"];
+        one_model_catalog("PIXDANCE_2_FAST", vec![
+            refer_option("textToVideo", &[(TEXT, "[0,20]"), (MEDIA, "[0,0]")]),
+            refer_option("referToVideo", &[(TEXT, "[0,20]"), (IMG, "[0,9]"), (VID, "[0,3]"), (AUD, "[0,3]"), (MEDIA, "[1,15]")]),
+            refer_option("imageToVideo", &[(IMG, "[1,1]"), (VID_AUD, "[0,0]")]),
+            refer_option("firstAndLastFrame", &[(IMG, "[2,2]"), (VID_AUD, "[0,0]")]),
+        ])
+    }
+
+    #[test]
+    fn test_pixmax_mode_caps_extraction() {
+        let caps = pixmax_parse_mode_caps(&fast_catalog(), "PIXDANCE_2_FAST");
+        assert_eq!(
+            caps["referToVideo"],
+            ModeCaps { images: Some((0, 9)), videos: Some((0, 3)), audios: Some((0, 3)), combined: Some((1, 15)) }
+        );
+        // the frame modes state an image rule only — no audio evidence
+        assert_eq!(caps["imageToVideo"], ModeCaps { images: Some((1, 1)), ..Default::default() });
+        assert_eq!(caps["firstAndLastFrame"], ModeCaps { images: Some((2, 2)), ..Default::default() });
+        // textToVideo covers images only through the mixed "nothing" rule
+        assert_eq!(caps["textToVideo"], ModeCaps { combined: Some((0, 0)), ..Default::default() });
+        // image-only range accessor: dedicated rule first, mixed rule as fallback
+        assert_eq!(caps["referToVideo"].image_range(), Some((0, 9)));
+        assert_eq!(caps["textToVideo"].image_range(), Some((0, 0)));
+
+        // VIDU-style: text-only rules (keyFrames) never count as image caps
+        let vidu = one_model_catalog(
+            "VIDU_Q3_MIX",
+            vec![
+                refer_option("imageRefer", &[(&["BASE_IMAGE", "GENERATE_IMAGE"], "[1,3]"), (&["BASE_VIDEO", "GENERATE_VIDEO"], "[0,0]")]),
+                refer_option("keyFrames", &[(&["BASE_TEXT", "GENERATE_TEXT"], "[0,20]")]),
+            ],
+        );
+        let caps = pixmax_parse_mode_caps(&vidu, "VIDU_Q3_MIX");
+        assert_eq!(caps["imageRefer"].image_range(), Some((1, 3)));
+        assert!(caps["keyFrames"].image_range().is_none());
         // malformed length strings are skipped, not fatal
-        assert!(serde_json::from_str::<(usize, usize)>("[1,3").is_err());
-        assert!(pixmax_parse_refer_ranges(&Value::Null, "VIDU_Q3_MIX").is_empty());
+        let broken = one_model_catalog("M", vec![refer_option("imageRefer", &[(&["BASE_IMAGE"], "[1,3")])]);
+        assert!(pixmax_parse_mode_caps(&broken, "M")["imageRefer"].image_range().is_none());
+        // wrong model / no catalog → empty
+        assert!(pixmax_parse_mode_caps(&vidu, "OTHER_MODEL").is_empty());
+        assert!(pixmax_parse_mode_caps(&Value::Null, "VIDU_Q3_MIX").is_empty());
+        // model alias resolves too
+        let aliased = json!([{
+            "nodeConfig": [{
+                "modelCode": "PIXDANCE_2_FAST",
+                "modelCodeAlias": "SEEDANCE_2_0_FAST",
+                "modelConfig": {
+                    "params": [{
+                        "name": "referModel",
+                        "options": [refer_option("referToVideo", &[(&["BASE_AUDIO"], "[0,3]")])]
+                    }]
+                }
+            }]
+        }]);
+        assert_eq!(pixmax_parse_mode_caps(&aliased, "SEEDANCE_2_0_FAST")["referToVideo"].audios, Some((0, 3)));
+        assert_eq!(pixmax_mode_caps_desc(&caps), "imageRefer 1-3");
+    }
+
+    #[test]
+    fn test_pixmax_reference_audio_needs_an_omni_mode() {
+        let fast = refer_specs(&["textToVideo", "referToVideo", "imageToVideo", "firstAndLastFrame"]);
+        let fast_caps = pixmax_parse_mode_caps(&fast_catalog(), "PIXDANCE_2_FAST");
+        let with_audio = RefCounts { images: 1, videos: 0, audios: 1 };
+
+        // image + audio → referToVideo (PIXDANCE_2_FAST = Seedance 2.0 Fast)
+        assert_eq!(
+            pixmax_refer_mode(&fast, &fast_caps, with_audio, true, None).as_deref(),
+            Ok("referToVideo")
+        );
+        assert_eq!(
+            pixmax_refer_mode(&fast, &fast_caps, RefCounts { images: 3, videos: 0, audios: 2 }, true, None).as_deref(),
+            Ok("referToVideo")
+        );
+        // the frame modes take no audio — an explicit ask is refused with both sides spelled out
+        let asked = pixmax_refer_mode(&fast, &fast_caps, with_audio, true, Some("imageToVideo")).unwrap_err();
+        assert!(asked.contains("audio clips none") && asked.contains("1/0/1"), "{asked}");
+        // over the audio cap
+        let four = pixmax_refer_mode(&fast, &fast_caps, RefCounts { images: 1, videos: 0, audios: 4 }, true, None).unwrap_err();
+        assert!(four.contains("no reference mode taking"), "{four}");
+
+        // explicit reference semantics are never reinterpreted as first/last
+        // frames — unlike the role-less 2-image flow right below
+        assert_eq!(pixmax_refer_mode(&fast, &fast_caps, counts(2), true, None).as_deref(), Ok("referToVideo"));
+        assert_eq!(pixmax_refer_mode(&fast, &fast_caps, counts(2), false, None).as_deref(), Ok("firstAndLastFrame"));
+        assert_eq!(
+            pixmax_refer_mode(&fast, &fast_caps, counts(2), false, Some("firstAndLastFrame")).as_deref(),
+            Ok("firstAndLastFrame")
+        );
+        // reference images beyond referToVideo's cap
+        assert!(pixmax_refer_mode(&fast, &fast_caps, counts(10), true, None).is_err());
+
+        // a model without an audio rule takes no reference audio: KLING_4…
+        let kling = refer_specs(&["textToVideo", "imageToVideo", "firstAndLastFrame", "imageRefer", "keyFrames"]);
+        let kling_caps = image_caps(&[
+            ("imageToVideo", (1, 1)),
+            ("firstAndLastFrame", (2, 2)),
+            ("imageRefer", (1, 10)),
+            ("keyFrames", (3, 10)),
+        ]);
+        let no_audio = pixmax_refer_mode(&kling, &kling_caps, with_audio, true, None).unwrap_err();
+        assert!(no_audio.contains("takes no reference audio"), "{no_audio}");
+        // …even when the client insists on a mode
+        let insisted = pixmax_refer_mode(&kling, &kling_caps, with_audio, true, Some("imageRefer")).unwrap_err();
+        assert!(insisted.contains("audio clips none"), "{insisted}");
+        // …while its plain multi-image flow is untouched
+        assert_eq!(pixmax_refer_mode(&kling, &kling_caps, counts(6), false, None).as_deref(), Ok("imageRefer"));
+
+        // no catalog at all: images stay optimistic, audio cannot be confirmed
+        let empty_caps = std::collections::HashMap::new();
+        assert_eq!(pixmax_refer_mode(&fast, &empty_caps, counts(3), false, None).as_deref(), Ok("referToVideo"));
+        assert_eq!(pixmax_refer_mode(&fast, &empty_caps, counts(2), false, None).as_deref(), Ok("firstAndLastFrame"));
+        let blind = pixmax_refer_mode(&fast, &empty_caps, with_audio, true, None).unwrap_err();
+        assert!(blind.contains("catalog is unavailable"), "{blind}");
+
+        // the fit rule itself
+        let rtv = fast_caps["referToVideo"];
+        assert!(pixmax_mode_fits(Some(&rtv), RefCounts { images: 9, videos: 3, audios: 3 }));
+        assert!(!pixmax_mode_fits(Some(&rtv), RefCounts { images: 10, videos: 0, audios: 0 }));
+        assert!(!pixmax_mode_fits(Some(&rtv), RefCounts { images: 0, videos: 0, audios: 4 }));
+        assert!(!pixmax_mode_fits(Some(&rtv), counts(0))); // combined rule: at least 1 medium
+        assert!(!pixmax_mode_fits(Some(&fast_caps["imageToVideo"]), with_audio));
+        assert!(pixmax_mode_fits(Some(&fast_caps["imageToVideo"]), counts(1)));
+        assert!(pixmax_mode_fits(None, counts(5))); // catalog silent → images optimistic
+        assert!(!pixmax_mode_fits(None, with_audio)); // …but never audio
+    }
+
+    // ─── Seedance (Ark) task body ─────────────────────────────────────────
+
+    fn fast_route() -> Route {
+        let mut r = route_with_format(crate::config::ProviderFormat::Seedance);
+        r.model = "doubao-seedance-2-0-fast-260128".into();
+        r
+    }
+
+    /// A video request whose user content is `blocks`; a block array gets a
+    /// text prompt first (a video request always needs one).
+    fn seedance_body(blocks: Value) -> Value {
+        let content = match blocks {
+            Value::Array(items) => {
+                let has_text = items.iter().any(|b| b.get("text").is_some());
+                let mut arr = Vec::new();
+                if !has_text {
+                    arr.push(json!({"type": "text", "text": "让画面动起来"}));
+                }
+                arr.extend(items);
+                Value::Array(arr)
+            }
+            other => other,
+        };
+        json!({ "messages": [{ "role": "user", "content": content }] })
+    }
+
+    fn content_of(route: &Route, body: &Value) -> Vec<Value> {
+        build_seedance_submit(route, body).unwrap()["content"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn test_seedance_submit_legacy_wire_is_unchanged() {
+        let route = route_with_format(crate::config::ProviderFormat::Seedance);
+        // text only
+        let text_only = build_seedance_submit(&route, &seedance_body(json!("一只金毛犬在奔跑"))).unwrap();
+        // …while a block array without any text is still "no prompt"
+        let mute = json!({"messages": [{"role": "user", "content": [img("https://x/a.png", None)]}]});
+        assert!(build_seedance_submit(&route, &mute).is_err());
+        assert_eq!(text_only, json!({
+            "model": "doubao-seedance-2-0-260128",
+            "content": [{"type": "text", "text": "一只金毛犬在奔跑"}],
+            "resolution": "1080p", "ratio": "16:9", "duration": 5, "generate_audio": true
+        }));
+        // one role-less image = first frame, forwarded without role
+        let content = content_of(&route, &seedance_body(json!([
+            {"type": "text", "text": "让它动起来"},
+            {"type": "image_url", "image_url": {"url": "https://x/first.png"}}
+        ])));
+        assert_eq!(content[1], json!({"type": "image_url", "image_url": {"url": "https://x/first.png"}}));
+        // several role-less images stay first-frame usage: only the first goes out
+        let content = content_of(&route, &seedance_body(json!([
+            img("https://x/a.png", None),
+            img("https://x/b.png", None)
+        ])));
+        assert_eq!(content.len(), 2);
+        // first + last frame, roles forwarded
+        let content = content_of(&route, &seedance_body(json!([
+            img("https://x/first.png", Some("first_frame")),
+            img("https://x/last.png", Some("last_frame"))
+        ])));
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[2]["role"], "last_frame");
+        // client params pass through
+        let body = seedance_body(json!("x"));
+        let mut with_params = body.clone();
+        with_params["resolution"] = json!("720p");
+        with_params["ratio"] = json!("9:16");
+        with_params["duration"] = json!(12);
+        with_params["generate_audio"] = json!(false);
+        let out = build_seedance_submit(&route, &with_params).unwrap();
+        assert_eq!((out["resolution"].clone(), out["ratio"].clone(), out["duration"].clone(), out["generate_audio"].clone()),
+                   (json!("720p"), json!("9:16"), json!(12), json!(false)));
+    }
+
+    fn img(url: &str, role: Option<&str>) -> Value {
+        let mut v = json!({"type": "image_url", "image_url": {"url": url}});
+        if let Some(r) = role {
+            v["role"] = json!(r);
+        }
+        v
+    }
+
+    #[test]
+    fn test_seedance_submit_reference_audio_is_forwarded_as_is() {
+        let route = fast_route();
+        let wav = "data:audio/wav;base64,UklGRiQAAABXQVZF";
+        let content = content_of(&route, &seedance_body(json!([
+            {"type": "text", "text": "让她说：今天天气真好"},
+            img("https://example.com/ref.png", Some("reference_image")),
+            {"type": "audio_url", "audio_url": {"url": "https://example.com/voice.wav"}, "role": "reference_audio"}
+        ])));
+        assert_eq!(content, vec![
+            json!({"type": "text", "text": "让她说：今天天气真好"}),
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/ref.png"}, "role": "reference_image"}),
+            json!({"type": "audio_url", "audio_url": {"url": "https://example.com/voice.wav"}, "role": "reference_audio"}),
+        ]);
+
+        // all three url kinds pass; a base64 clip is forwarded in Ark's spelling
+        // (lowercase format); role is always reference_audio; text → image →
+        // video → audio, each kind in client order
+        let content = content_of(&route, &seedance_body(json!([
+            {"type": "audio_url", "audio_url": {"url": "asset://voice-asset-1"}},   // no role given
+            {"type": "video_url", "video_url": {"url": "https://example.com/ref.mp4"}, "role": "reference_video"},
+            {"type": "audio_url", "audio_url": {"url": "data:audio/WAV;base64,UklGRiQAAABXQVZF"}, "role": "reference_audio"},
+            {"type": "audio_url", "audio_url": {"url": wav}, "role": "reference_audio"},
+            img("https://example.com/ref.png", Some("reference_image"))
+        ])));
+        assert_eq!(content.iter().map(|c| c["type"].as_str().unwrap().to_string()).collect::<Vec<_>>(),
+                   ["text", "image_url", "video_url", "audio_url", "audio_url", "audio_url"]);
+        assert_eq!(content[3], json!({"type": "audio_url", "audio_url": {"url": "asset://voice-asset-1"}, "role": "reference_audio"}));
+        assert_eq!(content[4]["audio_url"]["url"], json!(wav));
+        assert_eq!(content[5]["audio_url"]["url"], json!(wav));
+        assert!(content.iter().skip(3).all(|c| c["role"] == "reference_audio"));
+
+        // the spec's example body, verbatim
+        let spec = json!({
+            "model": "doubao-seedance-2-0-fast-260128",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "提示词"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/ref.png"}, "role": "reference_image"},
+                {"type": "audio_url", "audio_url": {"url": "https://example.com/voice.wav"}, "role": "reference_audio"}
+            ]}],
+            "resolution": "720p", "ratio": "9:16", "duration": 8, "generate_audio": true
+        });
+        let out = build_seedance_submit(&route, &spec).unwrap();
+        assert_eq!(out, json!({
+            "model": "doubao-seedance-2-0-fast-260128",
+            "content": [
+                {"type": "text", "text": "提示词"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/ref.png"}, "role": "reference_image"},
+                {"type": "audio_url", "audio_url": {"url": "https://example.com/voice.wav"}, "role": "reference_audio"}
+            ],
+            "resolution": "720p", "ratio": "9:16", "duration": 8, "generate_audio": true
+        }));
+    }
+
+    #[test]
+    fn test_seedance_submit_refuses_mixed_or_lone_reference_audio() {
+        let route = fast_route();
+        let audio = |url: &str| json!({"type": "audio_url", "audio_url": {"url": url}, "role": "reference_audio"});
+
+        // audio alone → 400
+        let lone = build_seedance_submit(&route, &seedance_body(json!([{"type": "text", "text": "说"}, audio("https://x/v.mp3")])));
+        assert!(matches!(&lone, Err(ProxyError::BadRequest(m)) if m.contains("cannot be used alone")), "{lone:?}");
+        // audio + a role-less image (a first frame) → 400, never promoted to a reference
+        let mixed = build_seedance_submit(&route, &seedance_body(json!([audio("https://x/v.mp3"), img("https://x/a.png", None)])));
+        assert!(matches!(&mixed, Err(ProxyError::BadRequest(m)) if m.contains("mutually exclusive")), "{mixed:?}");
+        for frame_role in ["first_frame", "last_frame"] {
+            let both = build_seedance_submit(&route, &seedance_body(json!([
+                img("https://x/a.png", Some(frame_role)), audio("https://x/v.mp3")
+            ])));
+            assert!(matches!(&both, Err(ProxyError::BadRequest(m)) if m.contains("mutually exclusive")), "{both:?}");
+        }
+        // a clip over the limit → 400 with the way out
+        let big = "A".repeat((video_media::REF_AUDIO_MAX_BYTES + 2) * 4 / 3 + 8);
+        let oversized = build_seedance_submit(&route, &seedance_body(json!([
+            img("https://x/a.png", Some("reference_image")),
+            {"type": "audio_url", "audio_url": {"url": format!("data:audio/mp3;base64,{big}")}, "role": "reference_audio"}
+        ])));
+        assert!(matches!(&oversized, Err(ProxyError::BadRequest(m)) if m.contains("public URL")), "{oversized:?}");
+        // wrong format (ogg) → 400
+        let ogg = build_seedance_submit(&route, &seedance_body(json!([
+            img("https://x/a.png", Some("reference_image")),
+            {"type": "audio_url", "audio_url": {"url": "data:audio/ogg;base64,AAAA"}, "role": "reference_audio"}
+        ])));
+        assert!(matches!(&ogg, Err(ProxyError::BadRequest(m)) if m.contains("wav and mp3 only")), "{ogg:?}");
+    }
+
+    #[test]
+    fn test_seedance_fast_model_limits() {
+        // 2.0 Fast: 480p / 720p only, default 720p
+        let route = fast_route();
+        assert_eq!(build_seedance_submit(&route, &seedance_body(json!("x"))).unwrap()["resolution"], "720p");
+        for ok in ["480p", "720p", " 720P "] {
+            let mut body = seedance_body(json!("x"));
+            body["resolution"] = json!(ok);
+            assert_eq!(build_seedance_submit(&route, &body).unwrap()["resolution"], json!(ok.trim().to_ascii_lowercase()));
+        }
+        let mut body = seedance_body(json!("x"));
+        body["resolution"] = json!("1080p");
+        let res = build_seedance_submit(&route, &body).unwrap_err();
+        assert!(matches!(&res, ProxyError::Unsupported(m) if m.contains("480p / 720p only")), "{res:?}");
+        // the standard 2.0 keeps the gateway default and accepts 1080p
+        let std_route = route_with_format(crate::config::ProviderFormat::Seedance);
+        let mut body = seedance_body(json!("x"));
+        body["resolution"] = json!("1080p");
+        assert_eq!(build_seedance_submit(&std_route, &body).unwrap()["resolution"], "1080p");
+
+        // duration: 4–15 or -1 on every Seedance 2.x model
+        for r in [&route, &std_route] {
+            for ok in [4, 5, 15, -1] {
+                let mut body = seedance_body(json!("x"));
+                body["duration"] = json!(ok);
+                assert_eq!(build_seedance_submit(r, &body).unwrap()["duration"], json!(ok));
+            }
+            for bad in [3, 16, 0, -2] {
+                let mut body = seedance_body(json!("x"));
+                body["duration"] = json!(bad);
+                let e = build_seedance_submit(r, &body).unwrap_err();
+                assert!(matches!(&e, ProxyError::Unsupported(m) if m.contains("4–15 seconds")), "{e:?}");
+            }
+        }
+        // another family (Seedance 1.5) is left to Ark's own validation
+        let mut other = route_with_format(crate::config::ProviderFormat::Seedance);
+        other.model = "doubao-seedance-1-5-pro-251201".into();
+        let mut body = seedance_body(json!("x"));
+        body["duration"] = json!(3);
+        assert_eq!(build_seedance_submit(&other, &body).unwrap()["duration"], 3);
+
+        // generate_audio (the OUTPUT soundtrack) and reference audio coexist
+        let mut body = seedance_body(json!([
+            img("https://x/a.png", Some("reference_image")),
+            {"type": "audio_url", "audio_url": {"url": "https://x/v.mp3"}, "role": "reference_audio"}
+        ]));
+        body["generate_audio"] = json!(false);
+        let out = build_seedance_submit(&route, &body).unwrap();
+        assert_eq!(out["generate_audio"], json!(false));
+        assert_eq!(out["content"].as_array().unwrap().len(), 3);
+        // …and no TTS knobs appear on the video wire
+        body["voice"] = json!("longxiaochun_v2");
+        body["speaker"] = json!("x");
+        let out = build_seedance_submit(&route, &body).unwrap();
+        let mut keys: Vec<&str> = out.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, ["content", "duration", "generate_audio", "model", "ratio", "resolution"]);
+    }
+
+    #[test]
+    fn test_seedance_submit_body_size_limit() {
+        let route = fast_route();
+        // 65 MB of base64 image is past Ark's 64 MB task-body limit
+        let huge = "A".repeat(65 * 1024 * 1024);
+        let e = build_seedance_submit(&route, &seedance_body(json!([
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{huge}")}, "role": "reference_image"}
+        ])))
+        .unwrap_err();
+        assert!(matches!(&e, ProxyError::BadRequest(m) if m.contains("64 MB")), "{e:?}");
+    }
+
+    #[test]
+    fn test_request_shaped_errors_are_4xx_and_final() {
+        use axum::response::IntoResponse;
+        assert_eq!(ProxyError::BadRequest("x".into()).into_response().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(ProxyError::Unsupported("x".into()).into_response().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(ProxyError::Upstream("x".into()).into_response().status(), StatusCode::BAD_GATEWAY);
+        // a wrong request is final; a missing capability is worth the next route
+        assert!(!is_retryable(&ProxyError::BadRequest("x".into())));
+        assert!(is_retryable(&ProxyError::Unsupported("x".into())));
+        assert!(is_retryable(&ProxyError::Upstream("x".into())));
+        assert!(matches!(
+            ProxyError::from(MediaError::Invalid("a".into())),
+            ProxyError::BadRequest(m) if m == "a"
+        ));
+        assert!(matches!(
+            ProxyError::from(MediaError::Unsupported("b".into())),
+            ProxyError::Unsupported(m) if m == "b"
+        ));
     }
 
     #[test]

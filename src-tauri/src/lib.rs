@@ -9,6 +9,7 @@ mod models;
 mod proxy;
 mod smart_routing;
 mod takeover;
+mod video_media;
 
 #[cfg(feature = "desktop")]
 mod tray;

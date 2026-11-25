@@ -31,6 +31,7 @@ aginxbrain/
 │       ├── lib.rs                # run_desktop（内嵌网关启动+tray+takeover 命令）与 run_server
 │       ├── config.rs             # 配置加载（providers、routes、tags）
 │       ├── proxy.rs              # 核心代理逻辑（协议检测、路由、failover）
+│       ├── video_media.rs        # 视频参考媒体（首帧/首尾帧/全模态参考规则、参考音频 wav/mp3 校验，纯函数）
 │       ├── api.rs                # 管理 REST API（provider/route/tag/config CRUD）
 │       ├── axum_server.rs        # Axum HTTP 服务器启动
 │       ├── takeover.rs           # Codex / Claude Code / Claude 桌面版接管（config.toml、settings.json、3p configLibrary）

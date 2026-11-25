@@ -46,6 +46,11 @@ curl https://brain.aginx.net/v1/chat/completions \
 > **模型直选**（pixmax）：`model` 直接填 pixmax 模型代码（如
 > `PIXDANCE_2_FAST` = Seedance 2.0 Fast）精确指定模型；各模型参考图
 > 上限见 3.5 的模型表。
+> **参考音频**（Seedance 2.0 Fast）：内容里放 `audio_url` 块
+> （`role: reference_audio`）+ 至少一张带 `role: reference_image` 的参考图。
+> 方舟直连（`doubao-seedance-2-0-fast-260128`）和 pixmax 的 `PIXDANCE_2_FAST`
+> 用**同一个内容格式**。这不是 TTS——视频接口上没有 `voice` / `speaker`，
+> 语音合成仍是 `model: "tts"`。字段和限制见 3.4 / 3.5。
 
 ---
 
@@ -248,7 +253,7 @@ done
 
 ### 3.4 Seedance 2.0（火山方舟，另一套视频后端）
 
-除了阿里 wanx，还接入了字节火山方舟的 **Seedance 2.0**（文生视频 / 首帧图生视频 / 多模态参考），用**独立的 `seedance` 标签**。调用方式和 wanx 一样是"提交 + 轮询"两步，但**参数和轮询响应格式不同**。
+除了阿里 wanx，还接入了字节火山方舟的 **Seedance 2.0**（文生视频 / 首帧图生视频 / 首尾帧 / 全模态参考——参考图、参考视频、**参考音频**），用**独立的 `seedance` 标签**。调用方式和 wanx 一样是"提交 + 轮询"两步，但**参数和轮询响应格式不同**。
 
 > 各异步视频后端用各自独立的 tag（`video`=wanx，`seedance`=Seedance），因为轮询按 tag 的第一个候选路由解析 provider，混用 tag 会把任务轮询到错的 provider。
 
@@ -272,10 +277,10 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `resolution` | 分辨率：`480p` / `720p` / `1080p` / `4K` | `1080p` |
+| `resolution` | 分辨率：`480p` / `720p` / `1080p` / `4K`。**Seedance 2.0 Fast 只收 `480p` / `720p`**，其它值提交即 4xx | `1080p`（2.0 Fast 默认 `720p`） |
 | `ratio` | 画幅：`16:9` / `9:16` / `1:1` 等 | `16:9` |
 | `duration` | 时长（秒）`4`–`15`，或 `-1` 智能 | `5` |
-| `generate_audio` | 是否生成配音 | `true` |
+| `generate_audio` | 成片是否带声音（配乐 / 音效）。和「参考音频」是两件事，可以同时给 | `true` |
 
 **图生视频**：在 `messages` 的 user 内容里加一个 `image_url` 块作为首帧：
 
@@ -286,9 +291,19 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 ] }
 ```
 
+**首尾帧**：两张图都带 `role`（第一张 `first_frame`，第二张 `last_frame`）。不填 role 的图永远是首帧，网关不会把它当成参考图：
+
+```json
+{ "role": "user", "content": [
+    { "type": "text", "text": "镜头从白天推到夜晚" },
+    { "type": "image_url", "image_url": { "url": "https://.../first.png" }, "role": "first_frame" },
+    { "type": "image_url", "image_url": { "url": "https://.../last.png" }, "role": "last_frame" }
+] }
+```
+
 **提交响应**（和 wanx 同样的 shape）：
 ```json
-{ "code": "Success", "task_id": "cgt-20260719210128-66hb5", "task_status": "queued", "tag": "seedance" }
+{ "code": "Success", "task_id": "cgt-20260719210128-66hb5", "task_status": "queued", "poll_url": "/v1/tasks/seedance/cgt-20260719210128-66hb5", "tag": "seedance" }
 ```
 
 **轮询**：`GET /v1/tasks/seedance/{task_id}`。注意返回的是**火山原生格式**（和 wanx 的 `output.task_status`/`output.video_url` 不同）：
@@ -310,7 +325,77 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 
 > - Seedance 带音频生成较慢，常要 **2–5 分钟**，轮询间隔建议 10–15s。
 > - `video_url` 是火山 TOS 签名链接，24h 有效，拿到后用 GET 下载。
-> - 换 Fast 版（更快更便宜）把 route 的 model 改成 `doubao-seedance-2-0-fast-260128` 即可。
+> - 换 Fast 版（更快更便宜）：`model` 直接填 `doubao-seedance-2-0-fast-260128`（方舟直连，下一节），或 pixmax 的 `PIXDANCE_2_FAST`（3.5）；也可以把 `seedance` 路由的 model 改成 `doubao-seedance-2-0-fast-260128`。
+
+#### 3.4.1 参考音频（全模态参考，Seedance 2.0 Fast）
+
+模型 ID `doubao-seedance-2-0-fast-260128`，方舟接口 `POST /api/v3/contents/generations/tasks`。提交仍走 `POST /v1/chat/completions`：在 `messages` 的内容里，和 `image_url` 并列放 `audio_url` 块，网关按方舟 `content` **原样转发**。
+
+> 这不是 TTS：视频接口上没有 `voice` / `speaker` / `tts` 参数，声音克隆 / 语音合成仍走 `model: "tts"` 的 CosyVoice（第 1 节）。`generate_audio` 是「成片要不要带声音」的开关，和参考音频是两件事，两个都保留。
+
+```bash
+curl -X POST https://brain.aginx.net/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{
+    "model": "doubao-seedance-2-0-fast-260128",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "提示词" },
+          {
+            "type": "image_url",
+            "image_url": { "url": "https://example.com/ref.png" },
+            "role": "reference_image"
+          },
+          {
+            "type": "audio_url",
+            "audio_url": { "url": "https://example.com/voice.wav" },
+            "role": "reference_audio"
+          }
+        ]
+      }
+    ],
+    "resolution": "720p",
+    "ratio": "9:16",
+    "duration": 8,
+    "generate_audio": true
+  }'
+```
+
+| 字段 | 说明 |
+|------|------|
+| `audio_url.url` | 三种都支持：公网 URL；`data:audio/<格式>;base64,...`（格式小写，`wav` / `mp3`）；虚拟人素材 `asset://<ASSET_ID>` |
+| `audio_url` 块的 `role` | 固定 `reference_audio`，原样转发（省略也行，网关补上） |
+| `image_url` 块的 `role` | 有参考音频时必须是 `reference_image` |
+| `video_url` 块 | `{ "type": "video_url", "video_url": { "url": "..." }, "role": "reference_video" }`，参考视频 |
+| `generate_audio` | 成片是否带声音，默认 `true`，保持不变 |
+
+**三种用法互斥，不能混在同一次请求里**：首帧（不填 role 的图）、首尾帧（`first_frame` + `last_frame`）、全模态参考（`reference_image` / `reference_video` / `reference_audio`）。
+
+提交时直接返回 **4xx**、响应里写明原因的情况：
+
+- **只有音频**：全模态参考至少要 1 张参考图（`role: reference_image`）或 1 段参考视频（`role: reference_video`）。Seedance 2.5 可以只传音频，这里按 2.0 Fast 校验，只有音频会被拒。
+- **音频和 `first_frame` / `last_frame` 同时出现**，或者和不填 role 的首帧图同时出现。
+- 参考音频超出下面的限制。
+- Fast 模型给了 `480p` / `720p` 以外的分辨率，或 `duration` 不在 `4`–`15` / `-1`。
+
+| 限制（按 Seedance 2.0 Fast 校验） | 值 |
+|------|------|
+| 音频格式 | `wav`、`mp3` |
+| 段数 | 最多 **3** 段 |
+| 单段时长 | **2–15** 秒 |
+| 全部音频合计 | 不超过 **15** 秒 |
+| 单段大小 | 不超过 **15 MB** |
+| 整个请求体 | 不超过 **64 MB**（超了拒绝 base64，改用 URL） |
+| 分辨率 | 只收 `480p` / `720p`，默认 `720p` |
+| `duration` | `4`–`15` 秒，或 `-1` |
+| `generate_audio` | 保持现有开关，默认 `true` |
+
+> - base64 音频在网关就校验格式 / 时长 / 大小；公网 URL 和 `asset://` 的音频由方舟在提交时校验，方舟的拒绝原因同样以 4xx 返回。
+> - `asset://` 只在方舟直连路由可用，pixmax 路由读不了（3.5）。
+> - 轮询不变：用提交返回的 `poll_url`，或照旧 `GET /v1/tasks/seedance/{task_id}`（同一个方舟账号，任务号通用）。成功时视频在 `content.video_url`。
+> - 参考图最多 9 张、参考视频最多 3 段。
 
 ### 3.5 Pixmax（聚合视频 SaaS：Kling / Seedance / Vidu / Hailuo / Wan / PixVerse / MiniMax）
 
@@ -397,7 +482,7 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 | 模型代码 | 参考图能力 |
 |---|---|
 | `PIXDANCE_2_5` / `PIXDANCE_2_5_DRAFT` | 1 张首帧；2 张首尾帧；**多图参考 ≤30 张** |
-| `PIXDANCE_2` / `PIXDANCE_2_FAST` / `PIXDANCE_2_MINI` | 1 张首帧；2 张首尾帧；**多图参考 ≤9 张**（FAST 实测 3 张出片） |
+| `PIXDANCE_2` / `PIXDANCE_2_FAST` / `PIXDANCE_2_MINI` | 1 张首帧；2 张首尾帧；**多图参考 ≤9 张**（FAST 实测 3 张出片）；**参考音频 ≤3 段**（见下） |
 | `SEEDANCE_1_5` | 1 张首帧；2 张首尾帧 |
 | `KLING_4` | 1 / 2 张；**imageRefer ≤10**；keyFrames 3–10；referToVideo ≤10 |
 | `KLING_O1` / `KLING_V3_OMNI` | 1 / 2 张；**imageRefer ≤7**；referToVideo ≤4 |
@@ -417,9 +502,42 @@ curl -X POST https://brain.aginx.net/v1/chat/completions \
 >
 > **人像合规预检**：参考图上传后网关自动逐张过 pixmax 合规检测（`/assetLibrary/compliance/check`）——渲染方的真人风控（"输入图像可能包含人像图片"）要求先过检。被拒的图会在**提交前**点名报错（如 `reference image #4 was blocked`），不会再浪费一次渲染；建议角色参考图避免过于写实的人像照片。
 
+**参考音频**（`PIXDANCE_2_FAST` = Seedance 2.0 Fast，同一个内容格式）
+
+`PIXDANCE_2_FAST` 在 pixmax 模型目录里就是 Seedance 2.0 Fast（`modelName: Seedance 2.0 Fast`，别名 `SEEDANCE_2_0_FAST`），收参考音频。内容格式和 3.4.1 **完全一样**——把 `model` 换成 `PIXDANCE_2_FAST` 即可创建任务：
+
+```json
+{ "model": "PIXDANCE_2_FAST",
+  "messages": [{ "role": "user", "content": [
+    { "type": "text", "text": "提示词" },
+    { "type": "image_url", "image_url": { "url": "https://example.com/ref.png" }, "role": "reference_image" },
+    { "type": "audio_url", "audio_url": { "url": "https://example.com/voice.wav" }, "role": "reference_audio" }
+  ]}],
+  "resolution": "480p", "ratio": "9:16", "duration": 5, "generate_audio": true }
+```
+
+- **限制同 3.4.1 的表**：网关按 Seedance 2.0 Fast 统一校验——`wav` / `mp3`、≤3 段、单段 2–15 秒、合计 ≤15 秒、单段 ≤15 MB，超限提交即 4xx。
+- **必须同时带 `role: reference_image` 的参考图**：只有音频、或音频和首帧 / 首尾帧图混用，提交直接 4xx。有音频时网关固定走 `referToVideo`（全模态参考），图片和音频都上传成 pixmax 素材并挂到视频节点上。
+- **`audio_url.url` 支持公网 URL 和 base64**。`asset://` 是方舟的虚拟人素材，pixmax 路由读不了——提交返回 4xx，请走方舟直连路由（3.4.1）。
+- **参考视频 `video_url` 在 pixmax 路由暂不支持**：提交返回 4xx，不会静默丢掉；需要参考视频请走方舟直连路由。
+- **不带音频时行为不变**：不填 role 的图仍按张数自动选模式；显式写了 role 的图（`reference_image` / `first_frame` / `last_frame`）按 role 走，`reference_image` 不会被当成首尾帧。
+- 不是 TTS：`voice` / `speaker` 不会加到视频接口上，语音合成仍是 `model: "tts"`。
+
+哪些 pixmax 模型收参考音频（以 pixmax 模型目录为准；目录里没有音频输入的模型，提交即 4xx `takes no reference audio`）：
+
+| 模型代码 | 参考音频 |
+|---|---|
+| `PIXDANCE_2_FAST` / `PIXDANCE_2` / `PIXDANCE_2_MINI` | 收，`referToVideo`，目录上限 3 段 |
+| `PIXDANCE_2_5` / `PIXDANCE_2_5_DRAFT` / `PIXDANCE_2_5_4K` / `PIXDANCE_2_5_FLASH` | 收，`referToVideo`（目录上限 10 / 5 段，网关仍按 2.0 Fast 收 3 段） |
+| `VEGA_10_PRO` / `VEGA_15_PRO` | 收，`referToVideo` |
+| `VIDU_Q4_PREVIEW` | 收，`imageRefer`（目录只收 mp3、3–12 秒） |
+| `KLING_4` / `KLING_O1` / `VIDU_Q3_*` / `HAILUO_*` / `WAN*` / `SEEDANCE_1_5` 等 | **收不了参考音频** |
+
+> 上表来自模型目录的输入规则，实测出片的只有 `PIXDANCE_2_FAST`。
+
 **提交响应**（与 wanx / seedance 同 shape）：
 ```json
-{ "code": "Success", "task_id": "062ecc6e-84b0-4f41-8479-6583db1c526e", "task_status": "queue", "tag": "pixmax" }
+{ "code": "Success", "task_id": "062ecc6e-84b0-4f41-8479-6583db1c526e", "task_status": "queue", "poll_url": "/v1/tasks/pixmax/062ecc6e-84b0-4f41-8479-6583db1c526e", "tag": "pixmax" }
 ```
 
 **轮询**：`GET /v1/tasks/pixmax/{task_id}`。返回 pixmax 原生任务对象（`task_id` 即提交返回的 nodeUuid）：
@@ -607,7 +725,7 @@ curl -o result.pptx "http://zhiwen-tob-prod.oss-cn-hangzhou.aliyuncs.com/ppt/...
 | PPT | `ppt` | POST `/v1/chat/completions` | system 消息放文档，user 消息放指令 | 流式：`reasoning_content`=大纲+各页 HTML，`content`=`.pptx` 下载链接 |
 | Seedream | `seedream` | POST `/v1/chat/completions` | messages 里 prompt | `output.choices[].message.content[].image`（TOS URL） |
 | Seedream Lite | `seedream-lite` | POST `/v1/chat/completions` | messages 里 prompt（size≥3,686,400px） | 同上（有免费额度） |
-| Seedance | `seedance` | POST `/v1/chat/completions` | messages 里 prompt（+可选首帧 image_url） | `task_id`（再轮询） |
+| Seedance | `seedance` | POST `/v1/chat/completions` | messages 里 prompt（+ 首帧 / 首尾帧，或参考图 + 参考视频 + **参考音频**） | `task_id`（再轮询） |
 | Seedance 轮询 | - | GET `/v1/tasks/seedance/{task_id}` | - | 火山原生：`status` + `content.video_url` |
 
 ## 6. 注意事项
