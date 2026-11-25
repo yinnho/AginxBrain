@@ -1,5 +1,10 @@
 # Config with real API keys
 config.yaml
+# …and its backups / runtime files on the server checkout — they carry the
+# same keys and this repo is public. A `git add -A` must never pick them up.
+config.yaml.bak*
+aginxbrain.db*
+aginxbrain-bin
 
 # Rust build output
 src-tauri/target/
